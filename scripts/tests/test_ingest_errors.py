@@ -206,7 +206,7 @@ class UploadErrorTests(unittest.TestCase):
         self.addCleanup(ingest_pipeline._jobs.pop, body["job_id"], None)
         job = ingest_pipeline.get_job(body["job_id"])
         self.assertEqual(job["files_total"], 2)
-        jsonl = "(JSON Lines (.jsonl) isn't supported yet, see #296)"
+        jsonl = "(JSON Lines (.jsonl) isn't supported yet, see #291)"
         self.assertEqual(sorted(job["skipped"]), sorted([
             "batch.zip:docs/c.txt.gz (unsupported type '.gz')",
             f"batch.zip:docs/d.jsonl {jsonl}",

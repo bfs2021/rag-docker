@@ -152,7 +152,7 @@ def write(target: pathlib.Path) -> None:
     data = (target / "truncated.zip").read_bytes()
     (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
     # Gzipped JSON members are decompressed and ingested; JSON Lines is skipped
-    # with its own reason (#296), other gzip types as unsupported.
+    # with its own reason (#291), other gzip types as unsupported.
     with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.write(target / "policies.json", arcname="policies.json")
         z.writestr("bills/policies2.json.gz",

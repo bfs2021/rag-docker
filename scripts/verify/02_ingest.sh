@@ -100,7 +100,7 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if sorted(d.get('skipped', [])) == [
     \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
-    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #296)\"] else 1)"
+    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
 check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
 
 # ── upload size limit at the proxy ───────────────────────────────────────────

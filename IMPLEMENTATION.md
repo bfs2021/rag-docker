@@ -3056,7 +3056,7 @@ def _skip_reason(name: str) -> str:
     """Why a file is not ingested, for the job's `skipped` list."""
     lower = name.lower()
     if lower.endswith(".jsonl") or lower.endswith(".jsonl.gz"):
-        return "JSON Lines (.jsonl) isn't supported yet, see #296"
+        return "JSON Lines (.jsonl) isn't supported yet, see #291"
     return f"unsupported type '{Path(lower).suffix or 'none'}'"
 
 
@@ -12648,7 +12648,7 @@ def write(target: pathlib.Path) -> None:
     data = (target / "truncated.zip").read_bytes()
     (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
     # Gzipped JSON members are decompressed and ingested; JSON Lines is skipped
-    # with its own reason (#296), other gzip types as unsupported.
+    # with its own reason (#291), other gzip types as unsupported.
     with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.write(target / "policies.json", arcname="policies.json")
         z.writestr("bills/policies2.json.gz",
@@ -13257,7 +13257,7 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if sorted(d.get('skipped', [])) == [
     \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
-    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #296)\"] else 1)"
+    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
 check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
 
 # ── upload size limit at the proxy ───────────────────────────────────────────

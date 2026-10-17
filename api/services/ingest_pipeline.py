@@ -57,7 +57,7 @@ def _skip_reason(name: str) -> str:
     """Why a file is not ingested, for the job's `skipped` list."""
     lower = name.lower()
     if lower.endswith(".jsonl") or lower.endswith(".jsonl.gz"):
-        return "JSON Lines (.jsonl) isn't supported yet, see #296"
+        return "JSON Lines (.jsonl) isn't supported yet, see #291"
     return f"unsupported type '{Path(lower).suffix or 'none'}'"
 
 

@@ -461,7 +461,7 @@ as JSON; its chunks have `source_type` `json` and `source_file` the member's fil
 the retained original is the `.json.gz` itself. A `.json.gz` uploaded directly, and other
 `.gz` members, are skipped as unsupported types. How JSON itself is parsed is #295.
 `.jsonl` and `.jsonl.gz` files, direct or in a ZIP, are skipped with the reason "JSON Lines
-(.jsonl) isn't supported yet, see #296".
+(.jsonl) isn't supported yet, see #291".
 
 ---
 
@@ -1354,7 +1354,7 @@ Flat (KNN) index has no tunable parameters.
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
 | JSON | `.json` | Unstructured (`partition_json`) | Flat key-value pairs converted to text; nested objects flattened |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. JSON Lines (`.jsonl`, `.jsonl.gz`) is skipped with its own reason (#296). Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. JSON Lines (`.jsonl`, `.jsonl.gz`) is skipped with its own reason (#291). Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
 
 ### 5.2 Chunking Strategy Specifications
 
