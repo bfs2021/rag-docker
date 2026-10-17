@@ -459,7 +459,7 @@ members with a reason each (up to 10, then "and N more") and suggest re-creating
 supported file. The job decompresses it (at most 512 MB decompressed) and parses the result
 as JSON; its chunks have `source_type` `json` and `source_file` the member's filename, and
 the retained original is the `.json.gz` itself. A `.json.gz` uploaded directly, and other
-`.gz` members, are skipped as unsupported types. How JSON itself is parsed is #295.
+`.gz` members, are skipped as unsupported types. The JSON is converted to text as described in §5.1.
 `.jsonl` and `.jsonl.gz` files, direct or in a ZIP, are skipped with the reason "JSON Lines
 (.jsonl) isn't supported yet, see #291".
 
@@ -487,7 +487,8 @@ GET /ingest/job/{job_id}
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
 `.json.gz` member can fail with: not a valid gzip file (truncated or corrupt);
-decompressing to more than 512 MB; or JSON that can't be parsed after decompression.
+decompressing to more than 512 MB; or JSON that can't be parsed after decompression. A `.json` file
+that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column.
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -1352,7 +1353,7 @@ Flat (KNN) index has no tunable parameters.
 | Plain text | `.txt` | Unstructured (`partition_text`) | UTF-8 encoding assumed |
 | Markdown | `.md` | Unstructured (`partition_md`) | Heading structure preserved |
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
-| JSON | `.json` | Unstructured (`partition_json`) | Flat key-value pairs converted to text; nested objects flattened |
+| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array of objects or arrays gives one element per item, separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text) fails that file with "is not valid JSON: <reason>". A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 
 For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. JSON Lines (`.jsonl`, `.jsonl.gz`) is skipped with its own reason (#291). Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
 
@@ -1942,6 +1943,16 @@ now lives once, in `api/services/ingest_config.py`.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
       extra and `Markdown==3.10.3` to the lock.*
+- [x] An ordinary JSON file (flat or nested object, or an array of records) is stored as readable `key: value` text in the file's key order, with non-ASCII text kept; a file of serialized Unstructured elements is still rehydrated (#295).
+      *Issue #295 reported a schema error, which came from Unstructured 0.17.2; at
+      the resolved 0.27.5 `partition_json` accepted any JSON but stored it
+      pretty-printed with sorted keys and escaped non-ASCII text (`"Zo\u00eb"`),
+      unlike §5.1. **Fixed**: the API converts ordinary JSON itself (§5.1).
+      `test_json_ingest.py` (27 cases in the API image) covers each conversion rule,
+      element-schema rehydration, empty files and invalid-JSON errors for `.json` and
+      `.json.gz`; `02_ingest.sh` ingests a nested `plain.json` through the proxy and
+      reads back `meta.author: Zoë Müller` with no JSON syntax. Full verification run
+      2026-10-17: all seven suites passed (9m31s).*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`

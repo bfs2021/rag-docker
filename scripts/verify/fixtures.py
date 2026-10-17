@@ -160,6 +160,15 @@ def write(target: pathlib.Path) -> None:
         z.writestr("records.jsonl.gz", gzip.compress(b'{"a": 1}\n', mtime=0))
         z.writestr("notes.txt.gz", gzip.compress(b"unsupported\n", mtime=0))
 
+    # Issue #295. Ordinary nested JSON with non-ASCII text, stored as readable
+    # `key: value` lines rather than pretty-printed JSON with escaped characters.
+    (target / "plain.json").write_text(json.dumps({
+        "title": "Remote work policy",
+        "body": "Remote work needs written manager approval.",
+        "meta": {"author": "Zoë Müller"},
+        "tags": ["policy", "remote"],
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

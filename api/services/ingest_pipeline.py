@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import gzip
+import json
 import logging
 import mimetypes
 import os
@@ -95,6 +96,109 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
             f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
 
 
+class _JsonError(ValueError):
+    """A .json file that can't be read as JSON; `detail` is the parser's reason."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"is not valid JSON: {detail}")
+        self.detail = detail
+
+
+class _JsonNumber(str):
+    """A JSON number kept as written in the file, so 1.50 stays 1.50."""
+
+
+def _reject_constant(name: str) -> Any:
+    raise _JsonError(f"{name} is not a JSON value")
+
+
+def _read_json(path: Path) -> tuple[bool, Any]:
+    """The file's JSON value, or (False, None) for an empty file."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise _JsonError(f"it is not UTF-8 text ({exc.reason} at byte {exc.start})") from exc
+    if not raw.strip():
+        return False, None
+    try:
+        return True, json.loads(raw, parse_int=_JsonNumber, parse_float=_JsonNumber,
+                                parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        raise _JsonError(f"{exc.msg} at line {exc.lineno}, column {exc.colno}") from exc
+    except RecursionError as exc:
+        raise _JsonError("it is nested too deeply to read") from exc
+
+
+def _is_json_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+
+def _json_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def _json_lines(value: Any, path: str, out: list[str]) -> None:
+    """Append `path: value` lines for value: dotted keys, indexed arrays (#295)."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _json_lines(item, f"{path}.{key}" if path else key, out)
+    elif isinstance(value, list):
+        if not value:
+            return
+        if all(_is_json_scalar(item) for item in value):
+            text = ", ".join(_json_scalar(item) for item in value)
+            out.append(f"{path}: {text}" if path else text)
+        else:
+            for i, item in enumerate(value):
+                _json_lines(item, f"{path}[{i}]", out)
+    else:
+        text = _json_scalar(value)
+        out.append(f"{path}: {text}" if path else text)
+
+
+def _json_records(value: Any) -> list[str]:
+    """Ordinary JSON as readable text: one record per item of a top-level array
+    holding objects or arrays, otherwise one record. Records with no text are dropped."""
+    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
+        groups = value
+    else:
+        groups = [value]
+    records = []
+    try:
+        for group in groups:
+            lines: list[str] = []
+            _json_lines(group, "", lines)
+            text = "\n".join(lines)
+            if text.strip():
+                records.append(text)
+    except RecursionError as exc:
+        raise _JsonError("it is nested too deeply to read") from exc
+    return records
+
+
+def _parse_json(path: Path) -> tuple[str, list[Any]]:
+    """Ordinary JSON becomes `key: value` text, one element per record. A file of
+    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    has_value, value = _read_json(path)
+    if not has_value:
+        return "", []
+    from unstructured.partition.common.json_partitioning import is_element_shaped_dict
+    if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
+        from unstructured.partition.json import partition_json
+        elements = partition_json(filename=str(path))
+        return "\n".join(str(el) for el in elements), elements
+    from unstructured.documents.elements import Text
+    records = _json_records(value)
+    # A blank line between records, so the language splitter prefers to cut there.
+    return "\n\n".join(records), [Text(text=record) for record in records]
+
+
 def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
     fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
     os.close(fd)
@@ -102,17 +206,16 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
     try:
         _gunzip_bounded(path, plain)
         try:
-            from unstructured.partition.json import partition_json
-            elements = partition_json(filename=str(plain))
+            return _parse_json(plain)
+        except _JsonError as exc:
+            raise ValueError(
+                f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc
         except Exception as exc:
-            # How JSON is parsed is issue #295; this only says where it failed.
             raise ValueError(
                 f"was decompressed, but its JSON could not be parsed: "
                 f"{str(exc) or type(exc).__name__}") from exc
     finally:
         plain.unlink(missing_ok=True)
-    text = "\n".join(str(el) for el in elements)
-    return text, elements
 
 
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
@@ -135,8 +238,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
         from unstructured.partition.csv import partition_csv
         elements = partition_csv(filename=str(path))
     elif ext == ".json":
-        from unstructured.partition.json import partition_json
-        elements = partition_json(filename=str(path))
+        return _parse_json(path)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
