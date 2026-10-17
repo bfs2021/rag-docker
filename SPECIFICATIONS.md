@@ -436,6 +436,33 @@ so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
 Ingest runs asynchronously. Progress is polled via `/ingest/job/{job_id}`.
 
+**Errors (#290).** All use the standard error shape. The whole request is refused:
+no job is created, nothing from it is ingested and its temporary files are removed.
+
+Every uploaded ZIP is validated before anything is queued: each member's data is read to
+its end, including members that will be skipped. A ZIP that can't be opened, or has any
+unreadable member, is refused as a whole; nothing is repaired or recovered.
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `NO_SUPPORTED_FILES` | nothing in the upload is a supported type; the message lists what was skipped |
+| 400 | `ARCHIVE_UNREADABLE` | the ZIP is damaged: it can't be opened (truncated, e.g. an incomplete download, or a bad central directory), or a member can't be read (wrong offset, bad local header, bad CRC, truncated data) |
+| 400 | `ARCHIVE_UNSUPPORTED` | no member is damaged, but one is password-protected or uses a compression method the server can't read (e.g. Deflate64) |
+| 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
+| 500 | `INGEST_FAILED` | anything unexpected; the message says so and the API log holds the traceback, collection and filenames |
+
+The ZIP messages name the upload, say nothing from it was imported, name the unreadable
+members with a reason each (up to 10, then "and N more") and suggest re-creating the ZIP.
+`detail` is `{"file": ..., "members": [{"member": ..., "reason": ...}, ...]}`.
+
+**`.json.gz` members.** A ZIP member ending in `.json.gz` is extracted and queued like a
+supported file. The job decompresses it (at most 512 MB decompressed) and parses the result
+as JSON; its chunks have `source_type` `json` and `source_file` the member's filename, and
+the retained original is the `.json.gz` itself. A `.json.gz` uploaded directly, and other
+`.gz` members, are skipped as unsupported types. How JSON itself is parsed is #295.
+`.jsonl` and `.jsonl.gz` files, direct or in a ZIP, are skipped with the reason "JSON Lines
+(.jsonl) isn't supported yet, see #296".
+
 ---
 
 ```
@@ -457,7 +484,10 @@ GET /ingest/job/{job_id}
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"failed"`.
 
-On failure, `errors` contains per-file error messages.
+On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
+`<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
+`.json.gz` member can fail with: not a valid gzip file (truncated or corrupt);
+decompressing to more than 512 MB; or JSON that can't be parsed after decompression.
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -1324,7 +1354,7 @@ Flat (KNN) index has no tunable parameters.
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
 | JSON | `.json` | Unstructured (`partition_json`) | Flat key-value pairs converted to text; nested objects flattened |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings).
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. JSON Lines (`.jsonl`, `.jsonl.gz`) is skipped with its own reason (#296). Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
 
 ### 5.2 Chunking Strategy Specifications
 

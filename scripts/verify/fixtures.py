@@ -9,6 +9,7 @@ pulled from a document library.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import pathlib
 import random
@@ -143,6 +144,21 @@ def write(target: pathlib.Path) -> None:
         for name in ("policies.txt", "policies.md", "policies.pdf",
                      "notes.xyz", "notes.rtf"):
             z.write(target / name, arcname=name)
+
+    # Issue #290. A ZIP cut before its central directory, like an incomplete
+    # download: it once ended the upload in a bare HTTP 500.
+    with zipfile.ZipFile(target / "truncated.zip", "w", zipfile.ZIP_STORED) as z:
+        z.write(target / "policies.txt", arcname="policies.txt")
+    data = (target / "truncated.zip").read_bytes()
+    (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
+    # Gzipped JSON members are decompressed and ingested; JSON Lines is skipped
+    # with its own reason (#296), other gzip types as unsupported.
+    with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(target / "policies.json", arcname="policies.json")
+        z.writestr("bills/policies2.json.gz",
+                   gzip.compress((target / "policies.json").read_bytes(), mtime=0))
+        z.writestr("records.jsonl.gz", gzip.compress(b'{"a": 1}\n', mtime=0))
+        z.writestr("notes.txt.gz", gzip.compress(b"unsupported\n", mtime=0))
 
 
 if __name__ == "__main__":
