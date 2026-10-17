@@ -331,6 +331,64 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── import errors (#290) ───────────────────────────────────────────────────
+  // A truncated ZIP once ended in a plain-text 500 that the page could only
+  // show as "HTTP 500", and a failing status poll was ignored.
+  r.section('import error messages');
+  {
+    const fs = require('fs');
+    const truncated = '/tmp/vfy-truncated.zip';
+    // A local file header and nothing after it: no central directory.
+    fs.writeFileSync(truncated, Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), Buffer.alloc(64, 0x61)]));
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(truncated);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(2500);
+      const text = await bodyText(s.page);
+      r.check("a truncated ZIP shows the API's message, not HTTP 500",
+              clicked && text.includes("is damaged and can't be read") && !text.includes('HTTP 500'),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(truncated);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfypoll1', status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/vfypoll1')
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      r.check('a failing status poll is shown, not ignored',
+              clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+      r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {

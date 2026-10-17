@@ -2999,6 +2999,8 @@ def chunk(
 ```python
 from __future__ import annotations
 import asyncio
+import errno
+import gzip
 import logging
 import mimetypes
 import os
@@ -3006,6 +3008,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -3018,13 +3021,51 @@ from services import sources
 from services import weaviate_client as wc
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
+# Gzipped JSON is accepted inside a ZIP only (issue #290). It is decompressed
+# when the job parses it, never more than this many bytes: the per-request
+# upload limit, so gzip cannot bring in more than a plain upload could.
+GZIP_JSON_SUFFIX = ".json.gz"
+MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 
 _jobs: dict[str, dict] = {}
 _log = logging.getLogger(__name__)
 
 
+class UploadRejected(Exception):
+    """An upload that cannot be unpacked. The whole request is refused with a
+    readable 4xx instead of the bare 500 an unhandled exception became (#290)."""
+
+    def __init__(self, code: str, message: str, file: str,
+                 members: list[dict[str, str]] | None = None, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.detail = {"file": file, "members": members or []}
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def _is_json_gz(name: str) -> bool:
+    return name.lower().endswith(GZIP_JSON_SUFFIX)
+
+
+def _skip_reason(name: str) -> str:
+    """Why a file is not ingested, for the job's `skipped` list."""
+    lower = name.lower()
+    if lower.endswith(".jsonl") or lower.endswith(".jsonl.gz"):
+        return "JSON Lines (.jsonl) isn't supported yet, see #291"
+    return f"unsupported type '{Path(lower).suffix or 'none'}'"
+
+
+def source_type_of(path: Path) -> str:
+    """The source_type stored with a file's chunks: what was parsed, so a
+    gzipped JSON file is "json", like a plain one."""
+    if _is_json_gz(path.name):
+        return "json"
+    return path.suffix.lower().lstrip(".")
 
 
 def _save_upload(src, dest: Path) -> None:
@@ -3032,7 +3073,50 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+def _gunzip_bounded(src: Path, dest: Path) -> None:
+    """Decompress src into dest in blocks, refusing more than the limit."""
+    written = 0
+    try:
+        with gzip.open(src, "rb") as gz, dest.open("wb") as out:
+            while True:
+                block = gz.read(1024 * 1024)
+                if not block:
+                    break
+                written += len(block)
+                if written > MAX_GZIP_DECOMPRESSED_BYTES:
+                    raise ValueError(
+                        f"decompresses to more than "
+                        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
+                        f"one compressed file; nothing from it was stored")
+                out.write(block)
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise ValueError(
+            f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+
+
+def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+    fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
+    os.close(fd)
+    plain = Path(name)
+    try:
+        _gunzip_bounded(path, plain)
+        try:
+            from unstructured.partition.json import partition_json
+            elements = partition_json(filename=str(plain))
+        except Exception as exc:
+            # How JSON is parsed is issue #295; this only says where it failed.
+            raise ValueError(
+                f"was decompressed, but its JSON could not be parsed: "
+                f"{str(exc) or type(exc).__name__}") from exc
+    finally:
+        plain.unlink(missing_ok=True)
+    text = "\n".join(str(el) for el in elements)
+    return text, elements
+
+
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
+    if _is_json_gz(path.name):
+        return _parse_json_gz(path)
     ext = path.suffix.lower()
     if ext == ".pdf":
         from unstructured.partition.pdf import partition_pdf
@@ -3070,6 +3154,7 @@ def _process_job_sync(
     chunk_overlap: int,
     similarity_threshold: float,
     min_chunk_size: int,
+    labels: dict[Path, str] | None = None,
 ) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -3078,8 +3163,7 @@ def _process_job_sync(
         for path in file_paths:
             try:
                 text, elements = _parse_file(path)
-                ext = path.suffix.lower().lstrip(".")
-                source_type = ext
+                source_type = source_type_of(path)
 
                 chunks = do_chunk(
                     text=text,
@@ -3127,8 +3211,12 @@ def _process_job_sync(
                 job["chunks_stored"] += len(chunks)
                 job["files_completed"] += 1
             except Exception as exc:
+                # Name the file the way the user knows it (a ZIP member by its
+                # archive and path), and never leave the reason blank.
+                label = (labels or {}).get(path, path.name)
                 job["files_failed"] += 1
-                job["errors"].append(f"{path.name}: {exc}")
+                job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
+                _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -3138,6 +3226,113 @@ def _process_job_sync(
         job["status"] = "failed"
     else:
         job["status"] = "partial"
+
+
+def _os_reason(exc: OSError) -> str:
+    return exc.strerror or str(exc) or type(exc).__name__
+
+
+def _rejected(code: str, message: str, file: str,
+              members: list[dict[str, str]] | None = None) -> UploadRejected:
+    _log.warning("Upload refused (%s): %s", code, message)
+    return UploadRejected(code, message, file, members)
+
+
+# How many unreadable members a refusal names in its message; detail lists all.
+_MAX_NAMED_MEMBERS = 10
+
+
+def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo) -> tuple[str, bool] | None:
+    """Why this member can't be read, and whether that is damage; None if it reads."""
+    if member.flag_bits & 0x1:
+        return "password-protected", False
+    try:
+        with z.open(member) as data:
+            while data.read(1024 * 1024):
+                pass
+    except NotImplementedError:
+        return f"unsupported compression method {member.compress_type}", False
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:
+            # A negative seek: the zip's directory points before the file starts.
+            return "damaged: its recorded position in the zip is invalid", True
+        return f"damaged: {_os_reason(exc)}", True
+    except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+        return f"damaged: {str(exc) or type(exc).__name__}", True
+    return None
+
+
+def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Path],
+                 skipped: list[str], labels: dict[Path, str]) -> None:
+    """Validate one uploaded ZIP, then extract its supported members into tmp_dir.
+
+    Every member is read to its end first, including the ones that will be
+    skipped. A zip with any unreadable member is refused as a whole, naming
+    them; nothing is repaired, and nothing from it is ingested (#290).
+    """
+    remedy = "Re-create the zip and upload it again."
+    try:
+        archive = zipfile.ZipFile(dest, "r")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise _rejected(
+            "ARCHIVE_UNREADABLE",
+            f"'{safe_name}' is damaged and can't be read, so nothing from it was imported. "
+            f"It may be truncated (for example an incomplete download or copy) or corrupt. "
+            f"{remedy}",
+            safe_name) from exc
+
+    resolved_tmp = tmp_dir.resolve()
+    with archive as z:
+        members = []
+        for member in z.infolist():
+            if member.is_dir():
+                continue
+            member_path = (tmp_dir / member.filename).resolve()
+            if not member_path.is_relative_to(resolved_tmp):
+                continue
+            members.append((member, member_path))
+
+        problems = []
+        for member, _ in members:
+            problem = _member_problem(z, member)
+            if problem is not None:
+                problems.append((member.filename, *problem))
+        if problems:
+            damaged = any(is_damage for _, _, is_damage in problems)
+            named = "; ".join(f"{name} ({reason})"
+                              for name, reason, _ in problems[:_MAX_NAMED_MEMBERS])
+            more = len(problems) - _MAX_NAMED_MEMBERS
+            if more > 0:
+                named += f"; and {more} more"
+            reasons = {reason for _, reason, _ in problems}
+            if "password-protected" in reasons:
+                remedy = "Re-create the zip without a password and upload it again."
+            elif not damaged:
+                remedy = ("Re-create the zip with standard (Deflate) compression and "
+                          "upload it again.")
+            raise _rejected(
+                "ARCHIVE_UNREADABLE" if damaged else "ARCHIVE_UNSUPPORTED",
+                f"'{safe_name}' {'is damaged and ' if damaged else ''}can't be read, so "
+                f"nothing from it was imported. Unreadable members: {named}. {remedy}",
+                safe_name,
+                [{"member": name, "reason": reason} for name, reason, _ in problems])
+
+        for member, member_path in members:
+            if not (member_path.suffix.lower() in SUPPORTED_EXTENSIONS
+                    or _is_json_gz(member_path.name)):
+                skipped.append(f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
+                continue
+            try:
+                z.extract(member, tmp_dir)
+            except OSError as exc:
+                reason = _os_reason(exc)
+                raise _rejected(
+                    "UPLOAD_WRITE_FAILED",
+                    f"Could not extract '{member.filename}' from '{safe_name}' on the "
+                    f"server: {reason}.",
+                    safe_name, [{"member": member.filename, "reason": reason}]) from exc
+            file_paths.append(member_path)
+            labels[member_path] = f"{safe_name}:{member.filename}"
 
 
 async def start_ingest_job(
@@ -3163,6 +3358,8 @@ async def start_ingest_job(
     # a word makes a ZIP of 8 files silently report 6, with nothing saying which
     # two were ignored or why.
     skipped: list[str] = []
+    # How each queued file is named in the job's errors.
+    labels: dict[Path, str] = {}
 
     try:
         for upload in files:
@@ -3175,31 +3372,22 @@ async def start_ingest_job(
             # whole file in memory. Uploads can now reach 512 MB (issue #21),
             # and this container already runs close to its memory budget. The
             # copy blocks, so it runs off the event loop.
-            await asyncio.to_thread(_save_upload, upload.file, dest)
+            try:
+                await asyncio.to_thread(_save_upload, upload.file, dest)
+            except OSError as exc:
+                raise _rejected(
+                    "UPLOAD_WRITE_FAILED",
+                    f"Could not save '{safe_name}' on the server: {_os_reason(exc)}.",
+                    safe_name) from exc
 
             if safe_name.lower().endswith(".zip"):
-                resolved_tmp = tmp_dir.resolve()
-                with zipfile.ZipFile(dest, "r") as z:
-                    for member in z.infolist():
-                        if member.is_dir():
-                            continue
-                        member_path = (tmp_dir / member.filename).resolve()
-                        if not member_path.is_relative_to(resolved_tmp):
-                            continue
-                        if member_path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                            z.extract(member, tmp_dir)
-                            file_paths.append(member_path)
-                        else:
-                            skipped.append(
-                                f"{safe_name}:{member.filename} "
-                                f"(unsupported type '{member_path.suffix.lower() or 'none'}')")
+                _extract_zip(dest, safe_name, tmp_dir, file_paths, skipped, labels)
                 os.remove(dest)
             elif Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS:
                 file_paths.append(dest)
+                labels[dest] = safe_name
             else:
-                skipped.append(
-                    f"{safe_name} (unsupported type "
-                    f"'{Path(safe_name).suffix.lower() or 'none'}')")
+                skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -3245,6 +3433,7 @@ async def start_ingest_job(
         chunk_overlap,
         similarity_threshold,
         min_chunk_size,
+        labels,
     )
     future.add_done_callback(_on_done)
 
@@ -6289,7 +6478,7 @@ from services import sources
 from services import weaviate_client as wc
 from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
-from services.ingest_pipeline import _parse_file
+from services.ingest_pipeline import _parse_file, source_type_of
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -6475,7 +6664,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                 min_chunk_size=min_chunk_size,
                 elements=elements if strategy == "context_aware" else None,
             )
-            source_type = staged.suffix.lower().lstrip(".")
+            source_type = source_type_of(staged)
             out.extend({
                 "content": c,
                 "source_file": staged.name,
@@ -7001,6 +7190,7 @@ async def delete_collection(name: str):
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from fastapi import APIRouter, Form, UploadFile, File
@@ -7014,6 +7204,7 @@ from services import weaviate_client as wc
 from utils import api_error
 
 router = APIRouter(prefix="/ingest")
+_log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
     collection: str
@@ -7031,6 +7222,21 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    try:
+        return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
+                                    similarity_threshold, min_chunk_size, files)
+    except Exception:
+        # Anything not handled below used to reach the client as a plain-text
+        # 500, which the Import page could only show as "HTTP 500" (#290).
+        _log.exception("Upload to collection %r failed unexpectedly (files: %s)",
+                       collection, ", ".join(f.filename or "?" for f in files))
+        return api_error(500, "INGEST_FAILED",
+                         "The upload failed because of an unexpected server error. "
+                         "The API log has the details.")
+
+
+async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
+                         similarity_threshold, min_chunk_size, files):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -7051,6 +7257,8 @@ async def ingest_upload(
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
         )
+    except ingest_pipeline.UploadRejected as exc:
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
 
@@ -9254,6 +9462,9 @@ export default function ImportPage() {
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
   const [error, setError] = useState('')
+  // A failed status poll, shown instead of ignored (#290). Polling carries on,
+  // and the next successful poll clears it.
+  const [pollError, setPollError] = useState('')
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
@@ -9274,8 +9485,11 @@ export default function ImportPage() {
       try {
         const j = await api.getJobStatus(jobId)
         setJob(j)
+        setPollError('')
         if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
-      } catch { /* ignore */ }
+      } catch (e: unknown) {
+        setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }, 3000)
     return () => clearInterval(interval)
   }, [jobId])
@@ -9307,6 +9521,7 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    setPollError('')
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -9406,6 +9621,7 @@ export default function ImportPage() {
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
       {job && <ProgressPanel job={job} />}
+      {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
@@ -10865,6 +11081,15 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
+refused as a whole with readable 400s naming their unreadable members (truncated archive,
+wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
+compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
+logged traceback, JSON Lines skip reasons, and that gzipped JSON members are decompressed
+within their limit with clear per-file errors. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+in the verify project's API container, then checks a truncated ZIP and a ZIP of
+`.json` and `.json.gz` members through the proxy.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -10952,12 +11177,13 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -12279,6 +12505,7 @@ pulled from a document library.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import pathlib
 import random
@@ -12413,6 +12640,21 @@ def write(target: pathlib.Path) -> None:
         for name in ("policies.txt", "policies.md", "policies.pdf",
                      "notes.xyz", "notes.rtf"):
             z.write(target / name, arcname=name)
+
+    # Issue #290. A ZIP cut before its central directory, like an incomplete
+    # download: it once ended the upload in a bare HTTP 500.
+    with zipfile.ZipFile(target / "truncated.zip", "w", zipfile.ZIP_STORED) as z:
+        z.write(target / "policies.txt", arcname="policies.txt")
+    data = (target / "truncated.zip").read_bytes()
+    (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
+    # Gzipped JSON members are decompressed and ingested; JSON Lines is skipped
+    # with its own reason (#291), other gzip types as unsupported.
+    with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(target / "policies.json", arcname="policies.json")
+        z.writestr("bills/policies2.json.gz",
+                   gzip.compress((target / "policies.json").read_bytes(), mtime=0))
+        z.writestr("records.jsonl.gz", gzip.compress(b'{"a": 1}\n', mtime=0))
+        z.writestr("notes.txt.gz", gzip.compress(b"unsupported\n", mtime=0))
 
 
 if __name__ == "__main__":
@@ -12920,7 +13162,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/gz_batch.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -12983,6 +13225,40 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── unreadable archives and gzipped JSON members (#290) ──────────────────────
+# Controlled cases: truncated archives, wrong member offsets, bad CRCs (also in
+# skipped members), unsupported compression, encryption and unwritable members;
+# JSON Lines skip reasons; gzip corruption, size bound and unparseable JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_ingest_errors.py)
+check "upload unpacking errors and gzipped JSON regressions" $?
+
+# A truncated ZIP, like an incomplete download, once ended in a bare HTTP 500.
+code=$(curl -s -m 120 -o /tmp/vfy_trunc.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/truncated.zip")
+read -r err_code names_file <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_trunc.json'))['error']
+except Exception: print('not-json no'); raise SystemExit
+print(e['code'], 'yes' if \"'truncated.zip' is damaged and can't be read\" in e['message'] else 'no')")"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_UNREADABLE ] && [ "$names_file" = yes ]
+check "a truncated ZIP is refused with a readable 400 naming it" $? \
+  "HTTP=$code code=$err_code names-file=$names_file"
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 "$FIX/gz_batch.zip"
+read -r status completed gz_errors <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], len(d['errors']))")"
+[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$gz_errors" = 0 ]
+check "a ZIP's .json and .json.gz members both ingest" $? \
+  "status=$status completed=$completed errors=$gz_errors (want completed 2)"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if sorted(d.get('skipped', [])) == [
+    \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
+    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
+check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
@@ -15909,6 +16185,64 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     fs.unlinkSync(big);
     await s.ctx.close();
+  }
+
+  // ── import errors (#290) ───────────────────────────────────────────────────
+  // A truncated ZIP once ended in a plain-text 500 that the page could only
+  // show as "HTTP 500", and a failing status poll was ignored.
+  r.section('import error messages');
+  {
+    const fs = require('fs');
+    const truncated = '/tmp/vfy-truncated.zip';
+    // A local file header and nothing after it: no central directory.
+    fs.writeFileSync(truncated, Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), Buffer.alloc(64, 0x61)]));
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(truncated);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(2500);
+      const text = await bodyText(s.page);
+      r.check("a truncated ZIP shows the API's message, not HTTP 500",
+              clicked && text.includes("is damaged and can't be read") && !text.includes('HTTP 500'),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(truncated);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfypoll1', status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/vfypoll1')
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      r.check('a failing status poll is shown, not ignored',
+              clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+      r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
   }
 
   // ── health dashboard ───────────────────────────────────────────────────────

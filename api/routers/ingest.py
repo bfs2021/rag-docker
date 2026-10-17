@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from fastapi import APIRouter, Form, UploadFile, File
@@ -14,6 +15,7 @@ from services import weaviate_client as wc
 from utils import api_error
 
 router = APIRouter(prefix="/ingest")
+_log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
     collection: str
@@ -31,6 +33,21 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    try:
+        return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
+                                    similarity_threshold, min_chunk_size, files)
+    except Exception:
+        # Anything not handled below used to reach the client as a plain-text
+        # 500, which the Import page could only show as "HTTP 500" (#290).
+        _log.exception("Upload to collection %r failed unexpectedly (files: %s)",
+                       collection, ", ".join(f.filename or "?" for f in files))
+        return api_error(500, "INGEST_FAILED",
+                         "The upload failed because of an unexpected server error. "
+                         "The API log has the details.")
+
+
+async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
+                         similarity_threshold, min_chunk_size, files):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -51,6 +68,8 @@ async def ingest_upload(
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
         )
+    except ingest_pipeline.UploadRejected as exc:
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
 
