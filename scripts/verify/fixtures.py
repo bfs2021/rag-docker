@@ -151,8 +151,8 @@ def write(target: pathlib.Path) -> None:
         z.write(target / "policies.txt", arcname="policies.txt")
     data = (target / "truncated.zip").read_bytes()
     (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
-    # Gzipped JSON members are decompressed and ingested; JSON Lines is skipped
-    # with its own reason (#291), other gzip types as unsupported.
+    # Gzipped JSON and JSON Lines members are decompressed and ingested (#290,
+    # #291); other gzip types are skipped as unsupported.
     with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.write(target / "policies.json", arcname="policies.json")
         z.writestr("bills/policies2.json.gz",
@@ -168,6 +168,19 @@ def write(target: pathlib.Path) -> None:
         "meta": {"author": "Zoë Müller"},
         "tags": ["policy", "remote"],
     }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Issue #291. JSON Lines: one record per line, converted like ordinary JSON,
+    # plain and gzipped; a line with no text adds nothing. bad.jsonl has a
+    # malformed second line, which fails the whole file.
+    records = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (
+        {"bill": "HR-1", "title": "Remote work act", "sponsor": {"name": "Zoë Müller"}},
+        {},
+        {"bill": "HR-2", "title": "Expense filing act", "tags": ["finance", "deadline"]},
+    ))
+    (target / "records.jsonl").write_text(records, encoding="utf-8")
+    (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
+    (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
+                                      encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/plain.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/bad.jsonl" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -72,7 +72,8 @@ check "each skip names the unsupported extension" $?
 # ── unreadable archives and gzipped JSON members (#290) ──────────────────────
 # Controlled cases: truncated archives, wrong member offsets, bad CRCs (also in
 # skipped members), unsupported compression, encryption and unwritable members;
-# JSON Lines skip reasons; gzip corruption, size bound and unparseable JSON.
+# which JSON Lines inputs are queued; gzip corruption, size bound and
+# unparseable JSON.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_ingest_errors.py)
 check "upload unpacking errors and gzipped JSON regressions" $?
 
@@ -93,15 +94,13 @@ ingest "$C" fixed 200 40 "$FIX/gz_batch.zip"
 read -r status completed gz_errors <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_job.json'))
 print(d['status'], d['files_completed'], len(d['errors']))")"
-[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$gz_errors" = 0 ]
-check "a ZIP's .json and .json.gz members both ingest" $? \
-  "status=$status completed=$completed errors=$gz_errors (want completed 2)"
+[ "$status" = completed ] && [ "$completed" = 3 ] && [ "$gz_errors" = 0 ]
+check "a ZIP's .json, .json.gz and .jsonl.gz members all ingest" $? \
+  "status=$status completed=$completed errors=$gz_errors (want completed 3)"
 python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
-sys.exit(0 if sorted(d.get('skipped', [])) == [
-    \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
-    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
-check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
+sys.exit(0 if d.get('skipped', []) == [\"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\"] else 1)"
+check "only the other gzip member is skipped, as unsupported" $?
 
 # ── ordinary JSON as readable text (#295) ────────────────────────────────────
 # Controlled cases: every conversion rule, file key order, non-ASCII text,
@@ -134,6 +133,57 @@ if missing or syntax:
 ENDPY
 )
 check "its chunks hold key: value text with non-ASCII kept" $?
+
+# ── JSON Lines (#291) ────────────────────────────────────────────────────────
+# Controlled cases: conversion per line, blank and malformed lines, the line
+# and text limits, bounded reading, gzip errors, rechunk of a retained file.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jsonl_ingest.py)
+check "JSON Lines regressions" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/records.jsonl" "$FIX/records.jsonl.gz"
+read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$chunks" -ge 2 ]
+check "a direct .jsonl and a direct .jsonl.gz both ingest" $? \
+  "status=$status completed=$completed chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    objects = [o.properties for o in collection.iterator()]
+finally:
+    wc.close_client()
+wanted = ("bill: HR-1\ntitle: Remote work act\nsponsor.name: Zoë Müller\n\n"
+          "bill: HR-2\ntitle: Expense filing act\ntags: finance, deadline")
+problems = []
+for name in ("records.jsonl", "records.jsonl.gz"):
+    mine = sorted((o for o in objects if o["source_file"] == name), key=lambda o: o["chunk_index"])
+    text = "".join(o["content"] for o in mine)
+    if text != wanted:
+        problems.append(f"{name}: text {text!r}")
+    if {o["source_type"] for o in mine} != {"jsonl"}:
+        problems.append(f"{name}: source_type {sorted({o['source_type'] for o in mine})}")
+if problems:
+    print("; ".join(problems), file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "their chunks hold one key: value record per line, source_type jsonl" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/bad.jsonl"
+read -r status first_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], 'yes' if d['errors'] == ['bad.jsonl: line 2 is not valid JSON: Expecting value at column 10'] else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
+check "a malformed line fails the file with its line number and stores nothing" $? \
+  "status=$status error=$first_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with

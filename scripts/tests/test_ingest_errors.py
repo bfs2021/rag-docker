@@ -1,4 +1,5 @@
-"""Upload unpacking errors and gzipped JSON members (issue #290).
+"""Upload unpacking errors and gzipped JSON members (issue #290); which JSON
+Lines inputs are queued (#291).
 
 Runs with the API's dependencies, inside the verify project's API container:
 
@@ -187,7 +188,7 @@ class UploadErrorTests(unittest.TestCase):
         self.assertIn("'Coll'", record.getMessage())
         self.assertIn("a.txt", record.getMessage())
 
-    def test_json_gz_member_is_queued_and_other_gz_skipped(self):
+    def test_json_gz_and_jsonl_members_are_queued_and_other_gz_skipped(self):
         data = zip_bytes([("docs/a.json", JSON_DOC),
                           ("docs/b.json.gz", gzip.compress(JSON_DOC.encode())),
                           ("docs/c.txt.gz", gzip.compress(b"text")),
@@ -201,24 +202,29 @@ class UploadErrorTests(unittest.TestCase):
         with patch.object(ingest_pipeline, "_process_job_sync", record):
             status, body = self.post(upload("batch.zip", data),
                                      upload("direct.json.gz", gzip.compress(b"{}")),
-                                     upload("direct.jsonl", b"{}\n"))
+                                     upload("other.txt.gz", gzip.compress(b"text")),
+                                     upload("direct.jsonl", b"{}\n"),
+                                     upload("Direct.JSONL.GZ", gzip.compress(b"{}\n")))
         self.assertEqual(status, 202, body)
         self.addCleanup(ingest_pipeline._jobs.pop, body["job_id"], None)
         job = ingest_pipeline.get_job(body["job_id"])
-        self.assertEqual(job["files_total"], 2)
-        jsonl = "(JSON Lines (.jsonl) isn't supported yet, see #291)"
+        self.assertEqual(job["files_total"], 6)
+        # JSON Lines is queued, direct or as a member (#291); a direct .json.gz
+        # and other gzip types are still skipped as unsupported.
         self.assertEqual(sorted(job["skipped"]), sorted([
             "batch.zip:docs/c.txt.gz (unsupported type '.gz')",
-            f"batch.zip:docs/d.jsonl {jsonl}",
-            f"batch.zip:docs/e.JSONL.gz {jsonl}",
             "direct.json.gz (unsupported type '.gz')",
-            f"direct.jsonl {jsonl}"]))
+            "other.txt.gz (unsupported type '.gz')"]))
+        self.assertFalse(any("#291" in s or "JSON Lines" in s for s in job["skipped"]))
         # The worker's arguments end with labels, then logical names (#22).
         paths, labels, names = started["args"][1], started["args"][-2], started["args"][-1]
         self.assertTrue(all(p.is_file() for p in paths))
-        self.assertEqual(sorted(labels[p] for p in paths),
-                         ["batch.zip:docs/a.json", "batch.zip:docs/b.json.gz"])
-        self.assertEqual(sorted(names[p] for p in paths), ["docs/a.json", "docs/b.json.gz"])
+        self.assertEqual(sorted(labels[p] for p in paths), sorted([
+            "batch.zip:docs/a.json", "batch.zip:docs/b.json.gz", "batch.zip:docs/d.jsonl",
+            "batch.zip:docs/e.JSONL.gz", "direct.jsonl", "Direct.JSONL.GZ"]))
+        self.assertEqual(sorted(names[p] for p in paths), sorted([
+            "docs/a.json", "docs/b.json.gz", "docs/d.jsonl", "docs/e.JSONL.gz",
+            "direct.jsonl", "Direct.JSONL.GZ"]))
 
 
 class JsonGzParseTests(unittest.TestCase):

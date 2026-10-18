@@ -3154,12 +3154,18 @@ from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
-# Gzipped JSON is accepted inside a ZIP only (issue #290). It is decompressed
-# when the job parses it, never more than this many bytes: the per-request
-# upload limit, so gzip cannot bring in more than a plain upload could.
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
+# Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
+# directly or inside a ZIP (#291). Either is decompressed when the job parses
+# it, never more than this many bytes: the per-request upload limit, so gzip
+# cannot bring in more than a plain upload could.
 GZIP_JSON_SUFFIX = ".json.gz"
+GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+# The most of one JSON Lines line that is read (#291). A line is parsed whole,
+# so this bounds the memory one record can take (a 10 MB line of small numbers
+# parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+MAX_JSONL_LINE_BYTES = 10_000_000
 
 # Job records survive an API restart (#23); see jobstore.py.
 _jobs = jobstore.JobStore("ingest")
@@ -3187,25 +3193,39 @@ def _is_json_gz(name: str) -> bool:
     return name.lower().endswith(GZIP_JSON_SUFFIX)
 
 
+def _is_jsonl_gz(name: str) -> bool:
+    return name.lower().endswith(GZIP_JSONL_SUFFIX)
+
+
+def _is_jsonl(name: str) -> bool:
+    return name.lower().endswith(".jsonl") or _is_jsonl_gz(name)
+
+
 def _skip_reason(name: str) -> str:
     """Why a file is not ingested, for the job's `skipped` list."""
-    lower = name.lower()
-    if lower.endswith(".jsonl") or lower.endswith(".jsonl.gz"):
-        return "JSON Lines (.jsonl) isn't supported yet, see #291"
-    return f"unsupported type '{Path(lower).suffix or 'none'}'"
+    return f"unsupported type '{Path(name.lower()).suffix or 'none'}'"
 
 
 def source_type_of(path: Path) -> str:
     """The source_type stored with a file's chunks: what was parsed, so a
-    gzipped JSON file is "json", like a plain one."""
+    gzipped JSON file is "json" and gzipped JSON Lines "jsonl", like plain ones."""
     if _is_json_gz(path.name):
         return "json"
+    if _is_jsonl_gz(path.name):
+        return "jsonl"
     return path.suffix.lower().lstrip(".")
 
 
 def _save_upload(src, dest: Path) -> None:
     with dest.open("wb") as fh:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
+
+
+def _gzip_too_large() -> ValueError:
+    return ValueError(
+        f"decompresses to more than "
+        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
+        f"one compressed file; nothing from it was stored")
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
@@ -3219,10 +3239,7 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
                     break
                 written += len(block)
                 if written > MAX_GZIP_DECOMPRESSED_BYTES:
-                    raise ValueError(
-                        f"decompresses to more than "
-                        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
-                        f"one compressed file; nothing from it was stored")
+                    raise _gzip_too_large()
                 out.write(block)
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
@@ -3423,7 +3440,134 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         plain.unlink(missing_ok=True)
 
 
+class _JsonlError(ValueError):
+    """A JSON Lines file that can't be ingested; `detail` names the line (#291)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class _JsonlTooLarge(_JsonlError):
+    """A JSON Lines file whose text passes the per-file limit."""
+
+
+class _BoundedLines:
+    """Lines of a decompressing stream, refusing more than the gzip limit."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.read = 0
+
+    def readline(self, size: int) -> bytes:
+        line = self.stream.readline(size)
+        self.read += len(line)
+        if self.read > MAX_GZIP_DECOMPRESSED_BYTES:
+            raise _gzip_too_large()
+        return line
+
+
+_JSONL_BLANK = b" \t\r"
+
+
+def _jsonl_records(stream: Any) -> list[str]:
+    """The records of a JSON Lines file, one per line with text (#291).
+
+    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it, and stopped at
+    the first bad line or when the file's text passes the per-file limit, so
+    memory is bounded by one line and that limit, never by the file's size.
+    """
+    budget = _JsonBudget()
+    records: list[str] = []
+    number = 0
+    blank = None  # the first blank line not yet followed by a record
+    while True:
+        raw = stream.readline(MAX_JSONL_LINE_BYTES + 1)
+        if not raw:
+            break
+        number += 1
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+            too_long = False
+        else:
+            # No newline: either the last line, or a line over the limit.
+            too_long = len(raw) > MAX_JSONL_LINE_BYTES
+        shift = 0
+        if number == 1 and raw.startswith(b"\xef\xbb\xbf"):
+            raw, shift = raw[3:], 3
+        if not too_long and not raw.strip(_JSONL_BLANK):
+            if blank is None:
+                blank = number
+            continue
+        # Trailing blank lines are accepted; one followed by a record is not.
+        if blank is not None:
+            raise _JsonlError(f"line {blank} is blank")
+        if too_long:
+            raise _JsonlError(
+                f"line {number} is longer than {MAX_JSONL_LINE_BYTES:,} bytes, the most one "
+                f"line can hold; split the record across lines or files")
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _JsonlError(f"line {number} is not UTF-8 text "
+                              f"({exc.reason} at byte {exc.start + shift})") from exc
+        try:
+            value = json.loads(line, parse_int=_JsonNumber, parse_float=_JsonNumber,
+                               parse_constant=_reject_constant)
+            lines: list[str] = []
+            left = budget.left
+            _json_lines(value, None, lines, budget)
+            text = "\n".join(lines)
+            if text.strip():
+                if records:
+                    budget.spend(2)  # the blank line before this record
+                records.append(text)
+            else:
+                budget.left = left  # a record with no text is not stored
+        except _JsonTooLarge as exc:
+            raise _JsonlTooLarge(
+                f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text by "
+                f"line {number}, the per-file limit for every chunking strategy; "
+                f"split the file") from exc
+        except _JsonError as exc:
+            raise _JsonlError(f"line {number} is not valid JSON: {exc.detail}") from exc
+        except json.JSONDecodeError as exc:
+            raise _JsonlError(
+                f"line {number} is not valid JSON: {exc.msg} at column {exc.colno}") from exc
+        except RecursionError as exc:
+            raise _JsonlError(
+                f"line {number} is not valid JSON: it is nested too deeply to read") from exc
+    return records
+
+
+def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
+    """JSON Lines, plain or gzipped: each line is one record, converted like
+    ordinary JSON (#295), records separated by a blank line (#291). Lines are
+    never treated as serialized Unstructured elements."""
+    if _is_jsonl_gz(path.name):
+        try:
+            # Decompressed while read; nothing decompressed is written to disk.
+            with gzip.open(path, "rb") as gz:
+                records = _jsonl_records(_BoundedLines(gz))
+        except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+            raise ValueError(
+                f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+        except _JsonlError as exc:
+            subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
+            raise ValueError(f"was decompressed, but {subject}{exc.detail}") from exc
+    else:
+        try:
+            with path.open("rb") as fh:
+                records = _jsonl_records(fh)
+        except _JsonlError as exc:
+            raise ValueError(exc.detail) from exc
+    from unstructured.documents.elements import Text
+    return "\n\n".join(records), [Text(text=record) for record in records]
+
+
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
+    if _is_jsonl(path.name):
+        return _parse_jsonl(path)
     if _is_json_gz(path.name):
         return _parse_json_gz(path)
     ext = path.suffix.lower()
@@ -3806,7 +3950,7 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
         for member, logical in members:
             basename = PurePosixPath(logical).name
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
-                    or _is_json_gz(basename)):
+                    or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
                     f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
                 continue
@@ -3888,7 +4032,9 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             if safe_name.lower().endswith(".zip"):
                 _extract_zip(dest, safe_name, queue)
                 os.remove(dest)
-            elif Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS:
+            elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
+                  or _is_jsonl_gz(safe_name)):
+                # A directly uploaded .json.gz is still skipped (#291 scope).
                 queue.add(dest, safe_name, safe_name)
             else:
                 skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
@@ -10517,8 +10663,8 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
-        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
+        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
 
@@ -12054,10 +12200,11 @@ and do not replace, this live acceptance.
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
 wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
 compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
-logged traceback, JSON Lines skip reasons, and that gzipped JSON members are decompressed
+logged traceback, which inputs are queued (JSON Lines direct and as members, #291; a direct
+`.json.gz` and other gzip types skipped), and that gzipped JSON members are decompressed
 within their limit with clear per-file errors. Weaviate and source retention are mocked. `02_ingest.sh` runs it
 in the verify project's API container, then checks a truncated ZIP and a ZIP of
-`.json` and `.json.gz` members through the proxy.
+`.json`, `.json.gz` and `.jsonl.gz` members through the proxy.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -12068,6 +12215,22 @@ fast with bounded memory), and readable errors for invalid JSON in `.json` files
 `.json.gz` members. `02_ingest.sh` runs it in the API
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
 back to confirm they hold that text.
+
+`scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
+becomes one `key: value` record per line, separated by blank lines, with one element per
+record: object, array and scalar lines, lines with no text dropped, CRLF, a byte-order mark,
+no final newline, trailing blank lines accepted and U+2028 kept inside its line. Every line
+error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
+non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
+text limit are checked at and one past their edges, and a file far over the limit stops
+being read at the line that passes it, with a small traced peak. Gzip: the same text as plain,
+the `was decompressed, but` prefix, corrupt, truncated and over-size data. It also checks
+`source_type` `jsonl`, a job that stores nothing for a bad file beside a good one, and
+rechunk of a retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a
+direct `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back,
+and checks that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing.
+`browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
+`.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
 `scripts/tests/test_delete_busy.py` (#40) checks that `DELETE /collections/{name}` answers
 `409 COLLECTION_BUSY`, naming the job, while an ingest, export, import, tune or gold-standard
@@ -12208,7 +12371,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
@@ -12216,6 +12379,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
+| `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
@@ -12223,7 +12387,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -13682,8 +13846,8 @@ def write(target: pathlib.Path) -> None:
         z.write(target / "policies.txt", arcname="policies.txt")
     data = (target / "truncated.zip").read_bytes()
     (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
-    # Gzipped JSON members are decompressed and ingested; JSON Lines is skipped
-    # with its own reason (#291), other gzip types as unsupported.
+    # Gzipped JSON and JSON Lines members are decompressed and ingested (#290,
+    # #291); other gzip types are skipped as unsupported.
     with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.write(target / "policies.json", arcname="policies.json")
         z.writestr("bills/policies2.json.gz",
@@ -13699,6 +13863,19 @@ def write(target: pathlib.Path) -> None:
         "meta": {"author": "Zoë Müller"},
         "tags": ["policy", "remote"],
     }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Issue #291. JSON Lines: one record per line, converted like ordinary JSON,
+    # plain and gzipped; a line with no text adds nothing. bad.jsonl has a
+    # malformed second line, which fails the whole file.
+    records = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (
+        {"bill": "HR-1", "title": "Remote work act", "sponsor": {"name": "Zoë Müller"}},
+        {},
+        {"bill": "HR-2", "title": "Expense filing act", "tags": ["finance", "deadline"]},
+    ))
+    (target / "records.jsonl").write_text(records, encoding="utf-8")
+    (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
+    (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
+                                      encoding="utf-8")
 
 
 if __name__ == "__main__":
@@ -14206,7 +14383,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/plain.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/bad.jsonl" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -14273,7 +14450,8 @@ check "each skip names the unsupported extension" $?
 # ── unreadable archives and gzipped JSON members (#290) ──────────────────────
 # Controlled cases: truncated archives, wrong member offsets, bad CRCs (also in
 # skipped members), unsupported compression, encryption and unwritable members;
-# JSON Lines skip reasons; gzip corruption, size bound and unparseable JSON.
+# which JSON Lines inputs are queued; gzip corruption, size bound and
+# unparseable JSON.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_ingest_errors.py)
 check "upload unpacking errors and gzipped JSON regressions" $?
 
@@ -14294,15 +14472,13 @@ ingest "$C" fixed 200 40 "$FIX/gz_batch.zip"
 read -r status completed gz_errors <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_job.json'))
 print(d['status'], d['files_completed'], len(d['errors']))")"
-[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$gz_errors" = 0 ]
-check "a ZIP's .json and .json.gz members both ingest" $? \
-  "status=$status completed=$completed errors=$gz_errors (want completed 2)"
+[ "$status" = completed ] && [ "$completed" = 3 ] && [ "$gz_errors" = 0 ]
+check "a ZIP's .json, .json.gz and .jsonl.gz members all ingest" $? \
+  "status=$status completed=$completed errors=$gz_errors (want completed 3)"
 python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
-sys.exit(0 if sorted(d.get('skipped', [])) == [
-    \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
-    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
-check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
+sys.exit(0 if d.get('skipped', []) == [\"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\"] else 1)"
+check "only the other gzip member is skipped, as unsupported" $?
 
 # ── ordinary JSON as readable text (#295) ────────────────────────────────────
 # Controlled cases: every conversion rule, file key order, non-ASCII text,
@@ -14335,6 +14511,57 @@ if missing or syntax:
 ENDPY
 )
 check "its chunks hold key: value text with non-ASCII kept" $?
+
+# ── JSON Lines (#291) ────────────────────────────────────────────────────────
+# Controlled cases: conversion per line, blank and malformed lines, the line
+# and text limits, bounded reading, gzip errors, rechunk of a retained file.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jsonl_ingest.py)
+check "JSON Lines regressions" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/records.jsonl" "$FIX/records.jsonl.gz"
+read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$chunks" -ge 2 ]
+check "a direct .jsonl and a direct .jsonl.gz both ingest" $? \
+  "status=$status completed=$completed chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    objects = [o.properties for o in collection.iterator()]
+finally:
+    wc.close_client()
+wanted = ("bill: HR-1\ntitle: Remote work act\nsponsor.name: Zoë Müller\n\n"
+          "bill: HR-2\ntitle: Expense filing act\ntags: finance, deadline")
+problems = []
+for name in ("records.jsonl", "records.jsonl.gz"):
+    mine = sorted((o for o in objects if o["source_file"] == name), key=lambda o: o["chunk_index"])
+    text = "".join(o["content"] for o in mine)
+    if text != wanted:
+        problems.append(f"{name}: text {text!r}")
+    if {o["source_type"] for o in mine} != {"jsonl"}:
+        problems.append(f"{name}: source_type {sorted({o['source_type'] for o in mine})}")
+if problems:
+    print("; ".join(problems), file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "their chunks hold one key: value record per line, source_type jsonl" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/bad.jsonl"
+read -r status first_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], 'yes' if d['errors'] == ['bad.jsonl: line 2 is not valid JSON: Expecting value at column 10'] else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
+check "a malformed line fails the file with its line number and stores nothing" $? \
+  "status=$status error=$first_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
@@ -17780,6 +18007,28 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     fs.unlinkSync(big);
     await s.ctx.close();
+  }
+
+  // ── import file types (#291) ───────────────────────────────────────────────
+  // The picker offers JSON Lines, plain and gzipped, and the hint names it.
+  r.section('import file types');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const accept = await s.page.evaluate(() => {
+        const input = document.querySelector('#file-input');
+        return input ? input.getAttribute('accept') : null;
+      });
+      r.check('the file picker accepts .jsonl and .jsonl.gz',
+              accept === '.pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip', String(accept));
+      const hint = await bodyText(s.page);
+      r.check('the drop zone hint names JSONL among the types',
+              hint.includes('PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to 512 MB per upload'),
+              hint.slice(0, 200));
+    } finally {
+      await s.ctx.close();
+    }
   }
 
   // ── import errors (#290) ───────────────────────────────────────────────────
