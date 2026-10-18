@@ -226,9 +226,20 @@ non-ASCII text and numbers as written, one element per top-level record, empty v
 files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
 converted text bounded by the chunker's per-file limit (a long key over many values fails
 fast with bounded memory), and readable errors for invalid JSON in `.json` files and
-`.json.gz` members. `02_ingest.sh` runs it in the API
+`.json.gz` members. For #300 it also checks the bounds on what one JSON file may cost: the
+blank lines between records charged to the text limit (exactly at the limit, and one dropped
+record refunded), the 1,000,000-record cap (records with no text not counted; a file of
+1,000,001 tiny records fails fast with a bounded peak and builds no elements), the
+30,000,000-byte input limit at and one past the edge (element-schema files and a byte-order
+mark included), a `.json.gz` member that stops decompressing at that limit, the exact messages,
+a job where over-limit files fail alone, the traced peak of deep long keys and of an over-long
+scalar array, and that an element-schema file's first parse is freed before `partition_json`
+runs. `02_ingest.sh` runs it in the API
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
-back to confirm they hold that text.
+back to confirm they hold that text. It then uploads `json_over_size.json` (30,000,001 bytes),
+`json_many_records.json` (1,000,001 records), `json_over_size_gz.zip` (a `.json.gz` member one
+byte over the limit when decompressed) and `plain.json` together, and checks that the job is
+`partial`, each over-limit file fails with its exact message, and `plain.json` is stored.
 
 `scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
 becomes one `key: value` record per line, separated by blank lines, with one element per
@@ -385,7 +396,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |

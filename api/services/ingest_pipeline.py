@@ -26,10 +26,11 @@ from services import weaviate_client as wc
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
 # Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
 # directly or inside a ZIP (#291). Either is decompressed when the job parses
-# it, never more than this many bytes. The bound is per file, so several
-# gzipped members could each reach it: a ZIP's members, their gzip output
-# included, are bounded together by settings.max_zip_expanded_bytes (#298). A
-# directly uploaded .jsonl.gz is bounded by this alone.
+# it: a .json.gz never past MAX_JSON_INPUT_BYTES (#300), a .jsonl.gz never past
+# MAX_GZIP_DECOMPRESSED_BYTES. The bounds are per file, so several gzipped
+# members could each reach them: a ZIP's members, their gzip output included,
+# are bounded together by settings.max_zip_expanded_bytes (#298). A directly
+# uploaded .jsonl.gz is bounded by its own limit alone.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
@@ -100,7 +101,8 @@ def _gzip_too_large() -> ValueError:
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
-    """Decompress src into dest in blocks, refusing more than the limit."""
+    """Decompress a .json.gz into dest in blocks, stopping as soon as the output
+    passes the JSON input limit (#300)."""
     written = 0
     try:
         with gzip.open(src, "rb") as gz, dest.open("wb") as out:
@@ -109,8 +111,8 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
                 if not block:
                     break
                 written += len(block)
-                if written > MAX_GZIP_DECOMPRESSED_BYTES:
-                    raise _gzip_too_large()
+                if written > MAX_JSON_INPUT_BYTES:
+                    raise ValueError(_json_input_too_large("decompresses to more than"))
                 out.write(block)
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
@@ -142,6 +144,33 @@ class _JsonTooLarge(_JsonError):
 # so the bound refuses nothing that could have been ingested; it only refuses
 # before the text is built.
 MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
+# The most bytes of one JSON file that are parsed (#300). A .json file is parsed
+# whole, before the text bound can be checked, and parsing takes up to about 34
+# times the file's size (`[[1],[1],...]`), so this bounds one file's parse at
+# about 1 GB. A .json.gz member stops decompressing here. JSON Lines files are
+# read a line at a time and have their own limits.
+MAX_JSON_INPUT_BYTES = 30_000_000
+# The most records one JSON file may keep (#300). Each kept record of a
+# top-level array becomes its own element, and the text bound alone still
+# allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
+# blank line between records). A file of more than this many records averages
+# under 8 characters a record; any other passes the text bound first.
+MAX_JSON_RECORDS = 1_000_000
+
+
+def _json_input_too_large(verb: str) -> str:
+    return (f"{verb} {MAX_JSON_INPUT_BYTES:,} bytes, the most one JSON file can hold; "
+            f"split the file or convert it to JSON Lines")
+
+
+class _JsonTooManyRecords(_JsonError):
+    """Valid JSON with more kept records than one file may hold (#300)."""
+
+    def __init__(self) -> None:
+        detail = (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+                  f"split the file")
+        ValueError.__init__(self, detail)
+        self.detail = detail
 
 
 class _JsonNumber:
@@ -264,6 +293,10 @@ def _json_records(value: Any) -> list[str]:
             _json_lines(group, None, lines, budget)
             text = "\n".join(lines)
             if text.strip():
+                if records:
+                    budget.spend(2)  # the blank line before this record (#300)
+                if len(records) == MAX_JSON_RECORDS:
+                    raise _JsonTooManyRecords()
                 records.append(text)
             else:
                 budget.left = left  # a dropped record's text is not stored
@@ -275,12 +308,18 @@ def _json_records(value: Any) -> list[str]:
 def _parse_json(path: Path) -> tuple[str, list[Any]]:
     """Ordinary JSON becomes `key: value` text, one element per record. A file of
     serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    # Checked before anything is read: the parse is the cost (#300).
+    if path.stat().st_size > MAX_JSON_INPUT_BYTES:
+        raise ValueError(_json_input_too_large("is larger than"))
     raw, value = _read_json(path)
     if not raw:
         return "", []
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
         from unstructured.partition.json import partition_json
+        # partition_json parses the text again: drop the first parse first, so
+        # the two are not held together (#300).
+        value = None
         # The text already read, so a byte-order mark is handled the same way.
         elements = partition_json(text=raw)
         return "\n".join(str(el) for el in elements), elements
@@ -298,7 +337,7 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         _gunzip_bounded(path, plain)
         try:
             return _parse_json(plain)
-        except _JsonTooLarge as exc:
+        except (_JsonTooLarge, _JsonTooManyRecords) as exc:
             raise ValueError(f"was decompressed, but it {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
