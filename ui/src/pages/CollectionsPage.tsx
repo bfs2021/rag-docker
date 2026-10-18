@@ -13,6 +13,9 @@ export default function CollectionsPage() {
   const [ef, setEf] = useState(64)
   const [deleteTarget, setDeleteTarget] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState('')
+  // Shown inside the delete dialog: the page-level error sits behind its
+  // overlay, so a refused delete (409 while a job runs, #40) looked like nothing.
+  const [deleteError, setDeleteError] = useState('')
 
   async function load() {
     api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
@@ -37,10 +40,17 @@ export default function CollectionsPage() {
       await api.deleteCollection(deleteTarget)
       setDeleteTarget('')
       setDeleteConfirm('')
+      setDeleteError('')
       load()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setDeleteError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function closeDelete() {
+    setDeleteTarget('')
+    setDeleteConfirm('')
+    setDeleteError('')
   }
 
   return (
@@ -70,7 +80,7 @@ export default function CollectionsPage() {
               <td className="py-2">{c.distance_metric}</td>
               <td className="py-2 text-gray-500">{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
               <td className="py-2">
-                <button onClick={() => setDeleteTarget(c.name)} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
               </td>
             </tr>
           ))}
@@ -129,8 +139,9 @@ export default function CollectionsPage() {
             <h2 className="font-semibold text-red-600 mb-3">Delete Collection</h2>
             <p className="text-sm text-gray-600 mb-3">Type <strong>{deleteTarget}</strong> to confirm deletion of all objects.</p>
             <input value={deleteConfirm} onChange={e => setDeleteConfirm(e.target.value)} placeholder={deleteTarget} className="border rounded px-3 py-2 text-sm w-full mb-4" />
+            {deleteError && <p role="alert" className="text-red-600 text-sm mb-4">{deleteError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setDeleteTarget(''); setDeleteConfirm('') }} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={closeDelete} className="text-sm text-gray-500">Cancel</button>
               <button onClick={deleteCollection} disabled={deleteConfirm !== deleteTarget} className="bg-red-600 text-white px-4 py-2 rounded text-sm disabled:opacity-40 hover:bg-red-700">Delete</button>
             </div>
           </div>

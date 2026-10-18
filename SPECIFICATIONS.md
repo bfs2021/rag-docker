@@ -32,6 +32,12 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
+      # Auto-schema (on by default) made an insert into a deleted collection
+      # recreate it, with inferred properties, no vectorizer and no app
+      # registration (issue #40). Every collection is created explicitly with
+      # the fixed properties, so nothing needs it; an insert into a missing
+      # collection now fails instead.
+      AUTOSCHEMA_ENABLED: 'false'
       # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
       # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
       # the IP recorded in weaviate_data no longer matches after `compose down`
@@ -380,6 +386,29 @@ Before deletion, resolves the backend's canonical collection name. After success
 ```json
 { "error": { "code": "CONFIRMATION_REQUIRED", "message": "Add ?confirm=true to confirm deletion.", "detail": null } }
 ```
+
+**Response 409** while a job is active for the collection (issue #40): an ingest,
+export, import, tune or gold-standard generation job, under either spelling of the
+name. Nothing is deleted. The message names the first job's kind and id; `detail`
+names it and lists every active job, oldest first. For gold-standard generation the
+id is the session id.
+```json
+{ "error": { "code": "COLLECTION_BUSY",
+  "message": "An ingest job is running for this collection ('Documents', job 1a2b3c4d). Delete the collection after the job finishes.",
+  "detail": { "collection": "Documents", "job_kind": "ingest", "job_id": "1a2b3c4d",
+              "jobs": [ { "job_kind": "ingest", "job_id": "1a2b3c4d" } ] } } }
+```
+The message starts "An ingest job", "An export job", "An import job", "A tuning job"
+or "A gold-standard generation job" "is running for this collection". A delete never
+waits behind a job: a job counts as active from its admission (ingest: before its
+upload is saved; import: once its target name is known; generation: once its session
+is published) until just before its status turns terminal, so a client that has seen
+the job end can delete at once. While the delete waits for the collection's writer
+guard (held briefly by collection creation, say), it rechecks every 0.25 s and
+answers `409` as soon as a job appears; it checks once more when it holds the guard.
+A job admitted after that last check is not refused at admission: it meets a deleted
+collection, which no insert can recreate (§5.4). Deletions an import-replace or a
+tune makes of its own target are not subject to this check.
 
 ---
 
@@ -979,6 +1008,7 @@ Standard error codes:
 |---|---|---|
 | `COLLECTION_NOT_FOUND` | 404 | Named collection does not exist |
 | `COLLECTION_EXISTS` | 409 | Collection already exists |
+| `COLLECTION_BUSY` | 409 | Delete refused while an ingest, export, import, tune or gold-standard generation job is active for the collection; generation could not get the collection's writer guard within one second |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
@@ -1422,6 +1452,19 @@ For each chunk, the API service creates a Weaviate object with all properties po
 
 Inserts are batched: up to 50 objects per batch using the weaviate-client v4 context-manager pattern (`with client.batch.dynamic() as batch: batch.add_object(...)`).
 
+Inserts never create a collection. Weaviate's auto-schema is off
+(`AUTOSCHEMA_ENABLED: 'false'`, §2.1): with it on, an insert sent after its
+collection was deleted recreated the collection with inferred properties, no
+vectorizer and no registry entry (issue #40). Every collection is created explicitly
+with the §4.1 properties, so an insert into a missing collection, or one carrying a
+property the collection does not declare, fails instead. When storing a file's chunks
+fails and the job's collection no longer exists, the ingest job stops: it ends
+`failed` and adds the error `collection '<name>' was deleted while this job was
+running`; that file and every later one count as failed, files already stored stay
+counted, and no later file is parsed or retained. The underlying batch error goes to
+the API log. Only a failed store checks for the collection; other failures are
+reported per file as before.
+
 **Query-time embedding paths:**
 
 | Retrieval mode | Weaviate query type | Who embeds the query |
@@ -1716,6 +1759,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Table of collections: name, object count, index type, distance metric, created date.
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
+- A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
 
@@ -1988,6 +2032,38 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
       *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes 19 checks in 1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
+- [x] Deleting a collection while an ingest, export, import, tune or gold-standard generation job is active for it (either spelling) answers `409 COLLECTION_BUSY` naming the job's kind and id, deletes nothing and does not wait for the job; once the job's status is terminal the delete succeeds (#40).
+      *Issue #40 reported a `DELETE` during an ingest returning `200`, the job failing
+      with batch errors, and the collection coming back with 608 objects and no
+      `created_at`. On `develop` at 3a8d462 the writer guard (since the issue was written)
+      made the `DELETE` wait for the whole job instead (223 s for a 1,373-chunk upload)
+      and then delete what it stored, and a `DELETE` that ran before a queued job's
+      worker still let the job recreate the collection. **Fixed**: one registry of active
+      jobs per canonical collection name, checked before and while the delete waits for
+      the writer guard and again once it holds it. `test_delete_busy.py` (18 cases in the
+      API image) drives each kind's real start path, checks its registration ends before
+      its status turns terminal, and arranges the request orderings with events: a job
+      registered before the delete, while the delete waits for the guard (refused within a
+      second while the guard is still held), and once the delete holds it.
+      `02_ingest.sh` sends a `DELETE` while a 180-chunk upload is still embedding (`409`,
+      objects in place), and again after the job completes (`200`, still gone 10 s later).
+      Full verification run 2026-10-17: all seven suites passed (10m57s).*
+- [x] An insert never creates a collection: an insert into a deleted collection fails and the collection stays absent (#40).
+      *Weaviate's auto-schema recreated the class with inferred properties, no
+      vectorizer and no vector index, which the app listed with `index_type: unknown`
+      and no `created_at`. **Fixed**: `AUTOSCHEMA_ENABLED: 'false'` (§2.1); every path
+      that makes a collection already created it explicitly. `02_ingest.sh` creates,
+      deletes and then inserts into a collection in the API container, and checks the
+      insert fails and nothing is recreated. The full run is the check that import,
+      tuning rebuilds and export do not rely on auto-schema.*
+- [x] An ingest job whose collection is deleted before or while it stores fails with "collection '<name>' was deleted while this job was running", stops processing files and retains no originals for them (#40).
+      *The job used to report "Stored vector is missing or invalid" (auto-schema on) or
+      a cleanup error saying accepted chunks may remain (auto-schema off), neither
+      naming the deletion. `test_delete_busy.py` covers a job admitted after a completed
+      delete, a collection deleted between two files, a store failure with the collection
+      present and a failed existence check (both reported as before), and a parse failure,
+      which does not consult the collection's existence.*
+
 ### 10.2 Query
 
 - [x] Invalid query enums, bounds and non-finite values return a serializable 422 before retrieval or model work.
@@ -2110,6 +2186,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
+- [x] A refused delete is shown in the delete dialog: the dialog stays open with the API's message as an alert, the collection stays listed, and Cancel clears the message (#40).
+      *Before, the error went to the page-level line behind the dialog's overlay, so a
+      refused delete looked like nothing happened. `ui_criteria.js` answers the `DELETE`
+      with a synthetic `409 COLLECTION_BUSY` by request interception, so no collection is
+      touched, and checks one `DELETE` was sent, the alert inside the dialog, the row and
+      the cleared message after Cancel.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message

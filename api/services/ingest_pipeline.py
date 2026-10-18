@@ -318,6 +318,35 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+class _CollectionDeleted(Exception):
+    """Storing failed because the job's collection no longer exists (#40)."""
+
+
+def _collection_gone(collection: str) -> bool:
+    """True only when the backend answers that the collection is missing. A
+    failed check is not evidence of deletion, so the original error stands."""
+    try:
+        return not wc._collection_exists_sync(collection)
+    except Exception:
+        _log.warning("Could not check whether %r still exists", collection, exc_info=True)
+        return False
+
+
+def _store_chunks(collection: str, chunks: list[dict]) -> None:
+    try:
+        wc._insert_chunks_sync(collection, chunks)
+    except Exception as exc:
+        # Only a failed store asks whether the collection is gone: a parse or
+        # chunking failure says nothing about it. With auto-schema off, Weaviate
+        # refuses inserts into a deleted class, and the batch, verification or
+        # cleanup error it causes would not tell the user what happened.
+        if _collection_gone(collection):
+            _log.warning("Collection %r disappeared while storing chunks: %s",
+                         collection, exc, exc_info=True)
+            raise _CollectionDeleted(collection) from exc
+        raise
+
+
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -333,9 +362,10 @@ def _process_job_sync(
 ) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
+    deleted = False
 
     try:
-        for path in file_paths:
+        for index, path in enumerate(file_paths):
             try:
                 text, elements = _parse_file(path)
                 source_type = source_type_of(path)
@@ -365,7 +395,7 @@ def _process_job_sync(
                     for i, c in enumerate(chunks)
                 ]
 
-                wc._insert_chunks_sync(collection, weaviate_chunks)
+                _store_chunks(collection, weaviate_chunks)
 
                 # Retain the original only after the file has been parsed,
                 # chunked and stored. A file that fails any of those steps
@@ -385,6 +415,11 @@ def _process_job_sync(
 
                 job["chunks_stored"] += len(chunks)
                 job["files_completed"] += 1
+            except _CollectionDeleted:
+                # Nothing more can be stored: this file and the rest fail.
+                job["files_failed"] += len(file_paths) - index
+                deleted = True
+                break
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
@@ -394,6 +429,14 @@ def _process_job_sync(
                 _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Before the status turns terminal: a client that sees the job end
+        # can delete the collection at once (#40).
+        collection_writes.end_job("ingest", job_id)
+
+    if deleted:
+        job["errors"].append(f"collection '{collection}' was deleted while this job was running")
+        job["status"] = "failed"
+        return
 
     if job["files_failed"] == 0:
         job["status"] = "completed"
@@ -527,6 +570,21 @@ async def start_ingest_job(
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
+    # Registered before the upload is saved, so the collection can't be deleted
+    # out from under a job being admitted (#40). Every way out of admission that
+    # starts no worker ends the registration; the worker ends its own.
+    collection_writes.register_job(collection, "ingest", job_id)
+    try:
+        return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
+                                       chunk_overlap, similarity_threshold, min_chunk_size)
+    except BaseException:
+        collection_writes.end_job("ingest", job_id)
+        raise
+
+
+async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
+                            chunk_size: int, chunk_overlap: int,
+                            similarity_threshold: float, min_chunk_size: int) -> str:
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
     file_paths: list[Path] = []
     # Files the caller sent that this build cannot parse. Dropping them without
@@ -586,6 +644,9 @@ async def start_ingest_job(
     }
 
     def _on_done(future: asyncio.Future) -> None:
+        # The worker ends its registration itself; this covers a job cancelled
+        # before it ran and an error that escaped the worker.
+        collection_writes.end_job("ingest", job_id)
         if future.cancelled():
             return
         exc = future.exception()

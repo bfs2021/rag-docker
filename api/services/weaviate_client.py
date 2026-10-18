@@ -179,6 +179,21 @@ async def delete_collection(name: str) -> int:
     return await asyncio.to_thread(_delete_collection_sync, name)
 
 
+def _delete_collection_when_idle_sync(name: str) -> int:
+    # The user's delete only. Import-replace and tuning delete their own target
+    # while their job is registered, through _delete_collection_sync or the
+    # client, and must never be refused by their own registration (#40).
+    return collection_writes.delete_when_idle(name, _delete_collection_sync)
+
+
+async def delete_collection_when_idle(name: str) -> int:
+    """Delete unless a job is active for the collection.
+
+    Raises collection_writes.CollectionInUseError naming the active jobs.
+    """
+    return await asyncio.to_thread(_delete_collection_when_idle_sync, name)
+
+
 def _get_collections_sync() -> list[dict]:
     client = get_client()
     all_cols = client.collections.list_all()

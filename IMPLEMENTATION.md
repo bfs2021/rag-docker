@@ -53,6 +53,12 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
+      # Auto-schema (on by default) made an insert into a deleted collection
+      # recreate it, with inferred properties, no vectorizer and no app
+      # registration (issue #40). Every collection is created explicitly with
+      # the fixed properties, so nothing needs it; an insert into a missing
+      # collection now fails instead.
+      AUTOSCHEMA_ENABLED: 'false'
       # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
       # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
       # the IP recorded in weaviate_data no longer matches after `compose down`
@@ -2355,6 +2361,21 @@ async def delete_collection(name: str) -> int:
     return await asyncio.to_thread(_delete_collection_sync, name)
 
 
+def _delete_collection_when_idle_sync(name: str) -> int:
+    # The user's delete only. Import-replace and tuning delete their own target
+    # while their job is registered, through _delete_collection_sync or the
+    # client, and must never be refused by their own registration (#40).
+    return collection_writes.delete_when_idle(name, _delete_collection_sync)
+
+
+async def delete_collection_when_idle(name: str) -> int:
+    """Delete unless a job is active for the collection.
+
+    Raises collection_writes.CollectionInUseError naming the active jobs.
+    """
+    return await asyncio.to_thread(_delete_collection_when_idle_sync, name)
+
+
 def _get_collections_sync() -> list[dict]:
     client = get_client()
     all_cols = client.collections.list_all()
@@ -3317,6 +3338,35 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+class _CollectionDeleted(Exception):
+    """Storing failed because the job's collection no longer exists (#40)."""
+
+
+def _collection_gone(collection: str) -> bool:
+    """True only when the backend answers that the collection is missing. A
+    failed check is not evidence of deletion, so the original error stands."""
+    try:
+        return not wc._collection_exists_sync(collection)
+    except Exception:
+        _log.warning("Could not check whether %r still exists", collection, exc_info=True)
+        return False
+
+
+def _store_chunks(collection: str, chunks: list[dict]) -> None:
+    try:
+        wc._insert_chunks_sync(collection, chunks)
+    except Exception as exc:
+        # Only a failed store asks whether the collection is gone: a parse or
+        # chunking failure says nothing about it. With auto-schema off, Weaviate
+        # refuses inserts into a deleted class, and the batch, verification or
+        # cleanup error it causes would not tell the user what happened.
+        if _collection_gone(collection):
+            _log.warning("Collection %r disappeared while storing chunks: %s",
+                         collection, exc, exc_info=True)
+            raise _CollectionDeleted(collection) from exc
+        raise
+
+
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -3332,9 +3382,10 @@ def _process_job_sync(
 ) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
+    deleted = False
 
     try:
-        for path in file_paths:
+        for index, path in enumerate(file_paths):
             try:
                 text, elements = _parse_file(path)
                 source_type = source_type_of(path)
@@ -3364,7 +3415,7 @@ def _process_job_sync(
                     for i, c in enumerate(chunks)
                 ]
 
-                wc._insert_chunks_sync(collection, weaviate_chunks)
+                _store_chunks(collection, weaviate_chunks)
 
                 # Retain the original only after the file has been parsed,
                 # chunked and stored. A file that fails any of those steps
@@ -3384,6 +3435,11 @@ def _process_job_sync(
 
                 job["chunks_stored"] += len(chunks)
                 job["files_completed"] += 1
+            except _CollectionDeleted:
+                # Nothing more can be stored: this file and the rest fail.
+                job["files_failed"] += len(file_paths) - index
+                deleted = True
+                break
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
@@ -3393,6 +3449,14 @@ def _process_job_sync(
                 _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Before the status turns terminal: a client that sees the job end
+        # can delete the collection at once (#40).
+        collection_writes.end_job("ingest", job_id)
+
+    if deleted:
+        job["errors"].append(f"collection '{collection}' was deleted while this job was running")
+        job["status"] = "failed"
+        return
 
     if job["files_failed"] == 0:
         job["status"] = "completed"
@@ -3526,6 +3590,21 @@ async def start_ingest_job(
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
+    # Registered before the upload is saved, so the collection can't be deleted
+    # out from under a job being admitted (#40). Every way out of admission that
+    # starts no worker ends the registration; the worker ends its own.
+    collection_writes.register_job(collection, "ingest", job_id)
+    try:
+        return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
+                                       chunk_overlap, similarity_threshold, min_chunk_size)
+    except BaseException:
+        collection_writes.end_job("ingest", job_id)
+        raise
+
+
+async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
+                            chunk_size: int, chunk_overlap: int,
+                            similarity_threshold: float, min_chunk_size: int) -> str:
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
     file_paths: list[Path] = []
     # Files the caller sent that this build cannot parse. Dropping them without
@@ -3585,6 +3664,9 @@ async def start_ingest_job(
     }
 
     def _on_done(future: asyncio.Future) -> None:
+        # The worker ends its registration itself; this covers a job cancelled
+        # before it ran and an error that escaped the worker.
+        collection_writes.end_job("ingest", job_id)
         if future.cancelled():
             return
         exc = future.exception()
@@ -3784,7 +3866,7 @@ from config import settings
 from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
-from services.collection_writes import aliases
+from services.collection_writes import aliases, end_job, register_job
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -4563,6 +4645,9 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         cancelled = True
         raise
     finally:
+        # Before the status turns terminal: a client that sees generation end
+        # can delete the collection at once (#40).
+        end_job("goldstandard", session_id)
         def finish(current):
             if persistence_failure is not None:
                 _failed_generation(current, persistence_failure)
@@ -4598,6 +4683,9 @@ def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None
                 "pairs": [],
             }
             session = _store_generated_session(session)
+            # Still inside the guard, so no delete can pass between publication
+            # and registration; DELETE /collections refuses from here (#40).
+            register_job(collection, "goldstandard", session["session_id"])
             return session, all_chunks
     except CollectionBusyError as exc:
         raise GoldStandardError("COLLECTION_BUSY",
@@ -4618,10 +4706,16 @@ async def start_generation(
         _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
-    task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    try:
+        task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    except BaseException:
+        end_job("goldstandard", session_id)
+        raise
     _tasks.add(task)
 
     def _on_task_done(t: asyncio.Task) -> None:
+        # _run_generation ends it first; this covers a task that never ran it.
+        end_job("goldstandard", session_id)
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
@@ -5414,7 +5508,7 @@ import logging
 import threading
 import uuid
 
-from services import packager
+from services import collection_writes, packager
 
 _log = logging.getLogger(__name__)
 
@@ -5440,18 +5534,23 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
     def progress(written: int) -> None:
         job["chunks_written"] = written
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the export finish can delete the collection at once (#40).
+        collection_writes.end_job("export", job_id)
+        job.update(fields)
+
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
-        job.update(status="failed", error=f"PackageError: {exc.message}",
-                   error_code=exc.code, error_detail=exc.detail)
+        finish(status="failed", error=f"PackageError: {exc.message}",
+               error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
         _log.exception("Export of %r failed", collection)
-        job["status"] = "failed"
-        job["error"] = f"{type(exc).__name__}: {exc}"
+        finish(status="failed", error=f"{type(exc).__name__}: {exc}")
     else:
-        job.update(
+        finish(
             status="completed",
             filename=result["filename"],
             size_bytes=result["size_bytes"],
@@ -5463,6 +5562,7 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
             warnings=result["warnings"],
         )
     finally:
+        collection_writes.end_job("export", job_id)
         with _lock:
             # Only clear the slot if it is still ours.
             if _active.get(collection) == job_id:
@@ -5498,10 +5598,14 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "error_code": None,
         "error_detail": None,
     }
+    # Lets DELETE /collections refuse while this export reads the collection (#40).
+    collection_writes.register_job(collection, "export", job_id)
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id
 ```
 
@@ -6202,6 +6306,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the import finish can delete the collection at once (#40).
+        collection_writes.end_job("import", job_id)
+        job.update(fields)
+
     try:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
@@ -6239,6 +6349,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
             if exists and on_conflict == "rename":
                 target = _rename_target(original, id8)
+
+            # The target is final: DELETE /collections refuses it from here until
+            # this job ends (#40). Replace's own delete of the old target below
+            # goes through _delete_collection_sync, which the registry never refuses.
+            collection_writes.register_job(target, "import", job_id)
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -6280,13 +6395,13 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     _log.exception("Could not remove staging collection %r", temp_collection)
                 staged = False
 
-            job.update(status="completed", collection=target, original_collection=original,
-                       chunks_written=written, renamed=(target != canonical(original)),
-                       notes=notes)
+            finish(status="completed", collection=target, original_collection=original,
+                   chunks_written=written, renamed=(target != canonical(original)),
+                   notes=notes)
 
     except PackageError as exc:
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
         if staged and temp_collection:
             # The real build failed after the target was deleted. Keeping the
             # staging collection means the data is recoverable, not lost.
@@ -6296,8 +6411,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
-        job.update(status="failed", error_code="IMPORT_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="IMPORT_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
@@ -6318,6 +6433,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             except Exception:
                 _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
+        collection_writes.end_job("import", job_id)
         with _lock:
             _active.discard(filename)
 
@@ -6969,6 +7085,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the job finish can delete the collection at once (#40).
+        collection_writes.end_job("tune", job_id)
+        job.update(fields)
+
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -7033,16 +7155,17 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
             notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
                          "gold-standard sessions were left alone")
 
-        job.update(status="completed", chunks_written=written, notes=notes)
+        finish(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Tuning %r on %r failed", operation, collection)
-        job.update(status="failed", error_code="TUNE_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="TUNE_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
     finally:
+        collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
 
@@ -7068,7 +7191,11 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
+    collection_writes.register_job(collection, "tune", job_id)
+    task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
     return job_id
 ```
 
@@ -7266,7 +7393,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
-from services.collection_writes import aliases
+from services.collection_writes import CollectionInUseError, aliases
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -7339,13 +7466,39 @@ async def create_collection(body: CreateCollectionRequest):
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
 
+# How a refused delete names the job in the way (#40). The UI shows the message
+# as it is, so each one reads as a sentence on its own.
+_BUSY_PHRASES = {
+    "ingest": "An ingest job is running for this collection",
+    "export": "An export job is running for this collection",
+    "import": "An import job is running for this collection",
+    "tune": "A tuning job is running for this collection",
+    "goldstandard": "A gold-standard generation job is running for this collection",
+}
+
+
+def _busy_error(name: str, jobs: list[tuple[str, str]]):
+    kind, job_id = jobs[0]
+    phrase = _BUSY_PHRASES.get(kind, f"A {kind} job is running for this collection")
+    return api_error(
+        409, "COLLECTION_BUSY",
+        f"{phrase} ('{name}', job {job_id}). Delete the collection after the job finishes.",
+        detail={"collection": name, "job_kind": kind, "job_id": job_id,
+                "jobs": [{"job_kind": k, "job_id": j} for k, j in jobs]})
+
+
 @router.delete("/{name}", status_code=200)
 async def delete_collection(name: str):
     if not await wc.collection_exists(name):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
     try:
-        count = await wc.delete_collection(name)
+        # Refused, not queued, while a job is active: waiting deleted the job's
+        # data after it finished, and a delete that ran first let a queued
+        # ingest recreate the collection (#40).
+        count = await wc.delete_collection_when_idle(name)
+    except CollectionInUseError as exc:
+        return _busy_error(name, exc.jobs)
     except Exception as exc:
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.", str(exc))
 
@@ -10446,6 +10599,9 @@ export default function CollectionsPage() {
   const [ef, setEf] = useState(64)
   const [deleteTarget, setDeleteTarget] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState('')
+  // Shown inside the delete dialog: the page-level error sits behind its
+  // overlay, so a refused delete (409 while a job runs, #40) looked like nothing.
+  const [deleteError, setDeleteError] = useState('')
 
   async function load() {
     api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
@@ -10470,10 +10626,17 @@ export default function CollectionsPage() {
       await api.deleteCollection(deleteTarget)
       setDeleteTarget('')
       setDeleteConfirm('')
+      setDeleteError('')
       load()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setDeleteError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function closeDelete() {
+    setDeleteTarget('')
+    setDeleteConfirm('')
+    setDeleteError('')
   }
 
   return (
@@ -10503,7 +10666,7 @@ export default function CollectionsPage() {
               <td className="py-2">{c.distance_metric}</td>
               <td className="py-2 text-gray-500">{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
               <td className="py-2">
-                <button onClick={() => setDeleteTarget(c.name)} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
               </td>
             </tr>
           ))}
@@ -10562,8 +10725,9 @@ export default function CollectionsPage() {
             <h2 className="font-semibold text-red-600 mb-3">Delete Collection</h2>
             <p className="text-sm text-gray-600 mb-3">Type <strong>{deleteTarget}</strong> to confirm deletion of all objects.</p>
             <input value={deleteConfirm} onChange={e => setDeleteConfirm(e.target.value)} placeholder={deleteTarget} className="border rounded px-3 py-2 text-sm w-full mb-4" />
+            {deleteError && <p role="alert" className="text-red-600 text-sm mb-4">{deleteError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setDeleteTarget(''); setDeleteConfirm('') }} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={closeDelete} className="text-sm text-gray-500">Cancel</button>
               <button onClick={deleteCollection} disabled={deleteConfirm !== deleteTarget} className="bg-red-600 text-white px-4 py-2 rounded text-sm disabled:opacity-40 hover:bg-red-700">Delete</button>
             </div>
           </div>
@@ -11274,6 +11438,18 @@ fast with bounded memory), and readable errors for invalid JSON in `.json` files
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
 back to confirm they hold that text.
 
+`scripts/tests/test_delete_busy.py` (#40) checks that `DELETE /collections/{name}` answers
+`409 COLLECTION_BUSY`, naming the job, while an ingest, export, import, tune or gold-standard
+generation job is active, and that each kind's registration ends before its status turns
+terminal. The request orderings are arranged with events: a job registered before the
+delete, one registered while the delete waits for the writer guard (refused within a
+second, not after the job), one registered once it holds the guard, and a job admitted
+after a completed delete, which fails with "collection '<name>' was deleted while this job
+was running" at its first store. Weaviate is mocked. `02_ingest.sh` runs it in the API
+container, then deletes a collection while a real ingest is still embedding (`409`, data
+in place), again after the job completes (`200`, still gone 10 s later), and checks that an
+insert into a deleted collection fails without recreating it (auto-schema is off).
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -11369,6 +11545,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
+| `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -13571,6 +13748,90 @@ job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_
 check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
+
+# ── deleting a collection while an ingest job runs (#40) ─────────────────────
+# A DELETE sent during a job used to wait for it and then remove what it stored,
+# and one that ran before a queued job let that job's inserts recreate the
+# collection (Weaviate auto-schema). Controlled cases: every job kind, both
+# request orderings, and the job's report when its collection disappears.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
+check "delete-while-busy: job kinds, request orderings and the job's report" $?
+
+DC="${PREFIX}DeleteBusy"
+drop_collection "$DC"; make_collection "$DC"
+object_count() {   # the collection's object count, or "absent"
+  api_get "/collections" | python3 -c "
+import json,sys
+found=[c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1']
+print(found[0] if found else 'absent')"
+}
+# About 180 chunks at chunk_size 300: some tens of seconds of embedding, so the
+# job is still running when the DELETE follows the upload.
+busy_dir=$(mktemp -d)
+python3 - "$busy_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(40)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+curl -s -m 600 -o /tmp/vfy_busy_start.json -X POST "$API/ingest/upload" -F "collection=$DC" \
+  -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$busy_dir/slow.txt"
+rm -rf "$busy_dir"
+busy_job=$(jfield "['job_id']" < /tmp/vfy_busy_start.json)
+before=$(object_count "$DC")
+code=$(curl -s -m 120 -o /tmp/vfy_busy_delete.json -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+state=$(api_get "/ingest/job/$busy_job" | jfield "['status']")
+after=$(object_count "$DC")
+read -r err_code err_kind err_job <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_busy_delete.json'))['error']
+except Exception: print('not-json - -'); raise SystemExit
+print(e['code'], e['detail']['job_kind'], e['detail']['job_id'])")"
+[ "$code" = 409 ] && [ "$err_code" = COLLECTION_BUSY ] && [ "$err_kind" = ingest ] \
+  && [ "$err_job" = "$busy_job" ] && { [ "$state" = queued ] || [ "$state" = running ]; }
+check "DELETE during a running ingest job is refused with 409 COLLECTION_BUSY naming it" $? \
+  "HTTP=$code code=$err_code kind=$err_kind job=$err_job (job $busy_job was $state)"
+[ "$after" != absent ] && [ "$before" != absent ] && [ "$after" -ge "$before" ]
+check "the refused DELETE leaves the collection and its objects in place" $? \
+  "objects before=$before after=$after"
+final=$(wait_for_job "/ingest/job/$busy_job" 900)
+check_eq "the ingest job still completes" "$final" "completed"
+code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+check_eq "DELETE after the job completes succeeds" "$code" "200"
+sleep 10
+check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC")" "absent"
+
+# With auto-schema off, an insert into a deleted collection fails and creates
+# nothing, instead of recreating it with inferred properties and no vectorizer.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "${PREFIX}NoAutoSchema" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+try:
+    client = wc.get_client()
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    wc._create_collection_sync(name, "hnsw", "cosine", {})
+    wc._delete_collection_sync(name)
+    try:
+        wc._insert_chunks_sync(name, [{"content": "must not recreate", "source_file": "x.txt",
+                                       "chunk_index": 0}])
+    except Exception:
+        pass
+    else:
+        print("the insert into a deleted collection succeeded", file=sys.stderr)
+        sys.exit(1)
+    if client.collections.exists(name):
+        client.collections.delete(name)
+        print("the insert recreated the deleted collection", file=sys.stderr)
+        sys.exit(1)
+finally:
+    wc.close_client()
+ENDPY
+) >/tmp/vfy_autoschema.txt 2>&1
+check "an insert into a deleted collection fails and does not recreate it" $? \
+  "$(tail -1 /tmp/vfy_autoschema.txt)"
 
 drop_collection "$C"
 cleanup_prefixed
@@ -16378,6 +16639,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await sleep(900);
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
+
+      // A refused delete (409 while a job runs, #40) is shown in the dialog. The
+      // page-level error line sits behind the overlay, where it read as nothing.
+      // The DELETE is answered here, so no collection is touched.
+      const busyMessage = "An ingest job is running for this collection ('Owned', job 0wned40). Delete the collection after the job finishes.";
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (request.method() === 'DELETE' && new URL(request.url()).pathname.startsWith('/api/collections/')) {
+          return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_BUSY', message: busyMessage, detail: { job_kind: 'ingest', job_id: '0wned40' } } }) });
+        }
+        return request.continue();
+      });
+      const target = await s.page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find(i => !i.type || i.type === 'text');
+        const name = el.placeholder;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, name);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return name;
+      });
+      await sleep(200);
+      const deletes = s.api.filter(x => x.method === 'DELETE').length;
+      await s.page.evaluate(() => {
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        if (btn && !btn.disabled) btn.click();
+      });
+      await sleep(900);
+      const refused = await s.page.evaluate(() => {
+        const dialog = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Delete Collection');
+        const box = dialog && dialog.parentElement;
+        const alert = box && box.querySelector('[role=alert]');
+        return { open: !!dialog, alert: alert ? alert.textContent : null };
+      });
+      r.check('a refused delete sends one DELETE', s.api.filter(x => x.method === 'DELETE').length === deletes + 1);
+      r.check('a refused delete keeps the dialog open and shows the message in it',
+              refused.open && refused.alert === busyMessage, JSON.stringify(refused));
+      const listed = await s.page.evaluate(t => [...document.querySelectorAll('tbody td')].some(td => td.textContent.trim() === t), target);
+      r.check('the refused collection is still listed', listed, target);
+      await clickByText(s.page, 'Cancel'); await sleep(200);
+      await s.page.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Delete');
+        if (b) b.click();
+      });
+      await sleep(300);
+      r.check('cancelling clears the message for the next attempt',
+              await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
   }
@@ -19055,6 +19362,73 @@ def serialized(argument):
                 return function(*args, **kwargs)
         return run
     return decorate
+
+
+# ── Jobs active for a collection (issue #40) ──────────────────────────────────
+# The guard above only serializes writers: a user's DELETE sent during an ingest
+# waited for the whole job and then removed what it stored, and one that won the
+# guard before a queued job let that job's inserts recreate the collection. Every
+# long job (ingest, export, import, tune, gold-standard generation) registers
+# here, under one lock and the canonical name, from admission until just before
+# its status turns terminal, so the delete route can refuse instead of waiting.
+
+_jobs_lock = threading.Lock()
+_active_jobs = {}
+
+
+def register_job(collection, kind, job_id):
+    with _jobs_lock:
+        _active_jobs.setdefault(canonical(collection), []).append((kind, job_id))
+
+
+def end_job(kind, job_id):
+    """End a registration; safe to repeat, and to call for one never made."""
+    with _jobs_lock:
+        for collection, entries in list(_active_jobs.items()):
+            if (kind, job_id) in entries:
+                entries.remove((kind, job_id))
+                if not entries:
+                    del _active_jobs[collection]
+                return
+
+
+def active_jobs(collection):
+    """The jobs registered for a collection, oldest first."""
+    with _jobs_lock:
+        return list(_active_jobs.get(canonical(collection), ()))
+
+
+class CollectionInUseError(RuntimeError):
+    """A delete was refused because jobs are registered for the collection."""
+
+    def __init__(self, collection, jobs):
+        super().__init__(collection)
+        self.collection = collection
+        self.jobs = jobs
+
+
+def delete_when_idle(collection, delete, poll=0.25):
+    """Run delete(collection) under its guard unless a job is registered.
+
+    The guard is awaited only while no job is registered, rechecked every `poll`
+    seconds, so a job admitted while the delete waits still refuses it promptly.
+    A job admitted after the last check is not refused: its worker waits for this
+    guard and then meets a deleted collection, which cannot be recreated
+    (AUTOSCHEMA_ENABLED is off) and which ingest reports as deleted.
+    """
+    def refuse_if_busy():
+        jobs = active_jobs(collection)
+        if jobs:
+            raise CollectionInUseError(collection, jobs)
+
+    refuse_if_busy()
+    while True:
+        try:
+            with guard(collection, timeout=poll):
+                refuse_if_busy()
+                return delete(collection)
+        except CollectionBusyError:
+            refuse_if_busy()
 ```
 
 ### scripts/tests/test_collection_writes.py
@@ -19287,7 +19661,7 @@ class DeletedRecoveryTests(unittest.TestCase):
                 registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
                 with self.subTest(caller=caller, fails=fails), \
                      patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
-                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route.wc, 'delete_collection_when_idle', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
                      patch.object(route, '_registry_lock', asyncio.Lock()), \
                      patch.object(route, '_load_registry', return_value=registry), \
                      patch.object(route, '_save_registry') as save:
