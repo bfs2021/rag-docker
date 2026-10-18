@@ -19,7 +19,8 @@ from models.schemas import (
 )
 from services import sources, tuning
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_deleting_error
 
 router = APIRouter(prefix="/tune")
 
@@ -29,6 +30,8 @@ async def _start(collection: str, operation: str, params: dict):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         job_id = await tuning.start_tune_job(collection, operation, params)
+    except CollectionDeletingError:
+        return collection_deleting_error(collection)
     except RuntimeError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
                          f"'{exc}' is already being tuned.",

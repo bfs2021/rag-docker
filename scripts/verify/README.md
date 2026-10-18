@@ -269,6 +269,24 @@ container, then deletes a collection while a real ingest is still embedding (`40
 in place), again after the job completes (`200`, still gone 10 s later), and checks that an
 insert into a deleted collection fails without recreating it (auto-schema is off).
 
+`test_delete_busy.py` also covers #302. A `DELETE` without `?confirm=true` (case-insensitive)
+answers `400 CONFIRMATION_REQUIRED` before the collection is looked up. A `DELETE` held inside
+its backend delete refuses new jobs: the ingest, export, tune and generate routes answer
+`409 COLLECTION_DELETING` and leave nothing behind, generation without its one-second guard
+wait, and an import of the collection ends `failed` with that code; a delete still waiting
+for another writer is not in progress, and one that waits behind a writer with no job deletes
+once it lets go. A gold-standard start cancelled mid-preparation ends its registration and
+leaves its session `cancelled`. Import-replace's own delete runs through `importer._run`.
+`scripts/tests/test_write_counts.py` (#302, API container) checks `chunks_submitted` and
+`chunks_accepted`: the writer's counts on each kind of failure, a retried file counted once,
+job totals, and `null` on an older record. `scripts/tests/test_mcp_delete.py` runs on the host
+with the MCP SDK stubbed and checks `rag_delete_collection` sends `confirm=true` with `name`
+still its only input. `02_ingest.sh` runs all three, then checks on the live verify stack the
+`400` cases, a `confirm=TRUE` delete, and that a clean job's three counts agree.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's
+"Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
+answered `409 COLLECTION_DELETING` to check its message is shown.
+
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
 that writes nothing; status changes and terminal records are written at once, owner-only;

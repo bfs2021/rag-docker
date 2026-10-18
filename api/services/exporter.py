@@ -86,6 +86,15 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         if running is not None:
             raise RuntimeError(running)
         _active[collection] = job_id
+    # Lets DELETE /collections refuse while this export reads the collection
+    # (#40). Before the job record, so a refusal during a delete leaves none (#302).
+    try:
+        collection_writes.register_job(collection, "export", job_id)
+    except collection_writes.CollectionDeletingError:
+        with _lock:
+            if _active.get(collection) == job_id:
+                del _active[collection]
+        raise
 
     _jobs[job_id] = {
         "job_id": job_id,
@@ -103,9 +112,6 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "error_code": None,
         "error_detail": None,
     }
-    # Lets DELETE /collections refuse while this export reads the collection (#40).
-    collection_writes.register_job(collection, "export", job_id)
-
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))

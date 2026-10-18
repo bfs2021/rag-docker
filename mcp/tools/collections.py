@@ -89,5 +89,7 @@ async def rag_create_collection(
     annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True),
 )
 async def rag_delete_collection(name: str) -> dict:
-    result = await ragclient.delete(f"/collections/{name}")
+    # The API refuses a delete without confirm=true (#302). The client's own
+    # confirmation comes from destructive_hint, so the tool always sends it.
+    result = await ragclient.delete(f"/collections/{name}", params={"confirm": "true"})
     return result if isinstance(result, dict) else {"status": "deleted", "name": name}

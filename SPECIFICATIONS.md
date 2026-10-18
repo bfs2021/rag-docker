@@ -369,6 +369,11 @@ DELETE /collections/{name}
 ```
 
 Deletes a collection and all its objects. Requires `confirm=true` query parameter as a safeguard.
+The value is compared as text, case-insensitively: `true`, `TRUE` or `True` confirm; a missing
+value or any other value (`false`, `1`, `yes`, empty) answers `400 CONFIRMATION_REQUIRED`,
+never `422`. Confirmation is checked first, before the collection is looked up, so a missing
+collection without it answers `400`, not `404` (#302). The UI and the MCP tool
+`rag_delete_collection` always send it.
 
 **Response 200:**
 ```json
@@ -406,9 +411,24 @@ is published) until just before its status turns terminal, so a client that has 
 the job end can delete at once. While the delete waits for the collection's writer
 guard (held briefly by collection creation, say), it rechecks every 0.25 s and
 answers `409` as soon as a job appears; it checks once more when it holds the guard.
-A job admitted after that last check is not refused at admission: it meets a deleted
-collection, which no insert can recreate (§5.4). Deletions an import-replace or a
-tune makes of its own target are not subject to this check.
+Once the delete holds the guard and that last check finds no job, the delete is *in
+progress* until it returns, under either spelling (#302). A delete still waiting for the
+guard is not, so a job that registers then still refuses the delete as above. While a delete
+is in progress, a new job for the collection is refused and not admitted: ingest upload,
+export, tune and gold-standard generation answer
+```json
+{ "error": { "code": "COLLECTION_DELETING",
+  "message": "Collection 'Documents' is being deleted. Start the job again once the delete finishes; the collection must be created again first.",
+  "detail": { "collection": "Documents" } } }
+```
+with the collection as the request named it, and leave no job record, registration, upload
+or session behind. Generation checks before its one-second guard wait (§3.1.5); a delete that
+starts during that wait and outlasts it still gives `409 COLLECTION_BUSY`. An import learns its
+target only after opening the package, so an import whose target is being deleted ends
+`failed` with `error_code` `COLLECTION_DELETING`, that message and `error_detail`
+`{"collection": "<target>"}`. After the delete, admission behaves as before (usually
+`404 COLLECTION_NOT_FOUND`). Deletions an import-replace or a tune makes of its own target are
+not subject to these checks.
 
 ---
 
@@ -479,6 +499,7 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | 400 | `ARCHIVE_UNSUPPORTED` | no member is damaged, but one is password-protected or uses a compression method the server can't read (e.g. Deflate64) |
 | 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
 | 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
+| 409 | `COLLECTION_DELETING` | a delete of the collection is in progress (§3.1.2; #302); nothing is saved or queued |
 | 500 | `INGEST_FAILED` | anything unexpected; the message says so and the API log holds the traceback, collection and filenames |
 
 The ZIP messages name the upload, say nothing from it was imported, name the unreadable
@@ -574,12 +595,22 @@ GET /ingest/job/{job_id}
   "files_completed": 1,
   "files_failed": 0,
   "chunks_stored": 142,
+  "chunks_submitted": 142,
+  "chunks_accepted": 142,
   "chunks_replaced": 0,
   "errors": [],
   "skipped": []
 }
 ```
 
+`chunks_stored` counts chunks whose insert was checked: read back and matched (§5.4).
+`chunks_submitted` counts chunks the job sent to Weaviate, once per file even when the "index
+not ready" retry sends them again; `chunks_accepted` counts those Weaviate acknowledged without
+a per-chunk error, including ones removed again because the check failed. Both come from a
+file's final attempt; a file that fails before its insert (parsing, chunking) adds to none, and
+one whose batch could not be sent adds what was handed to the batch to `chunks_submitted` and
+nothing to `chunks_accepted`. A clean job has all three equal. Job records written before
+these two fields existed read back with both `null`, not `0`, which would be untrue (#302).
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
 ingested, each with its reason: an unsupported type, or a later input with the same name.
@@ -848,7 +879,14 @@ Generation waits at most one second to acquire the collection mutation guard
 before sampling and publishing its session. A busy collection returns
 `409 COLLECTION_BUSY` without creating a session or model task. If a completed
 deletion removed the collection before sampling, it returns
-`404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes.
+`404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes. A delete in
+progress is checked before that wait and answers `409 COLLECTION_DELETING` at once (§3.1.2;
+#302).
+
+If the request that started a generation is cancelled while the session is being prepared,
+the preparation still finishes; a session it published is then settled as a cancelled
+generation is: its registration ends (so `DELETE` no longer answers `409`) and its status
+becomes `cancelled` (#302).
 
 Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most 100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
 
@@ -1109,6 +1147,7 @@ Standard error codes:
 | `COLLECTION_NOT_FOUND` | 404 | Named collection does not exist |
 | `COLLECTION_EXISTS` | 409 | Collection already exists |
 | `COLLECTION_BUSY` | 409 | Delete refused while an ingest, export, import, tune or gold-standard generation job is active for the collection; generation could not get the collection's writer guard within one second |
+| `COLLECTION_DELETING` | 409 | A new ingest, export, tune or generation job refused while a delete of its collection is in progress (an import job fails with it) |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
@@ -1213,6 +1252,8 @@ The job reports `models_bundled` — what the package actually carries, which is
   running; `detail.job_id` names it. Two concurrent exports of one collection
   would race on the staging directory and the temporary archive. Exports of
   *different* collections run concurrently.
+- **409 `COLLECTION_DELETING`** while a delete of the collection is in progress
+  (§3.1.2; #302). No job is created.
 
 The build runs off the event loop, so an export does not block ingest or query.
 Chunks are streamed one at a time and never accumulated: a 100k-chunk corpus is
@@ -1277,8 +1318,9 @@ could destroy a collection the caller did not mean to touch. It is one of
 **409 `IMPORT_IN_PROGRESS`** if the same file is already being imported.
 
 Everything else — unreadable archive, bad digest, embedding mismatch, name
-collision — is reported through the job rather than this response, because none
-of it is knowable without reading the package.
+collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2) — is reported
+through the job rather than this response, because none of it is knowable without
+reading the package.
 
 ---
 
@@ -1336,6 +1378,8 @@ ingest default.
 
 - **404 `COLLECTION_NOT_FOUND`** for an unknown collection.
 - **409 `TUNE_IN_PROGRESS`** if the collection is already being tuned.
+- **409 `COLLECTION_DELETING`** while a delete of the collection is in progress
+  (§3.1.2; #302). No job is created.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured. Re-chunking is also
@@ -1746,7 +1790,7 @@ settings, regardless of when a prior collection's save completes.
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
-- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
+- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
 
@@ -2197,6 +2241,14 @@ now lives once, in `api/services/ingest_config.py`.
       `02_ingest.sh` sends a `DELETE` while a 180-chunk upload is still embedding (`409`,
       objects in place), and again after the job completes (`200`, still gone 10 s later).
       Full verification run 2026-10-17: all seven suites passed (10m57s).*
+- [x] `DELETE /collections/{name}` without `?confirm=true` (case-insensitive) answers `400 CONFIRMATION_REQUIRED` before the collection is looked up and deletes nothing; the UI, the MCP tool and the verify scripts send it (#302).
+      *`test_delete_busy.py` sends no value, `false`, `1`, `yes`, an empty value and `truee` (400, no lookup, nothing deleted), a missing collection without it (400, not 404) and `TRUE`/`True` (200). `02_ingest.sh` repeats the 400 cases and a `confirm=TRUE` delete on the live verify stack, and `test_mcp_delete.py` checks the MCP tool sends `confirm=true` with `name` still its only input.*
+- [x] While a delete of a collection is in progress, a new ingest, export, tune or generation job for it answers `409 COLLECTION_DELETING` and leaves nothing behind, and an import of it ends `failed` with that code; a delete still waiting for the writer guard keeps #40's ordering (#302).
+      *`test_delete_busy.py` holds a real `DELETE` inside its backend delete and drives each route and the import worker against it, under both spellings, and checks generation answers without its one-second wait. `ui_criteria.js` checks the Import page shows the message for an upload refused this way.*
+- [x] A gold-standard start cancelled while its session is being prepared ends its registration and leaves the session `cancelled`, so the collection can be deleted (#302).
+      *`test_delete_busy.py` cancels a start while sampling is held, then checks the registration, the session's status, a `200` delete, and that a settle that fails is reported as a failed generation.*
+- [x] Ingest jobs report `chunks_submitted` and `chunks_accepted` beside `chunks_stored`, counted once per file from its final attempt; older records read them back as `null`; the Import page shows the three only when they differ (#302).
+      *`test_write_counts.py` covers the writer's counts for a clean insert, rejected objects, a failed check, a send failure and a cleanup failure, a retried file, job totals over stored, rejected, unparsed and deleted-collection files, and an older record through the route. `02_ingest.sh` checks a clean live job's three counts agree; `ui_criteria.js` checks the panel line for differing, equal and missing counts.*
 - [x] An insert never creates a collection: an insert into a deleted collection fails and the collection stays absent (#40).
       *Weaviate's auto-schema recreated the class with inferred properties, no
       vectorizer and no vector index, which the app listed with `index_type: unknown`
