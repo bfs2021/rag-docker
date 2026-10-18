@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E30)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E32)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -767,6 +767,51 @@ after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
 [ "$after_chunks" -gt "$chunks_before" ]
 check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
 
+# ── re-chunking after a replacement (#22, E17, E32) ──────────────────────────
+# Re-ingesting replaces a name's chunks and retained original, so a rebuild
+# brings back only the new version; a second name for the same content is
+# rebuilt under both names (one chunk set per digest and name).
+RC="${PREFIX}Rechunk"
+RCFIX=$(mktemp -d)
+printf '%s\n\n%s\n' \
+  "Parking Permits. Facilities issue parking permits each January, and a permit is valid for one named vehicle only." \
+  "Visitor Badges. Reception prints a visitor badge on arrival, and badges are returned at the end of the day." \
+  > "$RCFIX/policies.txt"
+cp "$RCFIX/policies.txt" "$RCFIX/copy.txt"
+drop_collection "$RC"; make_collection "$RC"
+for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RC" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$f" > /tmp/vfy_rc.json
+  rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
+  wait_for_job "/ingest/job/$rjob" 900 >/dev/null
+done
+check_eq "E32: re-chunking is offered after a replacement and a second name" \
+  "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
+api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "E32: the re-chunk completes" "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") > /tmp/vfy_rc_chunks.json <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps([[o.properties["source_file"], o.properties["content"]] for o in coll.iterator()]))
+finally:
+    wc.close_client()
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+chunks = json.load(open('/tmp/vfy_rc_chunks.json'))
+texts = " ".join(c for _, c in chunks)
+names = {n for n, _ in chunks}
+print(sorted(names), "Travel Booking" in texts)
+sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in texts
+         and "Parking Permits" in texts else 1)
+ENDPY
+check "E32: the rebuild holds only the new version, under both of its names" $?
+drop_collection "$RC"
+rm -rf "$RCFIX"
+
 # ── chunks-only refuses re-chunking ──────────────────────────────────────────
 SRCLESS="${PREFIX}Chunksonly"
 drop_collection "$SRCLESS"; make_collection "$SRCLESS"
@@ -821,6 +866,93 @@ import json,re,sys
 m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
+
+# ── export job status survives an API restart (#23; opt-in: restarts the API) ──
+# The export from the top of this suite must read back unchanged, and an export
+# killed part-way must read `failed` with INTERRUPTED, not 404. A synthetic
+# 30,000-chunk collection (supplied vectors, no embedding) exports for about
+# 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the export during shutdown.
+XR="${PREFIX}ExportRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "export job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "export job status across an API restart" 1 "$restart_refusal"
+else
+  api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done.json
+  drop_collection "$XR"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$XR" 30000 <<'ENDPY'
+import random, sys
+from datetime import datetime, timezone
+from services import batch_write
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    wc._create_collection_sync(name, "hnsw", "cosine",
+                               {"efConstruction": 128, "maxConnections": 64, "ef": 64})
+    collection = wc.get_client().collections.get(name)
+    rng, now = random.Random(23), datetime.now(timezone.utc).isoformat()
+    for base in range(0, count, 2000):
+        records = [{"properties": {"content": f"Synthetic chunk {i}. " + "lorem ipsum dolor " * 30,
+                                   "source_file": f"synthetic_{i // 100}.txt", "source_type": "txt",
+                                   "chunk_index": i % 100, "chunk_strategy": "fixed",
+                                   "chunk_size": 1000, "chunk_overlap": 0, "created_at": now},
+                    "vector": [rng.uniform(-1, 1) for _ in range(768)]}
+                   for i in range(base, min(count, base + 2000))]
+        batch_write.insert(collection, lambda r=records: iter(r), exact=False, cleanup_owned=True)
+finally:
+    wc.close_client()
+ENDPY
+  ) >/tmp/vfy_xrestart_prepare.log 2>&1
+  check "a 30,000-chunk collection is built for the interrupted export" $? \
+    "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/export/job/$xjob" > /tmp/vfy_xrestart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_xrestart_before.json'))
+print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/null)
+    case "$state" in running-writing|completed*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-writing ]; then
+    check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_xrestart_done.json')) == json.load(open('/tmp/vfy_xrestart_done_after.json')) else 1)"
+    check "a completed export job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_xrestart_after.json -w '%{http_code}' "$API/export/job/$xjob")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_xrestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the export again.")
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED" $? \
+      "$(head -c 300 /tmp/vfy_xrestart_after.json)"
+    # The killed build's leftovers are the container's (root, mode 0700): remove
+    # only the build directories that appeared during this export.
+    builds_after=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
+    stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
+    (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+  fi
+  drop_collection "$XR"
+fi
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"

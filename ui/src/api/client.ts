@@ -82,8 +82,11 @@ export interface CreateCollectionBody {
 }
 export interface JobStatus {
   job_id: string; status: string; files_total: number; files_completed: number; files_failed: number; chunks_stored: number; errors: string[]
-  // Files that could not be parsed at all — never counted in files_total.
+  // Files that could not be parsed at all, or that a later file with the same
+  // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Earlier chunks of the same names this job removed (#22).
+  chunks_replaced?: number
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean

@@ -53,6 +53,12 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
+      # Auto-schema (on by default) made an insert into a deleted collection
+      # recreate it, with inferred properties, no vectorizer and no app
+      # registration (issue #40). Every collection is created explicitly with
+      # the fixed properties, so nothing needs it; an insert into a missing
+      # collection now fails instead.
+      AUTOSCHEMA_ENABLED: 'false'
       # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
       # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
       # the IP recorded in weaviate_data no longer matches after `compose down`
@@ -680,6 +686,10 @@ class Settings(BaseSettings):
     # Reported by /health and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
+    # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP
+    # in one request, gzipped members' output included (#298). A small ZIP of
+    # zeros can otherwise unpack to gigabytes and fill Docker's disk.
+    max_zip_expanded_bytes: int = 2 * 1024 * 1024 * 1024
 
     class Config:
         env_file = ".env"
@@ -795,8 +805,12 @@ class JobStatusResponse(BaseModel):
     chunks_stored: int
     errors: list[str]
     # Files the caller sent that could not be parsed at all; they never
-    # became part of files_total, so without this they vanish silently.
+    # became part of files_total, so without this they vanish silently. Also
+    # inputs replaced by a later one with the same name in the upload (#22).
     skipped: list[str] = []
+    # Earlier chunks of the same names that this job removed (#22). Records
+    # written before the field existed read back as 0.
+    chunks_replaced: int = 0
 
 
 class IngestConfig(BaseModel):
@@ -1250,6 +1264,10 @@ are copied here instead.
 Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
 re-ingesting the same document stores one copy and records the extra logical
 name. Storage is proportional to the corpus rather than to upload count.
+
+A logical name belongs to one digest at a time (#22): ingest stores with
+replace=True, so a name ingested with new content leaves the digest it had, and a
+digest left with no names is removed with its blob.
 """
 from __future__ import annotations
 
@@ -1355,19 +1373,52 @@ def restore_package(package: Path, collection: str) -> None:
     shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
 
 
-def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
-    """Retain one accepted upload. Returns its sha256."""
+def _drop_blobs(collection: str, digests: list[str]) -> None:
+    """Delete blobs the index no longer lists. Called after the index is saved,
+    so it never names a missing blob; a blob left behind is only unused space."""
+    for digest in digests:
+        try:
+            blob_path(collection, digest).unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            log.error("Could not delete unreferenced source %s of %r: %s",
+                      digest[:12], collection, exc)
+
+
+def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
+          *, replace: bool = False) -> str:
+    """Retain one accepted upload. Returns its sha256.
+
+    With replace=True (ingest, #22) the filename is first released from every
+    other digest, and digests left with no names are dropped. That happens even
+    when writing the new blob fails, so the name never keeps claiming the
+    version it replaced, which a rechunk would otherwise rebuild.
+    """
     digest = hashlib.sha256(data).hexdigest()
     target = collection_dir(collection) / digest
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    if not target.exists():
-        tmp = target.with_name(digest + ".tmp")
-        tmp.write_bytes(data)
-        tmp.replace(target)
+    index = load_index(collection)
+    orphans: list[str] = []
+    if replace:
+        for other, entry in list(index["documents"].items()):
+            if other != digest and filename in entry["filenames"]:
+                entry["filenames"] = [n for n in entry["filenames"] if n != filename]
+                if not entry["filenames"]:
+                    del index["documents"][other]
+                    orphans.append(other)
+
+    try:
+        if not target.exists():
+            tmp = target.with_name(digest + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(target)
+    except BaseException:
+        if replace:
+            _save_index(collection, index)
+            _drop_blobs(collection, orphans)
+        raise
 
     now = datetime.now(timezone.utc).isoformat()
-    index = load_index(collection)
     entry = index["documents"].get(digest)
     if entry is None:
         index["documents"][digest] = {
@@ -1382,6 +1433,7 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
             entry["filenames"].append(filename)
         entry["last_seen"] = now
     _save_index(collection, index)
+    _drop_blobs(collection, orphans)
     return digest
 
 
@@ -2188,6 +2240,7 @@ import asyncio
 import logging
 import threading
 import time
+from datetime import datetime
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
@@ -2362,6 +2415,21 @@ def _delete_collection_sync(name: str) -> int:
 
 async def delete_collection(name: str) -> int:
     return await asyncio.to_thread(_delete_collection_sync, name)
+
+
+def _delete_collection_when_idle_sync(name: str) -> int:
+    # The user's delete only. Import-replace and tuning delete their own target
+    # while their job is registered, through _delete_collection_sync or the
+    # client, and must never be refused by their own registration (#40).
+    return collection_writes.delete_when_idle(name, _delete_collection_sync)
+
+
+async def delete_collection_when_idle(name: str) -> int:
+    """Delete unless a job is active for the collection.
+
+    Raises collection_writes.CollectionInUseError naming the active jobs.
+    """
+    return await asyncio.to_thread(_delete_collection_when_idle_sync, name)
 
 
 def _get_collections_sync() -> list[dict]:
@@ -2549,6 +2617,74 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
                     and all(_INDEX_NOT_READY in getattr(f, "message", "") for f in failed)):
                 raise
             time.sleep(_INSERT_RETRY_DELAY)
+
+
+def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
+    """Whether the collection holds any chunk stored under this logical name."""
+    coll = get_client().collections.get(collection_name)
+    return bool(coll.query.fetch_objects(
+        filters=Filter.by_property("source_file").equal(source_file),
+        limit=1, return_properties=[]).objects)
+
+
+class ReplaceError(RuntimeError):
+    """A name's earlier chunks could not all be removed after its new ones were
+    stored. `deleted` is how many were removed before it stopped."""
+
+    def __init__(self, message: str, deleted: int) -> None:
+        super().__init__(message)
+        self.deleted = deleted
+
+
+# Weaviate removes at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
+# delete_many, so removal repeats; this bounds it at a million chunks per file.
+_REPLACE_DELETE_ROUNDS = 100
+
+
+@collection_writes.serialized("collection_name")
+def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
+                                created_at: datetime, expected: int) -> int:
+    """Remove a name's earlier chunks after its `expected` new ones are stored (#22).
+
+    Called only after the insert has been verified, never before: if the insert
+    fails, the earlier version stays whole; if this fails, the name has
+    duplicates but nothing is lost, and uploading it again repairs it.
+
+    The new chunks all carry the same `created_at`, written by this job. They are
+    told apart by equality with that value rather than by "older than", so the
+    selection depends neither on the precision Weaviate keeps nor on earlier
+    chunks' timestamps (an imported package's can be later than now). Before
+    deleting, the equality filter must match exactly the new chunks; afterwards
+    exactly they must remain. Returns how many earlier chunks were deleted.
+    """
+    coll = get_client().collections.get(collection_name)
+    named = Filter.by_property("source_file").equal(source_file)
+
+    def count(where) -> int:
+        return coll.aggregate.over_all(filters=where, total_count=True).total_count or 0
+
+    found = count(named & Filter.by_property("created_at").equal(created_at))
+    if found != expected:
+        raise ReplaceError(f"found {found} of its {expected} new chunks by their timestamp, "
+                           "so none of the earlier ones were removed", 0)
+    earlier = named & Filter.by_property("created_at").not_equal(created_at)
+    deleted = 0
+    for _ in range(_REPLACE_DELETE_ROUNDS):
+        result = coll.data.delete_many(where=earlier)
+        deleted += result.successful or 0
+        if result.failed:
+            raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
+        if not result.matches:
+            break
+    else:
+        raise ReplaceError(f"earlier chunks were still being found after "
+                           f"{_REPLACE_DELETE_ROUNDS} delete rounds", deleted)
+    left = count(named) - expected
+    if left > 0:
+        raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
+    if left < 0:
+        raise ReplaceError(f"{-left} of its {expected} new chunks are missing afterwards", deleted)
+    return deleted
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
@@ -3008,32 +3144,91 @@ def chunk(
 ```python
 from __future__ import annotations
 import asyncio
+import errno
+import gzip
+import json
 import logging
 import mimetypes
 import os
+import posixpath
 import shutil
 import tempfile
 import uuid
 import zipfile
+import zlib
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
-from services.chunker import chunk as do_chunk
+from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
+# Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
+# directly or inside a ZIP (#291). Either is decompressed when the job parses
+# it, never more than this many bytes. The bound is per file, so several
+# gzipped members could each reach it: a ZIP's members, their gzip output
+# included, are bounded together by settings.max_zip_expanded_bytes (#298). A
+# directly uploaded .jsonl.gz is bounded by this alone.
+GZIP_JSON_SUFFIX = ".json.gz"
+GZIP_JSONL_SUFFIX = ".jsonl.gz"
+MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+# The most of one JSON Lines line that is read (#291). A line is parsed whole,
+# so this bounds the memory one record can take (a 10 MB line of small numbers
+# parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+MAX_JSONL_LINE_BYTES = 10_000_000
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("ingest")
 _log = logging.getLogger(__name__)
+
+
+class UploadRejected(Exception):
+    """An upload that cannot be unpacked. The whole request is refused with a
+    readable 4xx instead of the bare 500 an unhandled exception became (#290)."""
+
+    def __init__(self, code: str, message: str, file: str,
+                 members: list[dict[str, str]] | None = None, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.detail = {"file": file, "members": members or []}
 
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def _is_json_gz(name: str) -> bool:
+    return name.lower().endswith(GZIP_JSON_SUFFIX)
+
+
+def _is_jsonl_gz(name: str) -> bool:
+    return name.lower().endswith(GZIP_JSONL_SUFFIX)
+
+
+def _is_jsonl(name: str) -> bool:
+    return name.lower().endswith(".jsonl") or _is_jsonl_gz(name)
+
+
+def _skip_reason(name: str) -> str:
+    """Why a file is not ingested, for the job's `skipped` list."""
+    return f"unsupported type '{Path(name.lower()).suffix or 'none'}'"
+
+
+def source_type_of(path: Path) -> str:
+    """The source_type stored with a file's chunks: what was parsed, so a
+    gzipped JSON file is "json" and gzipped JSON Lines "jsonl", like plain ones."""
+    if _is_json_gz(path.name):
+        return "json"
+    if _is_jsonl_gz(path.name):
+        return "jsonl"
+    return path.suffix.lower().lstrip(".")
 
 
 def _save_upload(src, dest: Path) -> None:
@@ -3041,7 +3236,355 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+def _gzip_too_large() -> ValueError:
+    return ValueError(
+        f"decompresses to more than "
+        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
+        f"one compressed file; nothing from it was stored")
+
+
+def _gunzip_bounded(src: Path, dest: Path) -> None:
+    """Decompress src into dest in blocks, refusing more than the limit."""
+    written = 0
+    try:
+        with gzip.open(src, "rb") as gz, dest.open("wb") as out:
+            while True:
+                block = gz.read(1024 * 1024)
+                if not block:
+                    break
+                written += len(block)
+                if written > MAX_GZIP_DECOMPRESSED_BYTES:
+                    raise _gzip_too_large()
+                out.write(block)
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise ValueError(
+            f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+
+
+class _JsonError(ValueError):
+    """A .json file that can't be read as JSON; `detail` is the parser's reason."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"is not valid JSON: {detail}")
+        self.detail = detail
+
+
+class _JsonTooLarge(_JsonError):
+    """Valid JSON whose converted text would be over the per-file text limit."""
+
+    def __init__(self) -> None:
+        detail = (f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
+                  f"the per-file limit for every chunking strategy; split the file")
+        ValueError.__init__(self, detail)
+        self.detail = detail
+
+
+# The most text one JSON file may convert to (#295 review). Each line repeats its
+# full key path, so a small file with a long key over many values could otherwise
+# expand to gigabytes. This is the chunker's own per-file limit: a file whose
+# records hold more text than this is refused by every chunking strategy anyway,
+# so the bound refuses nothing that could have been ingested; it only refuses
+# before the text is built.
+MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
+
+
+class _JsonNumber:
+    """A JSON number kept as written in the file, so 1.50 stays 1.50. Not a str,
+    so element-shape checks see a number, as partition_json does."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _reject_constant(name: str) -> Any:
+    raise _JsonError(f"{name} is not a JSON value")
+
+
+def _read_json(path: Path) -> tuple[str, Any]:
+    """The file's text without a byte-order mark, and its JSON value; the value is
+    None for an empty file (and for JSON `null`, which the text tells apart)."""
+    try:
+        # utf-8-sig: a leading byte-order mark, as some Windows tools write, is dropped.
+        raw = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise _JsonError(f"it is not UTF-8 text ({exc.reason} at byte {exc.start})") from exc
+    if not raw.strip():
+        return "", None
+    try:
+        return raw, json.loads(raw, parse_int=_JsonNumber, parse_float=_JsonNumber,
+                                parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        raise _JsonError(f"{exc.msg} at line {exc.lineno}, column {exc.colno}") from exc
+    except RecursionError as exc:
+        raise _JsonError("it is nested too deeply to read") from exc
+
+
+def _is_json_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+
+def _json_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+class _JsonBudget:
+    """Characters of converted text left for this file."""
+
+    def __init__(self) -> None:
+        self.left = MAX_JSON_TEXT_CHARACTERS
+
+    def spend(self, characters: int) -> None:
+        self.left -= characters
+        if self.left < 0:
+            raise _JsonTooLarge()
+
+
+# A key path is a chain of (parent, segment, length) links, written out only for a
+# line that fits the budget, so no path longer than the text it produces is built.
+def _path_child(path: Any, segment: str) -> Any:
+    return (path, segment, len(segment) + (path[2] if path else 0))
+
+
+def _path_text(path: Any) -> str:
+    parts = []
+    while path is not None:
+        parts.append(path[1])
+        path = path[0]
+    return "".join(reversed(parts))
+
+
+def _json_line(path: Any, text: str, out: list[str], budget: _JsonBudget) -> None:
+    # A newline joins this line to the one before it in the record.
+    budget.spend((path[2] + 2 if path else 0) + len(text) + (1 if out else 0))
+    out.append(f"{_path_text(path)}: {text}" if path else text)
+
+
+def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> None:
+    """Append `path: value` lines for value: dotted keys, indexed arrays (#295)."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _json_lines(item, _path_child(path, f".{key}" if path else key), out, budget)
+    elif isinstance(value, list):
+        if not value:
+            return
+        if all(_is_json_scalar(item) for item in value):
+            items = [_json_scalar(item) for item in value]
+            # Checked before joining, so an over-long line is never built.
+            if sum(len(item) for item in items) + 2 * (len(items) - 1) > budget.left:
+                raise _JsonTooLarge()
+            _json_line(path, ", ".join(items), out, budget)
+        else:
+            for i, item in enumerate(value):
+                _json_lines(item, _path_child(path, f"[{i}]"), out, budget)
+    else:
+        _json_line(path, _json_scalar(value), out, budget)
+
+
+def _json_records(value: Any) -> list[str]:
+    """Ordinary JSON as readable text: one record per item of a top-level array
+    that holds any object or array, otherwise one record. Records with no text
+    are dropped."""
+    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
+        groups = value
+    else:
+        groups = [value]
+    records = []
+    budget = _JsonBudget()
+    try:
+        for group in groups:
+            lines: list[str] = []
+            left = budget.left
+            _json_lines(group, None, lines, budget)
+            text = "\n".join(lines)
+            if text.strip():
+                records.append(text)
+            else:
+                budget.left = left  # a dropped record's text is not stored
+    except RecursionError as exc:
+        raise _JsonError("it is nested too deeply to read") from exc
+    return records
+
+
+def _parse_json(path: Path) -> tuple[str, list[Any]]:
+    """Ordinary JSON becomes `key: value` text, one element per record. A file of
+    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    raw, value = _read_json(path)
+    if not raw:
+        return "", []
+    from unstructured.partition.common.json_partitioning import is_element_shaped_dict
+    if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
+        from unstructured.partition.json import partition_json
+        # The text already read, so a byte-order mark is handled the same way.
+        elements = partition_json(text=raw)
+        return "\n".join(str(el) for el in elements), elements
+    from unstructured.documents.elements import Text
+    records = _json_records(value)
+    # A blank line between records, so the language splitter prefers to cut there.
+    return "\n\n".join(records), [Text(text=record) for record in records]
+
+
+def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+    fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
+    os.close(fd)
+    plain = Path(name)
+    try:
+        _gunzip_bounded(path, plain)
+        try:
+            return _parse_json(plain)
+        except _JsonTooLarge as exc:
+            raise ValueError(f"was decompressed, but it {exc.detail}") from exc
+        except _JsonError as exc:
+            raise ValueError(
+                f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc
+        except Exception as exc:
+            raise ValueError(
+                f"was decompressed, but its JSON could not be parsed: "
+                f"{str(exc) or type(exc).__name__}") from exc
+    finally:
+        plain.unlink(missing_ok=True)
+
+
+class _JsonlError(ValueError):
+    """A JSON Lines file that can't be ingested; `detail` names the line (#291)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class _JsonlTooLarge(_JsonlError):
+    """A JSON Lines file whose text passes the per-file limit."""
+
+
+class _BoundedLines:
+    """Lines of a decompressing stream, refusing more than the gzip limit."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.read = 0
+
+    def readline(self, size: int) -> bytes:
+        line = self.stream.readline(size)
+        self.read += len(line)
+        if self.read > MAX_GZIP_DECOMPRESSED_BYTES:
+            raise _gzip_too_large()
+        return line
+
+
+_JSONL_BLANK = b" \t\r"
+
+
+def _jsonl_records(stream: Any) -> list[str]:
+    """The records of a JSON Lines file, one per line with text (#291).
+
+    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it, and stopped at
+    the first bad line or when the file's text passes the per-file limit, so
+    memory is bounded by one line and that limit, never by the file's size.
+    """
+    budget = _JsonBudget()
+    records: list[str] = []
+    number = 0
+    blank = None  # the first blank line not yet followed by a record
+    while True:
+        raw = stream.readline(MAX_JSONL_LINE_BYTES + 1)
+        if not raw:
+            break
+        number += 1
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+            too_long = False
+        else:
+            # No newline: either the last line, or a line over the limit.
+            too_long = len(raw) > MAX_JSONL_LINE_BYTES
+        shift = 0
+        if number == 1 and raw.startswith(b"\xef\xbb\xbf"):
+            raw, shift = raw[3:], 3
+        if not too_long and not raw.strip(_JSONL_BLANK):
+            if blank is None:
+                blank = number
+            continue
+        # Trailing blank lines are accepted; one followed by a record is not.
+        if blank is not None:
+            raise _JsonlError(f"line {blank} is blank")
+        if too_long:
+            raise _JsonlError(
+                f"line {number} is longer than {MAX_JSONL_LINE_BYTES:,} bytes, the most one "
+                f"line can hold; split the record across lines or files")
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _JsonlError(f"line {number} is not UTF-8 text "
+                              f"({exc.reason} at byte {exc.start + shift})") from exc
+        try:
+            value = json.loads(line, parse_int=_JsonNumber, parse_float=_JsonNumber,
+                               parse_constant=_reject_constant)
+            lines: list[str] = []
+            left = budget.left
+            _json_lines(value, None, lines, budget)
+            text = "\n".join(lines)
+            if text.strip():
+                if records:
+                    budget.spend(2)  # the blank line before this record
+                records.append(text)
+            else:
+                budget.left = left  # a record with no text is not stored
+        except _JsonTooLarge as exc:
+            raise _JsonlTooLarge(
+                f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text by "
+                f"line {number}, the per-file limit for every chunking strategy; "
+                f"split the file") from exc
+        except _JsonError as exc:
+            raise _JsonlError(f"line {number} is not valid JSON: {exc.detail}") from exc
+        except json.JSONDecodeError as exc:
+            raise _JsonlError(
+                f"line {number} is not valid JSON: {exc.msg} at column {exc.colno}") from exc
+        except RecursionError as exc:
+            raise _JsonlError(
+                f"line {number} is not valid JSON: it is nested too deeply to read") from exc
+    return records
+
+
+def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
+    """JSON Lines, plain or gzipped: each line is one record, converted like
+    ordinary JSON (#295), records separated by a blank line (#291). Lines are
+    never treated as serialized Unstructured elements."""
+    if _is_jsonl_gz(path.name):
+        try:
+            # Decompressed while read; nothing decompressed is written to disk.
+            with gzip.open(path, "rb") as gz:
+                records = _jsonl_records(_BoundedLines(gz))
+        except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+            raise ValueError(
+                f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+        except _JsonlError as exc:
+            subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
+            raise ValueError(f"was decompressed, but {subject}{exc.detail}") from exc
+    else:
+        try:
+            with path.open("rb") as fh:
+                records = _jsonl_records(fh)
+        except _JsonlError as exc:
+            raise ValueError(exc.detail) from exc
+    from unstructured.documents.elements import Text
+    return "\n\n".join(records), [Text(text=record) for record in records]
+
+
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
+    if _is_jsonl(path.name):
+        return _parse_jsonl(path)
+    if _is_json_gz(path.name):
+        return _parse_json_gz(path)
     ext = path.suffix.lower()
     if ext == ".pdf":
         from unstructured.partition.pdf import partition_pdf
@@ -3059,13 +3602,103 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
         from unstructured.partition.csv import partition_csv
         elements = partition_csv(filename=str(path))
     elif ext == ".json":
-        from unstructured.partition.json import partition_json
-        elements = partition_json(filename=str(path))
+        return _parse_json(path)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
     text = "\n".join(str(el) for el in elements)
     return text, elements
+
+
+class _CollectionDeleted(Exception):
+    """Storing failed because the job's collection no longer exists (#40)."""
+
+
+def _collection_gone(collection: str) -> bool:
+    """True only when the backend answers that the collection is missing. A
+    failed check is not evidence of deletion, so the original error stands."""
+    try:
+        return not wc._collection_exists_sync(collection)
+    except Exception:
+        _log.warning("Could not check whether %r still exists", collection, exc_info=True)
+        return False
+
+
+def _store_chunks(collection: str, chunks: list[dict]) -> None:
+    try:
+        wc._insert_chunks_sync(collection, chunks)
+    except Exception as exc:
+        # Only a failed store asks whether the collection is gone: a parse or
+        # chunking failure says nothing about it. With auto-schema off, Weaviate
+        # refuses inserts into a deleted class, and the batch, verification or
+        # cleanup error it causes would not tell the user what happened.
+        if _collection_gone(collection):
+            _log.warning("Collection %r disappeared while storing chunks: %s",
+                         collection, exc, exc_info=True)
+            raise _CollectionDeleted(collection) from exc
+        raise
+
+
+def _has_chunks(collection: str, name: str) -> bool:
+    """Whether the name already has chunks, which this file will replace (#22).
+    It is the job's first backend call for a file, so a deleted collection is
+    reported here the way _store_chunks reports it (#40)."""
+    try:
+        return wc._source_has_chunks_sync(collection, name)
+    except Exception as exc:
+        if _collection_gone(collection):
+            _log.warning("Collection %r disappeared before storing chunks: %s",
+                         collection, exc, exc_info=True)
+            raise _CollectionDeleted(collection) from exc
+        raise
+
+
+class _StaleMarkFailed(Exception):
+    """Gold-standard sessions could not be marked stale before a replacement."""
+
+
+# How many replaced names a stale reason lists before "and N more".
+_MAX_NAMED_FILES = 10
+
+
+def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None:
+    """Mark the collection's gold-standard sessions stale before `name` replaces
+    its earlier chunks (#22). Their pairs cite chunks by source_file and
+    chunk_index, which the replacement changes, so they would no longer describe
+    what is stored. Saved before anything is stored: if it can't be saved, the
+    file fails and the collection is left as it was.
+
+    The reason names this file and the job's later files that also have earlier
+    chunks, because a job marks at most once.
+    """
+    try:
+        names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
+        listed = ", ".join(names[:_MAX_NAMED_FILES])
+        if len(names) > _MAX_NAMED_FILES:
+            listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+        # Imported here: goldstandard imports weaviate_client, as tuning notes.
+        from services import goldstandard
+        goldstandard.mark_stale(
+            collection, f"documents were re-ingested, replacing their earlier chunks: {listed}",
+            require_durable=True)
+    except Exception as exc:
+        raise _StaleMarkFailed(str(exc) or type(exc).__name__) from exc
+
+
+def _remove_earlier(collection: str, name: str, created_at: datetime,
+                    expected: int) -> tuple[int, str | None]:
+    """Remove a name's earlier chunks once its new ones are stored.
+
+    Returns how many were removed and, when not all of them could be, why. A
+    failure here never undoes the insert: duplicates are recoverable by uploading
+    again, lost chunks are not.
+    """
+    try:
+        return wc._delete_earlier_chunks_sync(collection, name, created_at, expected), None
+    except Exception as exc:
+        _log.error("Could not remove the earlier chunks of %r in %r", name, collection,
+                   exc_info=True)
+        return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
 
 
 @collection_writes.serialized("collection")
@@ -3079,16 +3712,25 @@ def _process_job_sync(
     chunk_overlap: int,
     similarity_threshold: float,
     min_chunk_size: int,
+    labels: dict[Path, str] | None = None,
+    names: dict[Path, str] | None = None,
 ) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
+    deleted = False
+    # Logical names (#22): what each file is stored and replaced under.
+    names = names or {}
+    logical = [names.get(p, p.name) for p in file_paths]
+    # Gold-standard sessions are marked stale at most once per job.
+    marked = False
 
     try:
-        for path in file_paths:
+        for index, path in enumerate(file_paths):
+            name = logical[index]
+            label = (labels or {}).get(path, name)
             try:
                 text, elements = _parse_file(path)
-                ext = path.suffix.lower().lstrip(".")
-                source_type = ext
+                source_type = source_type_of(path)
 
                 chunks = do_chunk(
                     text=text,
@@ -3100,11 +3742,12 @@ def _process_job_sync(
                     elements=elements if strategy == "context_aware" else None,
                 )
 
-                now = datetime.now(timezone.utc).isoformat()
+                created = datetime.now(timezone.utc)
+                now = created.isoformat()
                 weaviate_chunks = [
                     {
                         "content": c,
-                        "source_file": path.name,
+                        "source_file": name,
                         "source_type": source_type,
                         "chunk_index": i,
                         "chunk_strategy": strategy,
@@ -3115,31 +3758,77 @@ def _process_job_sync(
                     for i, c in enumerate(chunks)
                 ]
 
-                wc._insert_chunks_sync(collection, weaviate_chunks)
+                # The last ingest of a name wins (#22). Everything before the
+                # insert only reads, so a failure up to there changes nothing.
+                replacing = _has_chunks(collection, name)
+                if replacing and not marked:
+                    _mark_replacement_stale(collection, name, logical[index + 1:])
+                    marked = True
+
+                # Insert first, then remove the earlier chunks, never the other
+                # way round: a failed insert leaves the earlier version whole.
+                _store_chunks(collection, weaviate_chunks)
+                removed, problem = 0, None
+                if replacing:
+                    removed, problem = _remove_earlier(collection, name, created, len(chunks))
+                    job["chunks_replaced"] = job.get("chunks_replaced", 0) + removed
 
                 # Retain the original only after the file has been parsed,
                 # chunked and stored. A file that fails any of those steps
-                # leaves no orphan source behind.
+                # leaves no orphan source behind. replace=True releases the name
+                # from the version it replaces, so rechunk can't rebuild that.
                 try:
+                    # A gzipped file's bytes are gzip, whatever it decompresses to.
+                    media_type, encoding = mimetypes.guess_type(name)
                     sources.store(
                         collection,
-                        path.name,
+                        name,
                         path.read_bytes(),
-                        mimetypes.guess_type(path.name)[0],
+                        "application/gzip" if encoding else media_type,
+                        replace=True,
                     )
                 except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
-                    _log.error("Could not retain source %s for %r: %s", path.name, collection, exc)
+                    # Names are logged with %r: one can hold a newline (#298).
+                    _log.error("Could not retain source %r for %r: %s", name, collection, exc)
 
                 job["chunks_stored"] += len(chunks)
-                job["files_completed"] += 1
-            except Exception as exc:
+                if problem is None:
+                    job["files_completed"] += 1
+                else:
+                    job["files_failed"] += 1
+                    job["errors"].append(
+                        f"{label}: its new chunks were stored, but earlier chunks could not "
+                        f"all be removed ({problem}); upload it again to retry")
+            except _CollectionDeleted:
+                # Nothing more can be stored: this file and the rest fail.
+                job["files_failed"] += len(file_paths) - index
+                deleted = True
+                break
+            except _StaleMarkFailed as exc:
                 job["files_failed"] += 1
-                job["errors"].append(f"{path.name}: {exc}")
+                job["errors"].append(
+                    f"{label}: could not mark gold-standard sessions stale before replacing "
+                    f"its chunks, so nothing was changed: {exc}")
+                _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
+            except Exception as exc:
+                # Name the file the way the user knows it (a ZIP member by its
+                # archive and path), and never leave the reason blank.
+                job["files_failed"] += 1
+                job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
+                _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Before the status turns terminal: a client that sees the job end
+        # can delete the collection at once (#40).
+        collection_writes.end_job("ingest", job_id)
+
+    if deleted:
+        job["errors"].append(f"collection '{collection}' was deleted while this job was running")
+        job["status"] = "failed"
+        return
 
     if job["files_failed"] == 0:
         job["status"] = "completed"
@@ -3147,6 +3836,281 @@ def _process_job_sync(
         job["status"] = "failed"
     else:
         job["status"] = "partial"
+
+
+def _os_reason(exc: OSError) -> str:
+    return exc.strerror or str(exc) or type(exc).__name__
+
+
+def _rejected(code: str, message: str, file: str,
+              members: list[dict[str, str]] | None = None) -> UploadRejected:
+    # %r: the message names the upload and its members, and a name can hold a
+    # newline that would otherwise forge a log line (#298).
+    _log.warning("Upload refused (%s): %r", code, message)
+    return UploadRejected(code, message, file, members)
+
+
+# How many unreadable members a refusal names in its message; detail lists all.
+_MAX_NAMED_MEMBERS = 10
+
+_BLOCK = 1024 * 1024
+
+
+class _OverCap(Exception):
+    """An upload's ZIPs expand past max_zip_expanded_bytes (#298)."""
+
+
+class _ExpansionBudget:
+    """Bytes the ZIPs of one upload request may still expand to (#298).
+
+    One total for the whole request: every ZIP in it adds to it, files
+    uploaded directly add nothing. Each member's bytes count once, as
+    validation reads them; extraction reads supported members again and does
+    not count them a second time.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+
+    def fits(self, size: int) -> bool:
+        return self.used + size <= self.limit
+
+    def spend(self, size: int) -> None:
+        self.used += size
+        if self.used > self.limit:
+            raise _OverCap()
+
+
+class _CountedMember:
+    """A ZIP member's data, counting every block read toward the cap (#298).
+
+    It is what the gzip reader reads from, so an error raised here is about the
+    ZIP member itself (damage), never about its gzip data; it is kept so the
+    caller can tell the two apart.
+    """
+
+    def __init__(self, data: Any, budget: _ExpansionBudget) -> None:
+        self.data = data
+        self.budget = budget
+        self.error: BaseException | None = None
+
+    def read(self, size: int = -1) -> bytes:
+        try:
+            block = self.data.read(_BLOCK if size is None or size < 0 else min(size, _BLOCK))
+        except BaseException as exc:
+            self.error = exc
+            raise
+        self.budget.spend(len(block))
+        return block
+
+
+def _count_gzip_output(member: _CountedMember, budget: _ExpansionBudget) -> None:
+    """Count what a gzipped member decompresses to, keeping none of it.
+
+    The job decompresses .json.gz and .jsonl.gz members later, with gzip.open,
+    so their output would not otherwise count toward the cap. They are read
+    here with the same reader, gzip.GzipFile, so the count is what the job
+    would decompress: the same headers accepted (zlib's own gzip mode refuses
+    some the job reads in full, which let them count nothing), concatenated
+    streams and zero padding followed. Gzip data the reader refuses stops the
+    count, and the job reports that file as it always has.
+    """
+    try:
+        with gzip.GzipFile(fileobj=member, mode="rb") as gz:
+            while True:
+                block = gz.read(_BLOCK)
+                if not block:
+                    break
+                budget.spend(len(block))
+    except (OSError, EOFError, zlib.error):
+        if member.error is not None:
+            raise member.error
+        # Invalid gzip data: its count stops here.
+
+
+def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo, budget: _ExpansionBudget,
+                    gunzip: bool = False) -> tuple[str, bool] | None:
+    """Why this member can't be read, and whether that is damage; None if it reads.
+
+    Every block read is counted toward the request's expansion cap, and a
+    gzipped member's decompressed output too (#298); _OverCap stops the read.
+    """
+    if member.flag_bits & 0x1:
+        return "password-protected", False
+    try:
+        with z.open(member) as data:
+            counted = _CountedMember(data, budget)
+            if gunzip:
+                _count_gzip_output(counted, budget)
+            # The rest of the member (all of it, if not gzip) is still read to
+            # its end, so damage anywhere in it is found.
+            while counted.read(_BLOCK):
+                pass
+    except NotImplementedError:
+        return f"unsupported compression method {member.compress_type}", False
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:
+            # A negative seek: the zip's directory points before the file starts.
+            return "damaged: its recorded position in the zip is invalid", True
+        return f"damaged: {_os_reason(exc)}", True
+    except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+        return f"damaged: {str(exc) or type(exc).__name__}", True
+    return None
+
+
+class _Queue:
+    """The files an upload queues, one per logical name (#22).
+
+    Every input is staged in a directory of its own, so no upload or ZIP member
+    can overwrite another's bytes on disk, and the parser still sees the file's
+    own extension. When a later input has the same logical name, the earlier one
+    is dropped and reported in `skipped`: the last one wins, never silently.
+    """
+
+    def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
+        self.tmp_dir = tmp_dir
+        self.skipped = skipped
+        self.entries: dict[str, tuple[Path, str]] = {}
+        self._slots = 0
+
+    def slot(self, basename: str) -> Path:
+        self._slots += 1
+        directory = self.tmp_dir / str(self._slots)
+        directory.mkdir()
+        return directory / basename
+
+    def add(self, path: Path, logical: str, label: str) -> None:
+        earlier = self.entries.pop(logical, None)
+        if earlier is not None:
+            earlier[0].unlink(missing_ok=True)
+            self.skipped.append(
+                f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")
+        self.entries[logical] = (path, label)
+
+
+def _member_name(filename: str) -> str | None:
+    """A ZIP member's logical name: its normalised POSIX path inside the archive
+    (#22), so a/report.pdf and b/report.pdf stay two documents and a/../b.txt is
+    b.txt. None for a path that leaves the archive, which is not ingested."""
+    name = posixpath.normpath(filename)
+    if name.startswith("/") or name in (".", "..") or name.startswith("../"):
+        return None
+    return name
+
+
+def _limit_text(limit: int) -> str:
+    mib = 1024 * 1024
+    if limit >= mib and limit % mib == 0:
+        return f"{limit // mib:,} MB"
+    return f"{limit:,} bytes"
+
+
+def _too_large(safe_name: str, limit: int) -> UploadRejected:
+    return _rejected(
+        "ARCHIVE_TOO_LARGE",
+        f"'{safe_name}' expands to more than {_limit_text(limit)} when unpacked, the most one "
+        f"upload's ZIPs can expand to, so nothing from it was imported. Split it into smaller "
+        f"zips and upload them in separate imports.",
+        safe_name)
+
+
+def _declared_size(members: list[tuple[zipfile.ZipInfo, str]]) -> int:
+    """What the ZIP's directory says these members decompress to."""
+    return sum(member.file_size for member, _ in members)
+
+
+def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
+    """Validate one uploaded ZIP, then queue its supported members.
+
+    Every member is read to its end first, including the ones that will be
+    skipped. A zip with any unreadable member is refused as a whole, naming
+    them; nothing is repaired, and nothing from it is ingested (#290).
+
+    The request's ZIPs may expand to at most the budget (#298): the sizes this
+    ZIP declares are checked before anything is read, then the bytes actually
+    decompressed, gzipped members' output included, are counted while reading,
+    and the request is refused as soon as the total passes the cap. This runs
+    in a worker thread: it can take seconds, and on the event loop it stalled
+    every other request.
+    """
+    remedy = "Re-create the zip and upload it again."
+    try:
+        archive = zipfile.ZipFile(dest, "r")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise _rejected(
+            "ARCHIVE_UNREADABLE",
+            f"'{safe_name}' is damaged and can't be read, so nothing from it was imported. "
+            f"It may be truncated (for example an incomplete download or copy) or corrupt. "
+            f"{remedy}",
+            safe_name) from exc
+
+    with archive as z:
+        members = []
+        for member in z.infolist():
+            if member.is_dir():
+                continue
+            logical = _member_name(member.filename)
+            if logical is None:
+                continue
+            members.append((member, logical))
+
+        if not budget.fits(_declared_size(members)):
+            raise _too_large(safe_name, budget.limit)
+
+        problems = []
+        try:
+            for member, logical in members:
+                basename = PurePosixPath(logical).name
+                problem = _member_problem(z, member, budget,
+                                          _is_json_gz(basename) or _is_jsonl_gz(basename))
+                if problem is not None:
+                    problems.append((member.filename, *problem))
+        except _OverCap:
+            # As soon as the total passes the cap, whatever else was found.
+            raise _too_large(safe_name, budget.limit) from None
+        if problems:
+            damaged = any(is_damage for _, _, is_damage in problems)
+            named = "; ".join(f"{name} ({reason})"
+                              for name, reason, _ in problems[:_MAX_NAMED_MEMBERS])
+            more = len(problems) - _MAX_NAMED_MEMBERS
+            if more > 0:
+                named += f"; and {more} more"
+            reasons = {reason for _, reason, _ in problems}
+            if "password-protected" in reasons:
+                remedy = "Re-create the zip without a password and upload it again."
+            elif not damaged:
+                remedy = ("Re-create the zip with standard (Deflate) compression and "
+                          "upload it again.")
+            raise _rejected(
+                "ARCHIVE_UNREADABLE" if damaged else "ARCHIVE_UNSUPPORTED",
+                f"'{safe_name}' {'is damaged and ' if damaged else ''}can't be read, so "
+                f"nothing from it was imported. Unreadable members: {named}. {remedy}",
+                safe_name,
+                [{"member": name, "reason": reason} for name, reason, _ in problems])
+
+        for member, logical in members:
+            basename = PurePosixPath(logical).name
+            if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
+                    or _is_json_gz(basename) or _is_jsonl_gz(basename)):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
+                continue
+            # Copied out by our own code, not ZipFile.extract, whose own path
+            # cleaning would put a/../b.txt somewhere other than where it is
+            # queued.
+            try:
+                target = queue.slot(basename)
+                with z.open(member) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
+            except OSError as exc:
+                reason = _os_reason(exc)
+                raise _rejected(
+                    "UPLOAD_WRITE_FAILED",
+                    f"Could not extract '{member.filename}' from '{safe_name}' on the "
+                    f"server: {reason}.",
+                    safe_name, [{"member": member.filename, "reason": reason}]) from exc
+            queue.add(target, logical, f"{safe_name}:{member.filename}")
 
 
 async def start_ingest_job(
@@ -3166,12 +4130,29 @@ async def start_ingest_job(
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
+    # Registered before the upload is saved, so the collection can't be deleted
+    # out from under a job being admitted (#40). Every way out of admission that
+    # starts no worker ends the registration; the worker ends its own.
+    collection_writes.register_job(collection, "ingest", job_id)
+    try:
+        return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
+                                       chunk_overlap, similarity_threshold, min_chunk_size)
+    except BaseException:
+        collection_writes.end_job("ingest", job_id)
+        raise
+
+
+async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
+                            chunk_size: int, chunk_overlap: int,
+                            similarity_threshold: float, min_chunk_size: int) -> str:
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
-    file_paths: list[Path] = []
-    # Files the caller sent that this build cannot parse. Dropping them without
-    # a word makes a ZIP of 8 files silently report 6, with nothing saying which
-    # two were ignored or why.
+    # Files the caller sent that this build cannot parse, and inputs replaced by
+    # a later one with the same name. Dropping them without a word makes a ZIP
+    # of 8 files silently report 6, with nothing saying which two or why.
     skipped: list[str] = []
+    queue = _Queue(tmp_dir, skipped)
+    # One expansion total for every ZIP in this request (#298).
+    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
 
     try:
         for upload in files:
@@ -3179,39 +4160,38 @@ async def start_ingest_job(
             safe_name = Path(raw_name).name
             if not safe_name:
                 continue
-            dest = tmp_dir / safe_name
+            dest = queue.slot(safe_name)
             # Copy in blocks rather than `await upload.read()`, which held the
             # whole file in memory. Uploads can now reach 512 MB (issue #21),
             # and this container already runs close to its memory budget. The
             # copy blocks, so it runs off the event loop.
-            await asyncio.to_thread(_save_upload, upload.file, dest)
+            try:
+                await asyncio.to_thread(_save_upload, upload.file, dest)
+            except OSError as exc:
+                raise _rejected(
+                    "UPLOAD_WRITE_FAILED",
+                    f"Could not save '{safe_name}' on the server: {_os_reason(exc)}.",
+                    safe_name) from exc
 
             if safe_name.lower().endswith(".zip"):
-                resolved_tmp = tmp_dir.resolve()
-                with zipfile.ZipFile(dest, "r") as z:
-                    for member in z.infolist():
-                        if member.is_dir():
-                            continue
-                        member_path = (tmp_dir / member.filename).resolve()
-                        if not member_path.is_relative_to(resolved_tmp):
-                            continue
-                        if member_path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                            z.extract(member, tmp_dir)
-                            file_paths.append(member_path)
-                        else:
-                            skipped.append(
-                                f"{safe_name}:{member.filename} "
-                                f"(unsupported type '{member_path.suffix.lower() or 'none'}')")
+                # Off the event loop, like the copy above (#298).
+                await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
                 os.remove(dest)
-            elif Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS:
-                file_paths.append(dest)
+            elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
+                  or _is_jsonl_gz(safe_name)):
+                # A directly uploaded .json.gz is still skipped (#291 scope).
+                queue.add(dest, safe_name, safe_name)
             else:
-                skipped.append(
-                    f"{safe_name} (unsupported type "
-                    f"'{Path(safe_name).suffix.lower() or 'none'}')")
+                skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
+
+    # One file per logical name, in the order of each winning input. How each
+    # is named in the job's errors, and what it is stored under.
+    file_paths = [path for path, _ in queue.entries.values()]
+    labels = {path: label for path, label in queue.entries.values()}
+    names = {path: logical for logical, (path, _) in queue.entries.items()}
 
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -3227,11 +4207,16 @@ async def start_ingest_job(
         "files_completed": 0,
         "files_failed": 0,
         "chunks_stored": 0,
+        # Earlier chunks of the same names removed by this job (#22).
+        "chunks_replaced": 0,
         "errors": [],
         "skipped": skipped,
     }
 
     def _on_done(future: asyncio.Future) -> None:
+        # The worker ends its registration itself; this covers a job cancelled
+        # before it ran and an error that escaped the worker.
+        collection_writes.end_job("ingest", job_id)
         if future.cancelled():
             return
         exc = future.exception()
@@ -3239,8 +4224,10 @@ async def start_ingest_job(
             _log.error("ingest job %s failed: %s", job_id, exc)
             job = _jobs.get(job_id)
             if job and job["status"] not in ("completed", "partial", "failed"):
-                job["status"] = "failed"
+                # The error first: the status change is the write that saves
+                # the record (#23), and an in-place append is not seen alone.
                 job["errors"].append(str(exc))
+                job["status"] = "failed"
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
@@ -3254,6 +4241,8 @@ async def start_ingest_job(
         chunk_overlap,
         similarity_threshold,
         min_chunk_size,
+        labels,
+        names,
     )
     future.add_done_callback(_on_done)
 
@@ -3430,7 +4419,7 @@ from config import settings
 from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
-from services.collection_writes import aliases
+from services.collection_writes import aliases, end_job, register_job
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -4209,6 +5198,9 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         cancelled = True
         raise
     finally:
+        # Before the status turns terminal: a client that sees generation end
+        # can delete the collection at once (#40).
+        end_job("goldstandard", session_id)
         def finish(current):
             if persistence_failure is not None:
                 _failed_generation(current, persistence_failure)
@@ -4244,6 +5236,9 @@ def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None
                 "pairs": [],
             }
             session = _store_generated_session(session)
+            # Still inside the guard, so no delete can pass between publication
+            # and registration; DELETE /collections refuses from here (#40).
+            register_job(collection, "goldstandard", session["session_id"])
             return session, all_chunks
     except CollectionBusyError as exc:
         raise GoldStandardError("COLLECTION_BUSY",
@@ -4264,10 +5259,16 @@ async def start_generation(
         _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
-    task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    try:
+        task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    except BaseException:
+        end_job("goldstandard", session_id)
+        raise
     _tasks.add(task)
 
     def _on_task_done(t: asyncio.Task) -> None:
+        # _run_generation ends it first; this covers a task that never ran it.
+        end_job("goldstandard", session_id)
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
@@ -5043,6 +6044,342 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
                                    {"file": "chunks.jsonl", "line": number}) from exc
 ```
 
+### api/services/jobstore.py
+
+```python
+"""Job records that survive an API restart (#23).
+
+Ingest, export, import and tune jobs used to keep their status in a plain dict,
+so any restart (a crash, an OOM kill, `docker compose restart`) turned every job
+the UI was polling into `404 JOB_NOT_FOUND`. A `JobStore` is used exactly like
+the dict it replaces (`store[job_id] = {...}`, `job = store[job_id]`,
+`job["status"] = "running"`, `job.update(...)`, `store.get(job_id)`), and once
+the API's startup has called `load()`, it also keeps one JSON file per job under
+`<UPLOAD_DIR>/jobs/<kind>/<job_id>.json`.
+
+**Unbound until loaded.** Before `load()` a store is only an in-memory dict that
+keeps the caller's own dict object. Verify helpers run inside the API container,
+on the same upload volume, and store jobs directly (some then assert on the dict
+they stored); without this rule they would leave job files that the next restart
+loads. Only a process that runs the API lifespan binds its stores.
+
+**When a change reaches the disk.** A record changed through its own methods is
+written at once when its `status` changes, and at once whenever its status is
+already terminal (import names its recovery copy after `finish`). Other changes
+(progress counters, which export and import update every few hundred chunks) are
+written at most once a second per job, and never later than about a second
+after they were made. Changes made in place to a nested list or dict
+(`job["errors"].append(...)`) are not seen by themselves; the next write
+carries them. Every job path ends with a status change, so the final record on
+disk is complete.
+
+**At startup** `load()` marks every record still `queued` or `running` as
+interrupted: its worker thread died with the old process. Unreadable files are
+left as they are and logged. The newest `RETENTION` files per kind are kept.
+
+A job record is never recovery authority: retained import and tuning data is
+owned by `collection_recovery` and the import markers (#43, #44), never by
+anything in `jobs/`.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+import time
+from collections.abc import MutableMapping
+from pathlib import Path
+
+from config import settings
+
+_log = logging.getLogger(__name__)
+
+KINDS = ("ingest", "export", "import", "tune")
+# The statuses a job never leaves; the same set scripts/verify/lib.sh waits for.
+TERMINAL = frozenset({"completed", "failed", "partial", "cancelled"})
+# Progress-only changes are written at most this often per job. Export and import
+# report progress every few hundred chunks; writing each one would be a disk-I/O
+# regression on a large export.
+THROTTLE_S = 1.0
+# Records kept per kind, newest first by modification time. About 1 KB each, so
+# the volume can't grow without bound. Nothing in jobs/ is ever recovery data.
+RETENTION = 200
+# Generated ids are 8 hex characters; anything else could name another path.
+_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+INTERRUPTED_MESSAGE = "Interrupted: the API restarted while this job was running."
+_REMEDY = {
+    "ingest": "Re-upload the files to try again.",
+    "export": "Start the export again.",
+    "import": "Start the import again.",
+    "tune": "Start the operation again.",
+}
+
+
+class _Job(dict):
+    """A record bound to its store: changes made through its methods are saved."""
+
+    __slots__ = ("_store", "_id", "_last", "_timer")
+
+    def __setitem__(self, key, value):
+        status_changed = key == "status" and self.get("status") != value
+        dict.__setitem__(self, key, value)
+        self._store._changed(self, status_changed)
+
+    def update(self, *args, **kwargs):
+        before = self.get("status")
+        dict.update(self, *args, **kwargs)
+        self._store._changed(self, self.get("status") != before)
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return dict.__getitem__(self, key)
+        dict.__setitem__(self, key, default)
+        self._store._changed(self, key == "status")
+        return default
+
+    def pop(self, key, *default):
+        status_changed = key == "status" and key in self
+        value = dict.pop(self, key, *default)
+        self._store._changed(self, status_changed)
+        return value
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, key)
+        self._store._changed(self, key == "status")
+
+
+class JobStore(MutableMapping):
+    """The job records of one kind; see the module docstring."""
+
+    def __init__(self, kind: str) -> None:
+        if kind not in KINDS:
+            raise ValueError(f"Unknown job kind {kind!r}")
+        self.kind = kind
+        self._records: dict = {}
+        self._dir: Path | None = None          # None: unbound, memory only
+        # One lock per store. Re-entrant because load() and _changed() write
+        # while holding it.
+        self._lock = threading.RLock()
+
+    # ── mapping ─────────────────────────────────────────────────────────────
+    # Lookups never touch the disk: after load() memory holds every kept record,
+    # and a job id from a URL is never turned into a path.
+
+    def __getitem__(self, job_id):
+        return self._records[job_id]
+
+    def __iter__(self):
+        return iter(list(self._records))
+
+    def __len__(self):
+        return len(self._records)
+
+    def __setitem__(self, job_id, doc):
+        if self._dir is None:
+            self._records[job_id] = doc        # the caller's own object
+            return
+        if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
+            raise ValueError(f"Invalid job id {job_id!r}")
+        record = self._bind(job_id, doc)
+        with self._lock:
+            old = self._records.get(job_id)
+            if isinstance(old, _Job):
+                self._cancel(old)
+            self._records[job_id] = record
+            self._write(record, durable=True)
+
+    def __delitem__(self, job_id):
+        with self._lock:
+            record = self._records.pop(job_id)
+            if isinstance(record, _Job):
+                self._cancel(record)
+            if self._dir is not None and isinstance(job_id, str) and _ID.fullmatch(job_id):
+                try:
+                    (self._dir / f"{job_id}.json").unlink(missing_ok=True)
+                except OSError:
+                    _log.exception("Could not remove %s job record %s", self.kind, job_id)
+
+    # ── persistence ─────────────────────────────────────────────────────────
+
+    def _bind(self, job_id: str, doc) -> _Job:
+        record = _Job(doc)
+        record._store = self
+        record._id = job_id
+        record._last = 0.0
+        record._timer = None
+        return record
+
+    @staticmethod
+    def _cancel(record: _Job) -> None:
+        if record._timer is not None:
+            record._timer.cancel()
+            record._timer = None
+
+    def _changed(self, record: _Job, status_changed: bool) -> None:
+        with self._lock:
+            if status_changed or record.get("status") in TERMINAL:
+                self._cancel(record)
+                self._write(record, durable=True)
+                return
+            now = time.monotonic()
+            if now - record._last >= THROTTLE_S:
+                self._cancel(record)
+                self._write(record, durable=False)
+            elif record._timer is None:
+                # Carry this change to disk even if the job changes no further
+                # (an ingest file can embed for tens of seconds after it).
+                timer = threading.Timer(record._last + THROTTLE_S - now, self._flush, (record,))
+                timer.daemon = True
+                record._timer = timer
+                timer.start()
+
+    def _flush(self, record: _Job) -> None:
+        with self._lock:
+            # A cancelled or superseded timer does nothing, so a late timer
+            # never adds a second write to one window.
+            if record._timer is not threading.current_thread():
+                return
+            record._timer = None
+            self._write(record, durable=False)
+
+    def _write(self, record: _Job, durable: bool) -> None:
+        """Atomically replace the record's file. Never raises: a job's outcome
+        must not depend on whether its status could be saved."""
+        with self._lock:
+            if self._dir is None or self._records.get(record._id) is not record:
+                return                          # deleted or replaced meanwhile
+            tmp = None
+            try:
+                payload = json.dumps(dict(record), default=str)
+                # mkstemp creates the file 0600, like the session files.
+                fd, tmp = tempfile.mkstemp(prefix=f".{record._id}.json.", suffix=".tmp",
+                                           dir=self._dir)
+                with os.fdopen(fd, "w") as output:
+                    output.write(payload)
+                    if durable:
+                        output.flush()
+                        os.fsync(output.fileno())
+                os.replace(tmp, self._dir / f"{record._id}.json")
+                tmp = None
+                if durable:
+                    _sync_dir(self._dir)
+            except Exception:                   # noqa: BLE001 - logged, never raised
+                _log.exception("Could not save %s job %s", self.kind, record._id)
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            finally:
+                # Also after a failure, so a lasting fault is retried at the
+                # throttle's pace rather than on every change.
+                record._last = time.monotonic()
+
+    # ── startup ─────────────────────────────────────────────────────────────
+
+    def load(self) -> list[str]:
+        """Bind to the disk, apply retention and mark interrupted jobs.
+
+        Called once, by the API lifespan, before any job can start. Returns the
+        ids of the jobs it marked interrupted.
+        """
+        with self._lock:
+            directory = Path(settings.upload_dir) / "jobs" / self.kind
+            directory.mkdir(parents=True, exist_ok=True)
+            self._dir = directory
+
+            for leftover in directory.glob(".*.json.*.tmp"):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    _log.exception("Could not remove interrupted write %s", leftover)
+
+            files = [p for p in directory.glob("*.json") if not p.name.startswith(".")]
+            readable = {}
+            for path in files:
+                try:
+                    readable[path] = _read_record(path)
+                except (OSError, ValueError) as exc:
+                    # Kept as it is: never rewritten or reset (only retention,
+                    # below, removes it once it is old).
+                    _log.warning("Unreadable %s job record %s kept as it is: %s",
+                                 self.kind, path, exc)
+
+            files.sort(key=_mtime, reverse=True)
+            for path in files[RETENTION:]:
+                try:
+                    path.unlink()
+                    _log.info("Removed old %s job record %s (keeping the newest %d)",
+                              self.kind, path.name, RETENTION)
+                except OSError:
+                    _log.exception("Could not remove old job record %s", path)
+
+            marked = []
+            for path in files[:RETENTION]:
+                if path not in readable:
+                    continue
+                record = self._bind(path.stem, readable[path])
+                self._records[path.stem] = record
+                if record.get("status") not in TERMINAL:
+                    self._mark_interrupted(record)
+                    self._write(record, durable=True)
+                    marked.append(path.stem)
+            return marked
+
+    def _mark_interrupted(self, record: _Job) -> None:
+        # Plain dict methods only: one durable write afterwards, so no record
+        # reaches the disk terminal but without its message.
+        if self.kind == "ingest":
+            completed = dict.get(record, "files_completed")
+            dict.__setitem__(record, "status", "partial"
+                             if isinstance(completed, int) and completed > 0 else "failed")
+            errors = dict.get(record, "errors")
+            message = f"{INTERRUPTED_MESSAGE} {_REMEDY['ingest']}"
+            if isinstance(errors, list):
+                errors.append(message)
+            else:
+                dict.__setitem__(record, "errors", [message])
+        else:
+            dict.__setitem__(record, "status", "failed")
+            dict.__setitem__(record, "error_code", "INTERRUPTED")
+            dict.__setitem__(record, "error", f"{INTERRUPTED_MESSAGE} {_REMEDY[self.kind]}")
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.lstat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _read_record(path: Path) -> dict:
+    """The record in `path`, or ValueError/OSError saying why it is unusable."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("not a regular file")
+    if not _ID.fullmatch(path.stem):
+        raise ValueError("not a job id")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    if not isinstance(data.get("status"), str):
+        raise ValueError("no status")
+    if "job_id" in data and data["job_id"] != path.stem:
+        raise ValueError("its job_id doesn't match its name")
+    return data
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+```
+
 ### api/services/exporter.py
 
 ```python
@@ -5060,11 +6397,12 @@ import logging
 import threading
 import uuid
 
-from services import packager
+from services import collection_writes, jobstore, packager
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("export")
 # collection name -> job_id of the export currently running for it
 _active: dict[str, str] = {}
 _lock = threading.Lock()
@@ -5086,18 +6424,23 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
     def progress(written: int) -> None:
         job["chunks_written"] = written
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the export finish can delete the collection at once (#40).
+        collection_writes.end_job("export", job_id)
+        job.update(fields)
+
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
-        job.update(status="failed", error=f"PackageError: {exc.message}",
-                   error_code=exc.code, error_detail=exc.detail)
+        finish(status="failed", error=f"PackageError: {exc.message}",
+               error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
         _log.exception("Export of %r failed", collection)
-        job["status"] = "failed"
-        job["error"] = f"{type(exc).__name__}: {exc}"
+        finish(status="failed", error=f"{type(exc).__name__}: {exc}")
     else:
-        job.update(
+        finish(
             status="completed",
             filename=result["filename"],
             size_bytes=result["size_bytes"],
@@ -5109,6 +6452,7 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
             warnings=result["warnings"],
         )
     finally:
+        collection_writes.end_job("export", job_id)
         with _lock:
             # Only clear the slot if it is still ours.
             if _active.get(collection) == job_id:
@@ -5144,10 +6488,14 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "error_code": None,
         "error_detail": None,
     }
+    # Lets DELETE /collections refuse while this export reads the collection (#40).
+    collection_writes.register_job(collection, "export", job_id)
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id
 ```
 
@@ -5199,14 +6547,15 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
-from services import batch_write, collection_recovery, collection_writes
+from services import batch_write, collection_recovery, collection_writes, jobstore
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
 ON_CONFLICT = ("abort", "rename", "replace")
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("import")
 _active: set[str] = set()
 _lock = threading.Lock()
 
@@ -5848,6 +7197,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the import finish can delete the collection at once (#40).
+        collection_writes.end_job("import", job_id)
+        job.update(fields)
+
     try:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
@@ -5885,6 +7240,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
             if exists and on_conflict == "rename":
                 target = _rename_target(original, id8)
+
+            # The target is final: DELETE /collections refuses it from here until
+            # this job ends (#40). Replace's own delete of the old target below
+            # goes through _delete_collection_sync, which the registry never refuses.
+            collection_writes.register_job(target, "import", job_id)
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -5926,13 +7286,13 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     _log.exception("Could not remove staging collection %r", temp_collection)
                 staged = False
 
-            job.update(status="completed", collection=target, original_collection=original,
-                       chunks_written=written, renamed=(target != canonical(original)),
-                       notes=notes)
+            finish(status="completed", collection=target, original_collection=original,
+                   chunks_written=written, renamed=(target != canonical(original)),
+                   notes=notes)
 
     except PackageError as exc:
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
         if staged and temp_collection:
             # The real build failed after the target was deleted. Keeping the
             # staging collection means the data is recoverable, not lost.
@@ -5942,8 +7302,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
-        job.update(status="failed", error_code="IMPORT_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="IMPORT_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
@@ -5964,6 +7324,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             except Exception:
                 _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
+        collection_writes.end_job("import", job_id)
         with _lock:
             _active.discard(filename)
 
@@ -6289,21 +7650,22 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
 from services import sources
 from services import weaviate_client as wc
 from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
-from services.ingest_pipeline import _parse_file
+from services.ingest_pipeline import _parse_file, source_type_of
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("tune")
 _active: set[str] = set()
 _lock = threading.Lock()
 
@@ -6372,11 +7734,6 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _emitted_name(digest: str, entry: dict) -> str:
-    """The source_file a rebuild writes for this retained digest's chunks."""
-    return Path((entry.get("filenames") or [digest])[0]).name
-
-
 def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     """Stored source files a rebuild from the retained originals would not reproduce."""
     by_filename: dict[str, list[str]] = {}
@@ -6391,8 +7748,9 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        digests = by_filename.get(filename, [])
-        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+        # A rebuild emits one chunk set per (digest, name) (#22), so a name is
+        # covered when exactly one digest lists it, whichever of its names it is.
+        if len(by_filename.get(filename, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -6440,14 +7798,14 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # Re-chunking rebuilds one chunk set per retained digest, under its first
-    # name. A stored name is covered only when exactly one digest lists it, it
-    # is that digest's first name, and its chunks form one set (no repeated
-    # chunk_index). A second name for the same content, a re-upload (whether
-    # its retention succeeded or failed) and a name with no retained original
-    # are refused before staging: replacing from the retained subset would
-    # lose chunks, and a successful cutover discards their recovery copy.
-    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    # Re-chunking rebuilds one chunk set per (digest, name) pair, as ingest
+    # stored it (#22), so a second name for the same content is rebuilt too. A
+    # stored name is covered only when exactly one digest lists it and its
+    # chunks form one set (no repeated chunk_index). A name with more than one
+    # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
+    # sets and a name with no retained original are refused before staging:
+    # replacing from the retained subset would lose chunks, and a successful
+    # cutover discards their recovery copy.
     uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
@@ -6461,6 +7819,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
+        slots = 0
         for digest, entry in sorted(documents.items()):
             blob = sources.blob_path(collection, digest)
             if not blob.is_file():
@@ -6469,32 +7828,38 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"Retained source {digest[:12]} is missing from disk, so "
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
-            # Parsers dispatch on the file extension, so the original filename
-            # has to be restored before parsing.
-            staged = work / _emitted_name(digest, entry)
-            shutil.copyfile(blob, staged)
+            for filename in entry["filenames"]:
+                # Parsers dispatch on the file extension, so the original name
+                # has to be restored before parsing; each pair is staged in a
+                # directory of its own, so a/report.txt and b/report.txt can't
+                # collide.
+                slots += 1
+                slot = work / str(slots)
+                slot.mkdir()
+                staged = slot / PurePosixPath(filename).name
+                shutil.copyfile(blob, staged)
 
-            text, elements = _parse_file(staged)
-            chunks = do_chunk(
-                text=text,
-                strategy=strategy,
-                chunk_size=chunk_size,
-                chunk_overlap_size=chunk_overlap,
-                similarity_threshold=similarity_threshold,
-                min_chunk_size=min_chunk_size,
-                elements=elements if strategy == "context_aware" else None,
-            )
-            source_type = staged.suffix.lower().lstrip(".")
-            out.extend({
-                "content": c,
-                "source_file": staged.name,
-                "source_type": source_type,
-                "chunk_index": i,
-                "chunk_strategy": strategy,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "created_at": now,
-            } for i, c in enumerate(chunks))
+                text, elements = _parse_file(staged)
+                chunks = do_chunk(
+                    text=text,
+                    strategy=strategy,
+                    chunk_size=chunk_size,
+                    chunk_overlap_size=chunk_overlap,
+                    similarity_threshold=similarity_threshold,
+                    min_chunk_size=min_chunk_size,
+                    elements=elements if strategy == "context_aware" else None,
+                )
+                source_type = source_type_of(staged)
+                out.extend({
+                    "content": c,
+                    "source_file": filename,
+                    "source_type": source_type,
+                    "chunk_index": i,
+                    "chunk_strategy": strategy,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
+                    "created_at": now,
+                } for i, c in enumerate(chunks))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -6615,6 +7980,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the job finish can delete the collection at once (#40).
+        collection_writes.end_job("tune", job_id)
+        job.update(fields)
+
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -6679,16 +8050,17 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
             notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
                          "gold-standard sessions were left alone")
 
-        job.update(status="completed", chunks_written=written, notes=notes)
+        finish(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Tuning %r on %r failed", operation, collection)
-        job.update(status="failed", error_code="TUNE_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="TUNE_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
     finally:
+        collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
 
@@ -6714,7 +8086,11 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
+    collection_writes.register_job(collection, "tune", job_id)
+    task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
     return job_id
 ```
 
@@ -6912,7 +8288,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
-from services.collection_writes import aliases
+from services.collection_writes import CollectionInUseError, aliases
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -6985,13 +8361,39 @@ async def create_collection(body: CreateCollectionRequest):
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
 
+# How a refused delete names the job in the way (#40). The UI shows the message
+# as it is, so each one reads as a sentence on its own.
+_BUSY_PHRASES = {
+    "ingest": "An ingest job is running for this collection",
+    "export": "An export job is running for this collection",
+    "import": "An import job is running for this collection",
+    "tune": "A tuning job is running for this collection",
+    "goldstandard": "A gold-standard generation job is running for this collection",
+}
+
+
+def _busy_error(name: str, jobs: list[tuple[str, str]]):
+    kind, job_id = jobs[0]
+    phrase = _BUSY_PHRASES.get(kind, f"A {kind} job is running for this collection")
+    return api_error(
+        409, "COLLECTION_BUSY",
+        f"{phrase} ('{name}', job {job_id}). Delete the collection after the job finishes.",
+        detail={"collection": name, "job_kind": kind, "job_id": job_id,
+                "jobs": [{"job_kind": k, "job_id": j} for k, j in jobs]})
+
+
 @router.delete("/{name}", status_code=200)
 async def delete_collection(name: str):
     if not await wc.collection_exists(name):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
     try:
-        count = await wc.delete_collection(name)
+        # Refused, not queued, while a job is active: waiting deleted the job's
+        # data after it finished, and a delete that ran first let a queued
+        # ingest recreate the collection (#40).
+        count = await wc.delete_collection_when_idle(name)
+    except CollectionInUseError as exc:
+        return _busy_error(name, exc.jobs)
     except Exception as exc:
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.", str(exc))
 
@@ -7010,6 +8412,7 @@ async def delete_collection(name: str):
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from fastapi import APIRouter, Form, UploadFile, File
@@ -7023,6 +8426,7 @@ from services import weaviate_client as wc
 from utils import api_error
 
 router = APIRouter(prefix="/ingest")
+_log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
     collection: str
@@ -7040,6 +8444,22 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    try:
+        return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
+                                    similarity_threshold, min_chunk_size, files)
+    except Exception:
+        # Anything not handled below used to reach the client as a plain-text
+        # 500, which the Import page could only show as "HTTP 500" (#290).
+        # %r: a filename can hold a newline that would forge a log line (#298).
+        _log.exception("Upload to collection %r failed unexpectedly (files: %r)",
+                       collection, [f.filename for f in files])
+        return api_error(500, "INGEST_FAILED",
+                         "The upload failed because of an unexpected server error. "
+                         "The API log has the details.")
+
+
+async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
+                         similarity_threshold, min_chunk_size, files):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -7060,6 +8480,8 @@ async def ingest_upload(
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
         )
+    except ingest_pipeline.UploadRejected as exc:
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
 
@@ -8157,7 +9579,6 @@ async def lifespan(app: FastAPI):
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of staging collections failed")
         try:
-            import asyncio
             from services import importer
             partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
             if partial:
@@ -8170,6 +9591,22 @@ async def lifespan(app: FastAPI):
                             len(stale_dirs), ", ".join(stale_dirs))
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted imports failed")
+        # Job records survive a restart (#23). After the sweeps, so a job interrupted
+        # mid-import is reported failed and its half-built collection already swept.
+        # No worker from the previous process is alive, so any job still queued or
+        # running is marked interrupted before the first request is served.
+        from services import exporter, importer, ingest_pipeline, tuning
+        interrupted = []
+        for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
+                             ("import", importer), ("tune", tuning)):
+            try:
+                marked = await asyncio.to_thread(module._jobs.load)
+                interrupted += [f"{kind} {job_id}" for job_id in marked]
+            except Exception:                             # noqa: BLE001
+                log.exception("Could not load the %s job records", kind)
+        if interrupted:
+            log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
+                        "says so; start them again.", len(interrupted), ", ".join(interrupted))
         yield
     finally:
         try:
@@ -8770,8 +10207,11 @@ export interface CreateCollectionBody {
 }
 export interface JobStatus {
   job_id: string; status: string; files_total: number; files_completed: number; files_failed: number; chunks_stored: number; errors: string[]
-  // Files that could not be parsed at all — never counted in files_total.
+  // Files that could not be parsed at all, or that a later file with the same
+  // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Earlier chunks of the same names this job removed (#22).
+  chunks_replaced?: number
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean
@@ -8982,6 +10422,13 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {(job.chunks_replaced ?? 0) > 0 && (
+        // Re-ingesting a name replaces its chunks (#22), so the total can stay
+        // the same while the content changed.
+        <p className="mt-2 text-xs text-gray-600">
+          Replaced {job.chunks_replaced} chunk{job.chunks_replaced === 1 ? '' : 's'} from a previous version
+        </p>
+      )}
       {job.errors.length > 0 && (
         <ul className="mt-2 text-xs text-red-600 space-y-1">
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
@@ -8989,10 +10436,11 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
-        // count simply reads lower than what the user uploaded.
+        // count simply reads lower than what the user uploaded. Each entry
+        // says why: an unsupported type, or a later file with the same name.
         <div className="mt-2 text-xs text-amber-700">
           <p className="font-medium">
-            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped — not a supported type:
+            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped:
           </p>
           <ul className="space-y-1 mt-1">
             {job.skipped!.map((f, i) => <li key={i}>{f}</li>)}
@@ -9272,6 +10720,9 @@ export default function ImportPage() {
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
   const [error, setError] = useState('')
+  // A failed status poll, shown instead of ignored (#290). Polling carries on,
+  // and the next successful poll clears it.
+  const [pollError, setPollError] = useState('')
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
@@ -9292,8 +10743,11 @@ export default function ImportPage() {
       try {
         const j = await api.getJobStatus(jobId)
         setJob(j)
+        setPollError('')
         if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
-      } catch { /* ignore */ }
+      } catch (e: unknown) {
+        setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }, 3000)
     return () => clearInterval(interval)
   }, [jobId])
@@ -9325,6 +10779,7 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    setPollError('')
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -9362,8 +10817,8 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
-        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
+        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
 
@@ -9424,6 +10879,7 @@ export default function ImportPage() {
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
       {job && <ProgressPanel job={job} />}
+      {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
@@ -10074,6 +11530,9 @@ export default function CollectionsPage() {
   const [ef, setEf] = useState(64)
   const [deleteTarget, setDeleteTarget] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState('')
+  // Shown inside the delete dialog: the page-level error sits behind its
+  // overlay, so a refused delete (409 while a job runs, #40) looked like nothing.
+  const [deleteError, setDeleteError] = useState('')
 
   async function load() {
     api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
@@ -10098,10 +11557,17 @@ export default function CollectionsPage() {
       await api.deleteCollection(deleteTarget)
       setDeleteTarget('')
       setDeleteConfirm('')
+      setDeleteError('')
       load()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setDeleteError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function closeDelete() {
+    setDeleteTarget('')
+    setDeleteConfirm('')
+    setDeleteError('')
   }
 
   return (
@@ -10131,7 +11597,7 @@ export default function CollectionsPage() {
               <td className="py-2">{c.distance_metric}</td>
               <td className="py-2 text-gray-500">{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
               <td className="py-2">
-                <button onClick={() => setDeleteTarget(c.name)} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
               </td>
             </tr>
           ))}
@@ -10190,8 +11656,9 @@ export default function CollectionsPage() {
             <h2 className="font-semibold text-red-600 mb-3">Delete Collection</h2>
             <p className="text-sm text-gray-600 mb-3">Type <strong>{deleteTarget}</strong> to confirm deletion of all objects.</p>
             <input value={deleteConfirm} onChange={e => setDeleteConfirm(e.target.value)} placeholder={deleteTarget} className="border rounded px-3 py-2 text-sm w-full mb-4" />
+            {deleteError && <p role="alert" className="text-red-600 text-sm mb-4">{deleteError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setDeleteTarget(''); setDeleteConfirm('') }} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={closeDelete} className="text-sm text-gray-500">Cancel</button>
               <button onClick={deleteCollection} disabled={deleteConfirm !== deleteTarget} className="bg-red-600 text-white px-4 py-2 rounded text-sm disabled:opacity-40 hover:bg-red-700">Delete</button>
             </div>
           </div>
@@ -10808,7 +12275,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -10882,6 +12349,118 @@ fail the export early with an actionable error and publish nothing. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
+
+`scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
+refused as a whole with readable 400s naming their unreadable members (truncated archive,
+wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
+compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
+logged traceback, which inputs are queued (JSON Lines direct and as members, #291; a direct
+`.json.gz` and other gzip types skipped), and that gzipped JSON members are decompressed
+within their limit with clear per-file errors. Since #298 it also checks a ZIP with damaged and
+unsupported members together (`ARCHIVE_UNREADABLE`, generic remedy), `UPLOAD_WRITE_FAILED` when
+saving the upload itself fails, names with a newline logged escaped in every ingest log line that
+carries one, the retained `media_type` of gzipped files (`application/gzip`), and rechunk of a
+retained `.json.gz`. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+in the verify project's API container, then checks a truncated ZIP and a ZIP of
+`.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
+(suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
+failing status poll, and that a new ingest and the next successful poll clear that error.
+
+`scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
+upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
+to the container; the test sets it when absent): declared sizes over the cap refused before
+any member is read, a total at the cap accepted and one byte over refused, one total for every
+ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
+counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
+member read and gzip counting stopped within one block once the cap is passed, gzip headers
+that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
+counted, the count equal to what the job's gzip reader produces, the exact message and
+`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
+serves other work. `02_ingest.sh` runs it in the API container, then, at the
+default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
+gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
+`ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
+are answered within a second (a smoke check; the controlled test is the one that tells
+off-loop from on-loop work).
+
+`scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
+`key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
+non-ASCII text and numbers as written, one element per top-level record, empty values and
+files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
+converted text bounded by the chunker's per-file limit (a long key over many values fails
+fast with bounded memory), and readable errors for invalid JSON in `.json` files and
+`.json.gz` members. `02_ingest.sh` runs it in the API
+container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
+back to confirm they hold that text.
+
+`scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
+becomes one `key: value` record per line, separated by blank lines, with one element per
+record: object, array and scalar lines, lines with no text dropped, CRLF, a byte-order mark,
+no final newline, trailing blank lines accepted and U+2028 kept inside its line. Every line
+error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
+non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
+text limit are checked at and one past their edges, and a file far over the limit stops
+being read at the line that passes it, with a small traced peak. Gzip: the same text as plain,
+the `was decompressed, but` prefix, corrupt, truncated and over-size data. It also checks
+`source_type` `jsonl`, a job that stores nothing for a bad file beside a good one, and
+rechunk of a retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a
+direct `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back,
+and checks that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing.
+`browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
+`.jsonl` and `.jsonl.gz` and that its hint names JSONL.
+
+`scripts/tests/test_delete_busy.py` (#40) checks that `DELETE /collections/{name}` answers
+`409 COLLECTION_BUSY`, naming the job, while an ingest, export, import, tune or gold-standard
+generation job is active, and that each kind's registration ends before its status turns
+terminal. The request orderings are arranged with events: a job registered before the
+delete, one registered while the delete waits for the writer guard (refused within a
+second, not after the job), one registered once it holds the guard, and a job admitted
+after a completed delete, which fails with "collection '<name>' was deleted while this job
+was running" at its first store. Weaviate is mocked. `02_ingest.sh` runs it in the API
+container, then deletes a collection while a real ingest is still embedding (`409`, data
+in place), again after the job completes (`200`, still gone 10 s later), and checks that an
+insert into a deleted collection fails without recreating it (auto-schema is off).
+
+`scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
+and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
+that writes nothing; status changes and terminal records are written at once, owner-only;
+10,000 progress updates cause a handful of writes and the last one still reaches the disk; a
+failed write raises nothing and keeps the previous file; ids can't name another path; startup
+marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
+`failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
+a real lifespan run marks a stored running export. `02_ingest.sh` runs it in the API
+container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while an upload is part-way and checks that a
+completed job reads back unchanged and the interrupted one reads `partial` with the
+interruption message; `05_transfer.sh` does the same for a completed export and one
+interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
+
+`scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
+same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
+repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
+keep the last and list each earlier one in `skipped`; members in different folders stay
+separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
+job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
+the replaced files, before any insert, and deletes earlier chunks only after the insert; a
+marking failure fails only that file and changes nothing; a failed insert keeps the earlier
+version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
+reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+retention releasing the name (also when the blob write fails, keeping shared digests), and
+rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mocked.
+`02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
+(one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
+with one filename. With a real gold-standard session planted for the collection, it checks
+that ingesting a new name leaves the session current and a replacing re-ingest marks it
+stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
+version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
+chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
+0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+`05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
+and checks that only the new text comes back, under both names.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -10970,17 +12549,24 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
+| `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
+| `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
+| `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
+| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -11004,7 +12590,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -12306,6 +13892,7 @@ pulled from a document library.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import pathlib
 import random
@@ -12440,6 +14027,60 @@ def write(target: pathlib.Path) -> None:
         for name in ("policies.txt", "policies.md", "policies.pdf",
                      "notes.xyz", "notes.rtf"):
             z.write(target / name, arcname=name)
+
+    # Issue #290. A ZIP cut before its central directory, like an incomplete
+    # download: it once ended the upload in a bare HTTP 500.
+    with zipfile.ZipFile(target / "truncated.zip", "w", zipfile.ZIP_STORED) as z:
+        z.write(target / "policies.txt", arcname="policies.txt")
+    data = (target / "truncated.zip").read_bytes()
+    (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
+    # Gzipped JSON and JSON Lines members are decompressed and ingested (#290,
+    # #291); other gzip types are skipped as unsupported.
+    with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(target / "policies.json", arcname="policies.json")
+        z.writestr("bills/policies2.json.gz",
+                   gzip.compress((target / "policies.json").read_bytes(), mtime=0))
+        z.writestr("records.jsonl.gz", gzip.compress(b'{"a": 1}\n', mtime=0))
+        z.writestr("notes.txt.gz", gzip.compress(b"unsupported\n", mtime=0))
+
+    # Issue #295. Ordinary nested JSON with non-ASCII text, stored as readable
+    # `key: value` lines rather than pretty-printed JSON with escaped characters.
+    (target / "plain.json").write_text(json.dumps({
+        "title": "Remote work policy",
+        "body": "Remote work needs written manager approval.",
+        "meta": {"author": "Zoë Müller"},
+        "tags": ["policy", "remote"],
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Issue #291. JSON Lines: one record per line, converted like ordinary JSON,
+    # plain and gzipped; a line with no text adds nothing. bad.jsonl has a
+    # malformed second line, which fails the whole file.
+    records = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (
+        {"bill": "HR-1", "title": "Remote work act", "sponsor": {"name": "Zoë Müller"}},
+        {},
+        {"bill": "HR-2", "title": "Expense filing act", "tags": ["finance", "deadline"]},
+    ))
+    (target / "records.jsonl").write_text(records, encoding="utf-8")
+    (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
+    (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
+                                      encoding="utf-8")
+
+    # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
+    # files are about 2 MB. zip_over_declared.zip honestly declares a member of
+    # 2,049 MiB of zeros, refused before anything is read (about 3 s to write).
+    # zip_over_gzip.zip declares only its 2 MB gzip member, but that member,
+    # 33 concatenated gzip streams of 64 MiB of zeros, decompresses to
+    # 2,112 MiB: it is refused while its output is counted.
+    zeros = bytes(1024 * 1024)
+    member = zipfile.ZipInfo("zeros.bin", date_time=(2026, 1, 1, 0, 0, 0))
+    member.compress_type = zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(target / "zip_over_declared.zip", "w") as z:
+        with z.open(member, "w", force_zip64=True) as out:
+            for _ in range(2049):
+                out.write(zeros)
+    stream = gzip.compress(bytes(64 * 1024 * 1024), mtime=0)
+    with zipfile.ZipFile(target / "zip_over_gzip.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", stream * 33)
 
 
 if __name__ == "__main__":
@@ -12954,7 +14595,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/zip_over_gzip.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -13017,6 +14658,177 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── unreadable archives and gzipped JSON members (#290) ──────────────────────
+# Controlled cases: truncated archives, wrong member offsets, bad CRCs (also in
+# skipped members), unsupported compression, encryption and unwritable members;
+# which JSON Lines inputs are queued; gzip corruption, size bound and
+# unparseable JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_ingest_errors.py)
+check "upload unpacking errors and gzipped JSON regressions" $?
+
+# A truncated ZIP, like an incomplete download, once ended in a bare HTTP 500.
+code=$(curl -s -m 120 -o /tmp/vfy_trunc.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/truncated.zip")
+read -r err_code names_file <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_trunc.json'))['error']
+except Exception: print('not-json no'); raise SystemExit
+print(e['code'], 'yes' if \"'truncated.zip' is damaged and can't be read\" in e['message'] else 'no')")"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_UNREADABLE ] && [ "$names_file" = yes ]
+check "a truncated ZIP is refused with a readable 400 naming it" $? \
+  "HTTP=$code code=$err_code names-file=$names_file"
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 "$FIX/gz_batch.zip"
+read -r status completed gz_errors <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], len(d['errors']))")"
+[ "$status" = completed ] && [ "$completed" = 3 ] && [ "$gz_errors" = 0 ]
+check "a ZIP's .json, .json.gz and .jsonl.gz members all ingest" $? \
+  "status=$status completed=$completed errors=$gz_errors (want completed 3)"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if d.get('skipped', []) == [\"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\"] else 1)"
+check "only the other gzip member is skipped, as unsupported" $?
+
+# ── the expansion cap on an upload's ZIPs (#298) ────────────────────────────
+# Controlled cases with a 1 MiB cap set through the environment: declared
+# sizes, counted bytes, gzip output, several ZIPs in one upload, and ZIP work
+# running off the event loop.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_EXPANDED_BYTES=1048576 \
+  api python - < scripts/tests/test_zip_expansion.py)
+check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
+
+# The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
+too_large() {
+  local name="$1" code
+  code=$(curl -s -m 300 -o /tmp/vfy_cap.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+    -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/$name")
+  python3 - "$code" "$name" <<'ENDPY'
+import json, sys
+code, name = sys.argv[1], sys.argv[2]
+want = (f"'{name}' expands to more than 2,048 MB when unpacked, the most one upload's ZIPs "
+        f"can expand to, so nothing from it was imported. Split it into smaller zips and "
+        f"upload them in separate imports.")
+try:
+    e = json.load(open('/tmp/vfy_cap.json'))['error']
+except Exception:
+    print(code, 'not-json', 'no'); raise SystemExit
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': []}
+print(code, e['code'], 'yes' if ok else 'no')
+ENDPY
+}
+read -r code err_code text_ok <<<"$(too_large zip_over_declared.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP declaring more than 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+
+# While a gzip member's output is counted, other requests are still answered.
+# A smoke check: the count takes about a second, so the controlled test above
+# is the one that tells off-loop from on-loop work.
+too_large zip_over_gzip.zip > /tmp/vfy_cap_result.txt &
+upload_pid=$!
+probes=0; slow=0; worst=0
+while kill -0 "$upload_pid" 2>/dev/null; do
+  read -r pcode ptime <<<"$(curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}' "$API/ingest/job/vfy-none")"
+  probes=$((probes + 1))
+  if [ "$pcode" != 404 ] || python3 -c "import sys; sys.exit(0 if float('$ptime') >= 1.0 else 1)"; then
+    slow=$((slow + 1))
+  fi
+  worst=$(python3 -c "print(max(float('$worst'), float('$ptime')))")
+done
+wait "$upload_pid"
+read -r code err_code text_ok < /tmp/vfy_cap_result.txt
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+[ "$slow" = 0 ]
+check "job polls are answered while a ZIP is being counted" $? \
+  "$probes probes, $slow slow or failed, slowest ${worst}s"
+
+# ── ordinary JSON as readable text (#295) ────────────────────────────────────
+# Controlled cases: every conversion rule, file key order, non-ASCII text,
+# element-schema rehydration, empty files and invalid JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_json_ingest.py)
+check "ordinary JSON conversion regressions" $?
+
+# The stored chunks once held pretty-printed JSON with escaped non-ASCII text.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/plain.json"
+read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$chunks" -gt 0 ]
+check "an ordinary nested JSON file ingests" $? "status=$status chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    text = "\n".join(o.properties["content"] for o in collection.iterator())
+finally:
+    wc.close_client()
+wanted = ["title: Remote work policy", "meta.author: Zoë Müller", "tags: policy, remote"]
+missing = [w for w in wanted if w not in text]
+syntax = [c for c in ("{", '"', "\\u") if c in text]
+if missing or syntax:
+    print(f"missing={missing} json-syntax={syntax}", file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "its chunks hold key: value text with non-ASCII kept" $?
+
+# ── JSON Lines (#291) ────────────────────────────────────────────────────────
+# Controlled cases: conversion per line, blank and malformed lines, the line
+# and text limits, bounded reading, gzip errors, rechunk of a retained file.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jsonl_ingest.py)
+check "JSON Lines regressions" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/records.jsonl" "$FIX/records.jsonl.gz"
+read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$chunks" -ge 2 ]
+check "a direct .jsonl and a direct .jsonl.gz both ingest" $? \
+  "status=$status completed=$completed chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    objects = [o.properties for o in collection.iterator()]
+finally:
+    wc.close_client()
+wanted = ("bill: HR-1\ntitle: Remote work act\nsponsor.name: Zoë Müller\n\n"
+          "bill: HR-2\ntitle: Expense filing act\ntags: finance, deadline")
+problems = []
+for name in ("records.jsonl", "records.jsonl.gz"):
+    mine = sorted((o for o in objects if o["source_file"] == name), key=lambda o: o["chunk_index"])
+    text = "".join(o["content"] for o in mine)
+    if text != wanted:
+        problems.append(f"{name}: text {text!r}")
+    if {o["source_type"] for o in mine} != {"jsonl"}:
+        problems.append(f"{name}: source_type {sorted({o['source_type'] for o in mine})}")
+if problems:
+    print("; ".join(problems), file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "their chunks hold one key: value record per line, source_type jsonl" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/bad.jsonl"
+read -r status first_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], 'yes' if d['errors'] == ['bad.jsonl: line 2 is not valid JSON: Expecting value at column 10'] else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
+check "a malformed line fails the file with its line number and stores nothing" $? \
+  "status=$status error=$first_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
@@ -13092,6 +14904,187 @@ import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if any('broken.pdf' in e for e in d['errors']) else 1)"
 check "the failure names the offending file" $?
 
+# ── re-ingesting a name replaces its chunks (#22) ────────────────────────────
+# Re-ingesting used to add a second chunk set beside the first, so answers could
+# cite a superseded version; ZIP members were named by basename, so a/report.txt
+# and b/report.txt merged. Controlled cases: same-name inputs in one upload,
+# ZIP path normalisation, insert-before-delete, stale marking, retention and
+# rechunk coverage.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_reingest.py)
+check "re-ingest: same-name inputs, replacement order, retention and rechunk regressions" $?
+
+RI="${PREFIX}Reingest"
+RIFIX=$(mktemp -d)
+python3 - "$FIX/policies.txt" "$RIFIX" <<'ENDPY'
+import pathlib, sys, zipfile
+v1, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+(out / "v2").mkdir()
+(out / "v2" / "policies.txt").write_text(
+    "Parking Permits. Facilities issue parking permits each January, and a permit "
+    "is valid for one named vehicle only.\n\n"
+    "Visitor Badges. Reception prints a visitor badge on arrival, and badges are "
+    "returned at the end of the day.\n")
+with zipfile.ZipFile(out / "folders.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.txt", "Alpha report. The cafeteria opens at seven every weekday.")
+    z.writestr("b/report.txt", "Beta report. The library closes at nine on Fridays.")
+assert "Travel Booking" in v1.read_text()
+ENDPY
+# What the collection holds: (source_file, content) pairs, and the retained index.
+ri_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$RI") <<'ENDPY'
+import json, sys
+from services import sources, weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    chunks = sorted([o.properties["source_file"], o.properties["content"]] for o in coll.iterator())
+    d = sources.collection_dir(sys.argv[1])
+    blobs = sorted(p.name for p in d.iterdir() if p.name != "index.json") if d.is_dir() else []
+    print(json.dumps({"chunks": chunks, "index": sources.load_index(sys.argv[1])["documents"],
+                      "blobs": blobs}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$RI"; make_collection "$RI"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+n1=$(jfield "['chunks_stored']" < /tmp/vfy_job.json)
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_again.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" <<'ENDPY'
+import json, sys
+n1 = int(sys.argv[1]); job = json.load(open('/tmp/vfy_ri_again.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+print(job["status"], job.get("chunks_replaced"), len(st["chunks"]), n1)
+sys.exit(0 if n1 > 0 and job["status"] == "completed" and job.get("chunks_replaced") == n1
+         and len(st["chunks"]) == n1 else 1)
+ENDPY
+check "ingesting the same file twice keeps one chunk set and reports chunks_replaced" $? \
+  "$(cat /tmp/vfy_ri_again.json | head -c 300)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/v2/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_v2.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+n1 = int(sys.argv[1]); v2 = hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+job = json.load(open('/tmp/vfy_ri_v2.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for _, c in st["chunks"])
+checks = {
+    "completed": job["status"] == "completed",
+    "replaced all of v1": job.get("chunks_replaced") == n1,
+    "holds only v2's chunks": len(st["chunks"]) == job["chunks_stored"],
+    "v1 text gone": "Travel Booking" not in texts,
+    "v2 text present": "Parking Permits" in texts,
+    "one digest names it": [d for d, e in st["index"].items() if "policies.txt" in e["filenames"]] == [v2],
+    "v1 blob gone": st["blobs"] == [v2],
+}
+print({k: v for k, v in checks.items() if not v} or "ok")
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a modified file replaces its chunks and its retained original" $? "$(head -c 300 /tmp/vfy_ri_v2.json)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/folders.zip"
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+ok = ("Alpha report" in names.get("a/report.txt", "")
+      and "Beta report" in names.get("b/report.txt", "") and "report.txt" not in names)
+print(sorted(names))
+sys.exit(0 if ok else 1)
+ENDPY
+check "ZIP members with one basename in two folders stay two documents, named by path" $?
+
+# Two parts with one filename: the second's bytes are stored, the first reported.
+ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_dupe.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_dupe.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for n, c in st["chunks"] if n == "dupe.txt")
+ok = (job["files_total"] == 1 and job["skipped"] == [
+          "dupe.txt (replaced by dupe.txt later in this upload, same name 'dupe.txt')"]
+      and "Parking Permits" in texts and "Travel Booking" not in texts)
+print(job["files_total"], job["skipped"])
+sys.exit(0 if ok else 1)
+ENDPY
+check "the same name twice in one upload ingests the last and reports the first" $? \
+  "$(head -c 300 /tmp/vfy_ri_dupe.json)"
+
+# Gold-standard sessions are marked stale only when a re-ingest replaces earlier
+# chunks, never for a brand-new name (#22). A real session, not a mocked marker.
+RIGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RI" "$RIGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ri_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "policies.txt", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "re-ingest: a synthetic gold-standard session is planted for the collection" $?
+# The API reads sessions written by another process at its next scan.
+api_get "/goldstandard/diagnostics" >/dev/null
+printf 'Fresh document. The gym opens at six.\n' > "$RIFIX/fresh.txt"
+ingest "$RI" fixed 200 40 "$RIFIX/fresh.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' and j.get('chunks_replaced')==0 else 1)"
+check "ingesting a brand-new name leaves gold-standard sessions current" $? "$(head -c 300 /tmp/vfy_ri_gs.json)"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+r=d.get('stale_reason') or ''
+print(d.get('stale'), r, j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is True and 're-ingested' in r and 'policies.txt' in r
+         and j['status']=='completed' and j.get('chunks_replaced',0)>0 else 1)"
+check "a replacing re-ingest marks the collection's gold-standard sessions stale, naming the file" $? \
+  "$(head -c 300 /tmp/vfy_ri_gs.json)"
+
+# Two concurrent uploads of one name (#22): the job that runs last wins, each
+# job is applied whole, and arrival order is not promised, so either may win.
+for v in 1 2; do
+  src="$FIX/policies.txt"; [ "$v" = 2 ] && src="$RIFIX/v2/policies.txt"
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$src;filename=race.txt" > "/tmp/vfy_ri_race$v.json" &
+done
+wait
+for v in 1 2; do
+  rj=$(jfield "['job_id']" < "/tmp/vfy_ri_race$v.json")
+  [ -n "$rj" ] && wait_for_job "/ingest/job/$rj" 900 >/dev/null
+  api_get "/ingest/job/$rj" > "/tmp/vfy_ri_race$v.done.json"
+done
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$FIX/policies.txt" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+sha = [hashlib.sha256(open(p, "rb").read()).hexdigest() for p in sys.argv[1:3]]
+jobs = [json.load(open(f"/tmp/vfy_ri_race{v}.done.json")) for v in (1, 2)]
+st = json.load(open("/tmp/vfy_ri_state.json"))
+texts = [c for n, c in st["chunks"] if n == "race.txt"]
+joined = " ".join(texts)
+v1, v2 = "Travel Booking" in joined, "Parking Permits" in joined
+win = 0 if v1 else 1
+digests = [d for d, e in st["index"].items() if "race.txt" in e["filenames"]]
+checks = {
+    "both completed": all(j.get("status") == "completed" for j in jobs),
+    "exactly one version present": v1 != v2,
+    "winner's whole chunk set": len(texts) == jobs[win].get("chunks_stored"),
+    "winner replaced the loser's set": jobs[win].get("chunks_replaced") == jobs[1 - win].get("chunks_stored"),
+    "one digest, the winner's": digests == [sha[win]],
+}
+print({k: v for k, v in checks.items() if not v} or "ok", [j.get("status") for j in jobs])
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "two concurrent uploads of one name leave exactly one job's version, whole" $?
+drop_collection "$RI"
+rm -rf "$RIFIX"
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
@@ -13103,6 +15096,166 @@ job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_
 check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
+
+# ── deleting a collection while an ingest job runs (#40) ─────────────────────
+# A DELETE sent during a job used to wait for it and then remove what it stored,
+# and one that ran before a queued job let that job's inserts recreate the
+# collection (Weaviate auto-schema). Controlled cases: every job kind, both
+# request orderings, and the job's report when its collection disappears.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
+check "delete-while-busy: job kinds, request orderings and the job's report" $?
+
+DC="${PREFIX}DeleteBusy"
+drop_collection "$DC"; make_collection "$DC"
+object_count() {   # the collection's object count, or "absent"
+  api_get "/collections" | python3 -c "
+import json,sys
+found=[c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1']
+print(found[0] if found else 'absent')"
+}
+# About 180 chunks at chunk_size 300: some tens of seconds of embedding, so the
+# job is still running when the DELETE follows the upload.
+busy_dir=$(mktemp -d)
+python3 - "$busy_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(40)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+curl -s -m 600 -o /tmp/vfy_busy_start.json -X POST "$API/ingest/upload" -F "collection=$DC" \
+  -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$busy_dir/slow.txt"
+rm -rf "$busy_dir"
+busy_job=$(jfield "['job_id']" < /tmp/vfy_busy_start.json)
+before=$(object_count "$DC")
+code=$(curl -s -m 120 -o /tmp/vfy_busy_delete.json -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+state=$(api_get "/ingest/job/$busy_job" | jfield "['status']")
+after=$(object_count "$DC")
+read -r err_code err_kind err_job <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_busy_delete.json'))['error']
+except Exception: print('not-json - -'); raise SystemExit
+print(e['code'], e['detail']['job_kind'], e['detail']['job_id'])")"
+[ "$code" = 409 ] && [ "$err_code" = COLLECTION_BUSY ] && [ "$err_kind" = ingest ] \
+  && [ "$err_job" = "$busy_job" ] && { [ "$state" = queued ] || [ "$state" = running ]; }
+check "DELETE during a running ingest job is refused with 409 COLLECTION_BUSY naming it" $? \
+  "HTTP=$code code=$err_code kind=$err_kind job=$err_job (job $busy_job was $state)"
+[ "$after" != absent ] && [ "$before" != absent ] && [ "$after" -ge "$before" ]
+check "the refused DELETE leaves the collection and its objects in place" $? \
+  "objects before=$before after=$after"
+final=$(wait_for_job "/ingest/job/$busy_job" 900)
+check_eq "the ingest job still completes" "$final" "completed"
+code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+check_eq "DELETE after the job completes succeeds" "$code" "200"
+sleep 10
+check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC")" "absent"
+
+# ── job records survive an API restart (#23) ─────────────────────────────────
+# Controlled cases: unbound stores, throttled and immediate writes, failed
+# writes, startup marking of interrupted jobs, corrupt files and retention.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
+check "job store: persistence, throttling, startup marking and retention" $?
+
+# With auto-schema off, an insert into a deleted collection fails and creates
+# nothing, instead of recreating it with inferred properties and no vectorizer.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "${PREFIX}NoAutoSchema" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+try:
+    client = wc.get_client()
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    wc._create_collection_sync(name, "hnsw", "cosine", {})
+    wc._delete_collection_sync(name)
+    try:
+        wc._insert_chunks_sync(name, [{"content": "must not recreate", "source_file": "x.txt",
+                                       "chunk_index": 0}])
+    except Exception:
+        pass
+    else:
+        print("the insert into a deleted collection succeeded", file=sys.stderr)
+        sys.exit(1)
+    if client.collections.exists(name):
+        client.collections.delete(name)
+        print("the insert recreated the deleted collection", file=sys.stderr)
+        sys.exit(1)
+finally:
+    wc.close_client()
+ENDPY
+) >/tmp/vfy_autoschema.txt 2>&1
+check "an insert into a deleted collection fails and does not recreate it" $? \
+  "$(tail -1 /tmp/vfy_autoschema.txt)"
+
+# ── job status survives an API restart (#23; opt-in: restarts the API) ───────
+# Before #23 every job answered 404 after a restart. A job that finished must
+# read back unchanged, and one interrupted after storing a file must read
+# `partial` with the interruption message. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the job during shutdown.
+JR="${PREFIX}JobRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "ingest job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "ingest job status across an API restart" 1 "$restart_refusal"
+else
+  drop_collection "$JR"; make_collection "$JR"
+  ingest "$JR" fixed 300 50 "$FIX/policies.txt"
+  done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
+  api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
+  # policies.txt stores in seconds; the slow file then embeds for tens of seconds.
+  slow_dir=$(mktemp -d)
+  python3 - "$slow_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(23)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+  curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
+    -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
+    -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
+  rm -rf "$slow_dir"
+  slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/ingest/job/$slow_job" > /tmp/vfy_restart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_restart_before.json'))
+print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/null)
+    case "$state" in running-stored|completed*|partial*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-stored ]; then
+    check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_restart_done.json')) == json.load(open('/tmp/vfy_restart_done_after.json')) else 1)"
+    check "a completed ingest job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_after.json -w '%{http_code}' "$API/ingest/job/$slow_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+before = json.load(open('/tmp/vfy_restart_before.json'))
+after = json.load(open('/tmp/vfy_restart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "partial"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == before["files_completed"])
+print(sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
+      "$(head -c 300 /tmp/vfy_restart_after.json)"
+  fi
+  drop_collection "$JR"
+fi
 
 drop_collection "$C"
 cleanup_prefixed
@@ -13835,7 +15988,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E30)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E32)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -14603,6 +16756,51 @@ after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
 [ "$after_chunks" -gt "$chunks_before" ]
 check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
 
+# ── re-chunking after a replacement (#22, E17, E32) ──────────────────────────
+# Re-ingesting replaces a name's chunks and retained original, so a rebuild
+# brings back only the new version; a second name for the same content is
+# rebuilt under both names (one chunk set per digest and name).
+RC="${PREFIX}Rechunk"
+RCFIX=$(mktemp -d)
+printf '%s\n\n%s\n' \
+  "Parking Permits. Facilities issue parking permits each January, and a permit is valid for one named vehicle only." \
+  "Visitor Badges. Reception prints a visitor badge on arrival, and badges are returned at the end of the day." \
+  > "$RCFIX/policies.txt"
+cp "$RCFIX/policies.txt" "$RCFIX/copy.txt"
+drop_collection "$RC"; make_collection "$RC"
+for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RC" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$f" > /tmp/vfy_rc.json
+  rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
+  wait_for_job "/ingest/job/$rjob" 900 >/dev/null
+done
+check_eq "E32: re-chunking is offered after a replacement and a second name" \
+  "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
+api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "E32: the re-chunk completes" "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") > /tmp/vfy_rc_chunks.json <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps([[o.properties["source_file"], o.properties["content"]] for o in coll.iterator()]))
+finally:
+    wc.close_client()
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+chunks = json.load(open('/tmp/vfy_rc_chunks.json'))
+texts = " ".join(c for _, c in chunks)
+names = {n for n, _ in chunks}
+print(sorted(names), "Travel Booking" in texts)
+sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in texts
+         and "Parking Permits" in texts else 1)
+ENDPY
+check "E32: the rebuild holds only the new version, under both of its names" $?
+drop_collection "$RC"
+rm -rf "$RCFIX"
+
 # ── chunks-only refuses re-chunking ──────────────────────────────────────────
 SRCLESS="${PREFIX}Chunksonly"
 drop_collection "$SRCLESS"; make_collection "$SRCLESS"
@@ -14657,6 +16855,93 @@ import json,re,sys
 m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
+
+# ── export job status survives an API restart (#23; opt-in: restarts the API) ──
+# The export from the top of this suite must read back unchanged, and an export
+# killed part-way must read `failed` with INTERRUPTED, not 404. A synthetic
+# 30,000-chunk collection (supplied vectors, no embedding) exports for about
+# 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the export during shutdown.
+XR="${PREFIX}ExportRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "export job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "export job status across an API restart" 1 "$restart_refusal"
+else
+  api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done.json
+  drop_collection "$XR"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$XR" 30000 <<'ENDPY'
+import random, sys
+from datetime import datetime, timezone
+from services import batch_write
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    wc._create_collection_sync(name, "hnsw", "cosine",
+                               {"efConstruction": 128, "maxConnections": 64, "ef": 64})
+    collection = wc.get_client().collections.get(name)
+    rng, now = random.Random(23), datetime.now(timezone.utc).isoformat()
+    for base in range(0, count, 2000):
+        records = [{"properties": {"content": f"Synthetic chunk {i}. " + "lorem ipsum dolor " * 30,
+                                   "source_file": f"synthetic_{i // 100}.txt", "source_type": "txt",
+                                   "chunk_index": i % 100, "chunk_strategy": "fixed",
+                                   "chunk_size": 1000, "chunk_overlap": 0, "created_at": now},
+                    "vector": [rng.uniform(-1, 1) for _ in range(768)]}
+                   for i in range(base, min(count, base + 2000))]
+        batch_write.insert(collection, lambda r=records: iter(r), exact=False, cleanup_owned=True)
+finally:
+    wc.close_client()
+ENDPY
+  ) >/tmp/vfy_xrestart_prepare.log 2>&1
+  check "a 30,000-chunk collection is built for the interrupted export" $? \
+    "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/export/job/$xjob" > /tmp/vfy_xrestart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_xrestart_before.json'))
+print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/null)
+    case "$state" in running-writing|completed*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-writing ]; then
+    check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_xrestart_done.json')) == json.load(open('/tmp/vfy_xrestart_done_after.json')) else 1)"
+    check "a completed export job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_xrestart_after.json -w '%{http_code}' "$API/export/job/$xjob")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_xrestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the export again.")
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED" $? \
+      "$(head -c 300 /tmp/vfy_xrestart_after.json)"
+    # The killed build's leftovers are the container's (root, mode 0700): remove
+    # only the build directories that appeared during this export.
+    builds_after=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
+    stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
+    (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+  fi
+  drop_collection "$XR"
+fi
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
@@ -15910,6 +18195,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await sleep(900);
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
+
+      // A refused delete (409 while a job runs, #40) is shown in the dialog. The
+      // page-level error line sits behind the overlay, where it read as nothing.
+      // The DELETE is answered here, so no collection is touched.
+      const busyMessage = "An ingest job is running for this collection ('Owned', job 0wned40). Delete the collection after the job finishes.";
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (request.method() === 'DELETE' && new URL(request.url()).pathname.startsWith('/api/collections/')) {
+          return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_BUSY', message: busyMessage, detail: { job_kind: 'ingest', job_id: '0wned40' } } }) });
+        }
+        return request.continue();
+      });
+      const target = await s.page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find(i => !i.type || i.type === 'text');
+        const name = el.placeholder;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, name);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return name;
+      });
+      await sleep(200);
+      const deletes = s.api.filter(x => x.method === 'DELETE').length;
+      await s.page.evaluate(() => {
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        if (btn && !btn.disabled) btn.click();
+      });
+      await sleep(900);
+      const refused = await s.page.evaluate(() => {
+        const dialog = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Delete Collection');
+        const box = dialog && dialog.parentElement;
+        const alert = box && box.querySelector('[role=alert]');
+        return { open: !!dialog, alert: alert ? alert.textContent : null };
+      });
+      r.check('a refused delete sends one DELETE', s.api.filter(x => x.method === 'DELETE').length === deletes + 1);
+      r.check('a refused delete keeps the dialog open and shows the message in it',
+              refused.open && refused.alert === busyMessage, JSON.stringify(refused));
+      const listed = await s.page.evaluate(t => [...document.querySelectorAll('tbody td')].some(td => td.textContent.trim() === t), target);
+      r.check('the refused collection is still listed', listed, target);
+      await clickByText(s.page, 'Cancel'); await sleep(200);
+      await s.page.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Delete');
+        if (b) b.click();
+      });
+      await sleep(300);
+      r.check('cancelling clears the message for the next attempt',
+              await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
   }
@@ -15943,6 +18274,186 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     fs.unlinkSync(big);
     await s.ctx.close();
+  }
+
+  // ── import file types (#291) ───────────────────────────────────────────────
+  // The picker offers JSON Lines, plain and gzipped, and the hint names it.
+  r.section('import file types');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const accept = await s.page.evaluate(() => {
+        const input = document.querySelector('#file-input');
+        return input ? input.getAttribute('accept') : null;
+      });
+      r.check('the file picker accepts .jsonl and .jsonl.gz',
+              accept === '.pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip', String(accept));
+      const hint = await bodyText(s.page);
+      r.check('the drop zone hint names JSONL among the types',
+              hint.includes('PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to 512 MB per upload'),
+              hint.slice(0, 200));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
+  // ── import errors (#290) ───────────────────────────────────────────────────
+  // A truncated ZIP once ended in a plain-text 500 that the page could only
+  // show as "HTTP 500", and a failing status poll was ignored.
+  r.section('import error messages');
+  {
+    const fs = require('fs');
+    const truncated = '/tmp/vfy-truncated.zip';
+    // A local file header and nothing after it: no central directory.
+    fs.writeFileSync(truncated, Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), Buffer.alloc(64, 0x61)]));
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(truncated);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(2500);
+      const text = await bodyText(s.page);
+      r.check("a truncated ZIP shows the API's message, not HTTP 500",
+              clicked && text.includes("is damaged and can't be read") && !text.includes('HTTP 500'),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(truncated);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfypoll1', status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/vfypoll1')
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      r.check('a failing status poll is shown, not ignored',
+              clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+      r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  // A poll error is cleared by a new ingest and by the next successful poll
+  // (#298). Job A's polls always fail; job B's first poll fails, then it
+  // completes. Polls run every 3 s.
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll-clear.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    const failure = JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } });
+    let uploads = 0, pollsB = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST') {
+        uploads += 1;
+        const job = uploads === 1 ? 'vfyclrA' : 'vfyclrB';
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: job, status: 'queued', files_queued: 1, collection: 'x' }) });
+      }
+      if (path === '/api/ingest/job/vfyclrA')
+        return request.respond({ status: 500, contentType: 'application/json', body: failure });
+      if (path === '/api/ingest/job/vfyclrB') {
+        pollsB += 1;
+        if (pollsB === 1) return request.respond({ status: 500, contentType: 'application/json', body: failure });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfyclrB', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, chunks_replaced: 0, errors: [], skipped: [] }) });
+      }
+      return request.continue();
+    });
+    const shown = text => text.includes("Could not check the import's progress: Synthetic status failure.");
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const first = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);                       // job A's first poll has failed
+      const before = shown(await bodyText(s.page));
+      const second = await clickByText(s.page, 'Start Ingest');
+      await sleep(1000);                       // job B accepted, not yet polled
+      const afterNew = await bodyText(s.page);
+      r.check('a new ingest clears a poll error',
+              first && second && before && uploads === 2 && !shown(afterNew),
+              `clicked=${first},${second} shown-before=${before} uploads=${uploads} after: ${afterNew.slice(0, 160)}`);
+      await sleep(2700);                       // job B's first poll has failed
+      const failedAgain = shown(await bodyText(s.page));
+      await sleep(3000);                       // job B's second poll has succeeded
+      const afterPoll = await bodyText(s.page);
+      r.check('the next successful poll clears a poll error',
+              failedAgain && pollsB >= 2 && !shown(afterPoll),
+              `shown-after-B's-first-poll=${failedAgain} B-polls=${pollsB} after: ${afterPoll.slice(0, 160)}`);
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
+  // ── re-ingest progress (#22) ───────────────────────────────────────────────
+  // The progress panel reports replaced chunks, and the skipped heading no
+  // longer claims every skip is an unsupported type: a later file with the
+  // same name in one upload is skipped too. Job responses are stubbed.
+  r.section('re-ingest progress');
+  for (const [replaced, label] of [[3, 'Replaced 3 chunks from a previous version'], [1, 'Replaced 1 chunk from a previous version'], [0, null]]) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-reingest.txt';
+    fs.writeFileSync(small, 'Re-ingest fixture.\n');
+    const jobId = 'vfyrein' + replaced;
+    const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (label) {
+        r.check(`chunks_replaced=${replaced} is shown as "${label}"`, clicked && text.includes(label),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check('chunks_replaced=0 shows no replacement line', clicked && text.includes('Chunks stored: 2') && !text.includes('Replaced '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+        r.check('the skipped heading is a plain "1 file skipped:" with the entry\'s own reason',
+                text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
+                text.slice(0, 300));
+      }
+      r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
   }
 
   // ── health dashboard ───────────────────────────────────────────────────────
@@ -18008,7 +20519,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();return 'Owned later upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
             reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
             def start_ingest():
@@ -18027,7 +20538,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
             upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
             self.assertTrue(parsed.wait(2))
@@ -18529,6 +21040,73 @@ def serialized(argument):
                 return function(*args, **kwargs)
         return run
     return decorate
+
+
+# ── Jobs active for a collection (issue #40) ──────────────────────────────────
+# The guard above only serializes writers: a user's DELETE sent during an ingest
+# waited for the whole job and then removed what it stored, and one that won the
+# guard before a queued job let that job's inserts recreate the collection. Every
+# long job (ingest, export, import, tune, gold-standard generation) registers
+# here, under one lock and the canonical name, from admission until just before
+# its status turns terminal, so the delete route can refuse instead of waiting.
+
+_jobs_lock = threading.Lock()
+_active_jobs = {}
+
+
+def register_job(collection, kind, job_id):
+    with _jobs_lock:
+        _active_jobs.setdefault(canonical(collection), []).append((kind, job_id))
+
+
+def end_job(kind, job_id):
+    """End a registration; safe to repeat, and to call for one never made."""
+    with _jobs_lock:
+        for collection, entries in list(_active_jobs.items()):
+            if (kind, job_id) in entries:
+                entries.remove((kind, job_id))
+                if not entries:
+                    del _active_jobs[collection]
+                return
+
+
+def active_jobs(collection):
+    """The jobs registered for a collection, oldest first."""
+    with _jobs_lock:
+        return list(_active_jobs.get(canonical(collection), ()))
+
+
+class CollectionInUseError(RuntimeError):
+    """A delete was refused because jobs are registered for the collection."""
+
+    def __init__(self, collection, jobs):
+        super().__init__(collection)
+        self.collection = collection
+        self.jobs = jobs
+
+
+def delete_when_idle(collection, delete, poll=0.25):
+    """Run delete(collection) under its guard unless a job is registered.
+
+    The guard is awaited only while no job is registered, rechecked every `poll`
+    seconds, so a job admitted while the delete waits still refuses it promptly.
+    A job admitted after the last check is not refused: its worker waits for this
+    guard and then meets a deleted collection, which cannot be recreated
+    (AUTOSCHEMA_ENABLED is off) and which ingest reports as deleted.
+    """
+    def refuse_if_busy():
+        jobs = active_jobs(collection)
+        if jobs:
+            raise CollectionInUseError(collection, jobs)
+
+    refuse_if_busy()
+    while True:
+        try:
+            with guard(collection, timeout=poll):
+                refuse_if_busy()
+                return delete(collection)
+        except CollectionBusyError:
+            refuse_if_busy()
 ```
 
 ### scripts/tests/test_collection_writes.py
@@ -18761,7 +21339,7 @@ class DeletedRecoveryTests(unittest.TestCase):
                 registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
                 with self.subTest(caller=caller, fails=fails), \
                      patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
-                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route.wc, 'delete_collection_when_idle', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
                      patch.object(route, '_registry_lock', asyncio.Lock()), \
                      patch.object(route, '_load_registry', return_value=registry), \
                      patch.object(route, '_save_registry') as save:
@@ -19471,6 +22049,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
              patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
              patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.wc, "_source_has_chunks_sync", return_value=False), \
              patch.object(ingest_pipeline.sources, "store", side_effect=ValueError("Invalid retained source index")):
             ingest_pipeline._process_job_sync(job_id, [upload], self.root,
                                               "Invalid", "fixed", 150, 0, 0.85, 0)
@@ -21459,8 +24038,14 @@ class TelemetryTests(unittest.TestCase):
             gold=SimpleNamespace(load_sessions_from_disk=Mock(side_effect=RuntimeError('startup') if fail else lambda:order.append('load')),
                                  reconcile_interrupted_generations=Mock())
             wc=SimpleNamespace(sweep_staging=AsyncMock(return_value=[]),close_client=lambda:order.append('close'))
-            importer=SimpleNamespace(sweep_interrupted_imports=lambda:[],sweep_stale_workdirs=lambda:[])
-            service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),weaviate_client=wc,importer=importer)
+            def job_module(kind):
+                return SimpleNamespace(_jobs=SimpleNamespace(load=lambda:(order.append(kind) or [])))
+            importer=job_module('import')
+            importer.sweep_interrupted_imports=lambda:[]
+            importer.sweep_stale_workdirs=lambda:[]
+            service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
+                                    weaviate_client=wc,importer=importer,exporter=job_module('export'),
+                                    ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
             async def exercise():
                 async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
@@ -21472,6 +24057,9 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(order[0],'bootstrap')
             self.assertEqual(order[-2:],['close','shutdown'])
             self.assertEqual('yield' in order,not fail)
+            if not fail:
+                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune',
+                                         'yield', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):
         release=threading.Event()
