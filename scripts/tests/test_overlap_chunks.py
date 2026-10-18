@@ -173,6 +173,7 @@ class OverlapTests(unittest.TestCase):
             try:
                 with patch.object(ingest_pipeline,'_parse_file',side_effect=[('x'*100000,[]),('inert text',[])]), \
                      patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
+                     patch.object(ingest_pipeline.wc, '_source_has_chunks_sync', return_value=False), \
                      patch.object(ingest_pipeline.sources,'store') as retained:
                     ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,999,0.85,100)
                     store.assert_called_once();retained.assert_called_once()
@@ -217,6 +218,7 @@ class OverlapTests(unittest.TestCase):
             with patch.dict(ingest_pipeline._jobs, {job_id:job}, clear=True), \
                  patch.object(ingest_pipeline, '_parse_file', return_value=(text,None)), \
                  patch.object(ingest_pipeline.wc, '_insert_chunks_sync') as store, \
+                 patch.object(ingest_pipeline.wc, '_source_has_chunks_sync', return_value=False), \
                  patch.object(ingest_pipeline.sources, 'store'):
                 ingest_pipeline._process_job_sync(job_id,[source],Path(directory),'ReviewOverlap','overlap',1000,200,0.85,100)
             self.assertEqual(job['status'], 'completed', job)

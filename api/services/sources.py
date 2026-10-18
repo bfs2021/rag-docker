@@ -7,6 +7,10 @@ are copied here instead.
 Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
 re-ingesting the same document stores one copy and records the extra logical
 name. Storage is proportional to the corpus rather than to upload count.
+
+A logical name belongs to one digest at a time (#22): ingest stores with
+replace=True, so a name ingested with new content leaves the digest it had, and a
+digest left with no names is removed with its blob.
 """
 from __future__ import annotations
 from services import telemetry
@@ -113,20 +117,53 @@ def restore_package(package: Path, collection: str) -> None:
     shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
 
 
+def _drop_blobs(collection: str, digests: list[str]) -> None:
+    """Delete blobs the index no longer lists. Called after the index is saved,
+    so it never names a missing blob; a blob left behind is only unused space."""
+    for digest in digests:
+        try:
+            blob_path(collection, digest).unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            log.error("Could not delete unreferenced source %s of %r: %s",
+                      digest[:12], collection, exc)
+
+
 @telemetry.traced("rag.retain")
-def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
-    """Retain one accepted upload. Returns its sha256."""
+def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
+          *, replace: bool = False) -> str:
+    """Retain one accepted upload. Returns its sha256.
+
+    With replace=True (ingest, #22) the filename is first released from every
+    other digest, and digests left with no names are dropped. That happens even
+    when writing the new blob fails, so the name never keeps claiming the
+    version it replaced, which a rechunk would otherwise rebuild.
+    """
     digest = hashlib.sha256(data).hexdigest()
     target = collection_dir(collection) / digest
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    if not target.exists():
-        tmp = target.with_name(digest + ".tmp")
-        tmp.write_bytes(data)
-        tmp.replace(target)
+    index = load_index(collection)
+    orphans: list[str] = []
+    if replace:
+        for other, entry in list(index["documents"].items()):
+            if other != digest and filename in entry["filenames"]:
+                entry["filenames"] = [n for n in entry["filenames"] if n != filename]
+                if not entry["filenames"]:
+                    del index["documents"][other]
+                    orphans.append(other)
+
+    try:
+        if not target.exists():
+            tmp = target.with_name(digest + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(target)
+    except BaseException:
+        if replace:
+            _save_index(collection, index)
+            _drop_blobs(collection, orphans)
+        raise
 
     now = datetime.now(timezone.utc).isoformat()
-    index = load_index(collection)
     entry = index["documents"].get(digest)
     if entry is None:
         index["documents"][digest] = {
@@ -141,6 +178,7 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
             entry["filenames"].append(filename)
         entry["last_seen"] = now
     _save_index(collection, index)
+    _drop_blobs(collection, orphans)
     return digest
 
 

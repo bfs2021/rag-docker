@@ -32,6 +32,12 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
+      # Auto-schema (on by default) made an insert into a deleted collection
+      # recreate it, with inferred properties, no vectorizer and no app
+      # registration (issue #40). Every collection is created explicitly with
+      # the fixed properties, so nothing needs it; an insert into a missing
+      # collection now fails instead.
+      AUTOSCHEMA_ENABLED: 'false'
       # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
       # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
       # the IP recorded in weaviate_data no longer matches after `compose down`
@@ -381,6 +387,29 @@ Before deletion, resolves the backend's canonical collection name. After success
 { "error": { "code": "CONFIRMATION_REQUIRED", "message": "Add ?confirm=true to confirm deletion.", "detail": null } }
 ```
 
+**Response 409** while a job is active for the collection (issue #40): an ingest,
+export, import, tune or gold-standard generation job, under either spelling of the
+name. Nothing is deleted. The message names the first job's kind and id; `detail`
+names it and lists every active job, oldest first. For gold-standard generation the
+id is the session id.
+```json
+{ "error": { "code": "COLLECTION_BUSY",
+  "message": "An ingest job is running for this collection ('Documents', job 1a2b3c4d). Delete the collection after the job finishes.",
+  "detail": { "collection": "Documents", "job_kind": "ingest", "job_id": "1a2b3c4d",
+              "jobs": [ { "job_kind": "ingest", "job_id": "1a2b3c4d" } ] } } }
+```
+The message starts "An ingest job", "An export job", "An import job", "A tuning job"
+or "A gold-standard generation job" "is running for this collection". A delete never
+waits behind a job: a job counts as active from its admission (ingest: before its
+upload is saved; import: once its target name is known; generation: once its session
+is published) until just before its status turns terminal, so a client that has seen
+the job end can delete at once. While the delete waits for the collection's writer
+guard (held briefly by collection creation, say), it rechecks every 0.25 s and
+answers `409` as soon as a job appears; it checks once more when it holds the guard.
+A job admitted after that last check is not refused at admission: it meets a deleted
+collection, which no insert can recreate (§5.4). Deletions an import-replace or a
+tune makes of its own target are not subject to this check.
+
 ---
 
 #### 3.1.3 Ingest
@@ -448,6 +477,7 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | 400 | `NO_SUPPORTED_FILES` | nothing in the upload is a supported type; the message lists what was skipped |
 | 400 | `ARCHIVE_UNREADABLE` | the ZIP is damaged: it can't be opened (truncated, e.g. an incomplete download, or a bad central directory), or a member can't be read (wrong offset, bad local header, bad CRC, truncated data) |
 | 400 | `ARCHIVE_UNSUPPORTED` | no member is damaged, but one is password-protected or uses a compression method the server can't read (e.g. Deflate64) |
+| 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
 | 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
 | 500 | `INGEST_FAILED` | anything unexpected; the message says so and the API log holds the traceback, collection and filenames |
 
@@ -455,13 +485,79 @@ The ZIP messages name the upload, say nothing from it was imported, name the unr
 members with a reason each (up to 10, then "and N more") and suggest re-creating the ZIP.
 `detail` is `{"file": ..., "members": [{"member": ..., "reason": ...}, ...]}`.
 
+**Expansion cap (#298).** All the ZIPs of one upload request may expand to at most
+`max_zip_expanded_bytes` (env `MAX_ZIP_EXPANDED_BYTES`, default 2,147,483,648 bytes = 2 GiB) in
+all; files uploaded directly, a `.jsonl.gz` included, don't count. Before a ZIP's members are
+read, the total so far plus the uncompressed sizes the ZIP declares for the members validation
+reads is checked. While validation reads each member, the bytes it decompresses are counted, once
+per member (extraction reads supported members again but doesn't count them); a `.json.gz` or
+`.jsonl.gz` member is also gunzipped, only to count its output, on top of its own bytes. It is
+read with the job's own gzip reader (Python's `gzip` module), so the count is what the job would
+decompress: the same headers accepted, concatenated streams and zero padding followed. Gzip data
+that reader refuses stops that member's count, and the job reports the file as usual. As soon as the total is over the cap the
+whole request is refused, whatever else was found: 400 `ARCHIVE_TOO_LARGE`, `'<zip>' expands to
+more than 2,048 MB when unpacked, the most one upload's ZIPs can expand to, so nothing from it was
+imported. Split it into smaller zips and upload them in separate imports.` (`<zip>` is the ZIP
+being checked or read; the limit is in MB when it is a whole number of MiB, otherwise in bytes),
+`detail` `{"file": "<zip>", "members": []}`. A total equal to the cap is accepted. The ZIP work
+(opening, the size check, validation, counting and extraction) runs in a worker thread, so the
+API keeps answering other requests meanwhile. The member-count and compression-ratio caps are
+#28's.
+
 **`.json.gz` members.** A ZIP member ending in `.json.gz` is extracted and queued like a
 supported file. The job decompresses it (at most 512 MB decompressed) and parses the result
-as JSON; its chunks have `source_type` `json` and `source_file` the member's filename, and
+as JSON; its chunks have `source_type` `json` and `source_file` the member's logical name (below), and
 the retained original is the `.json.gz` itself. A `.json.gz` uploaded directly, and other
 `.gz` members, are skipped as unsupported types. The JSON is converted to text as described in §5.1.
-`.jsonl` and `.jsonl.gz` files, direct or in a ZIP, are skipped with the reason "JSON Lines
-(.jsonl) isn't supported yet, see #291".
+
+**JSON Lines (#291).** `.jsonl` and `.jsonl.gz` files (case-insensitive) are queued whether
+uploaded directly or as ZIP members. A `.jsonl.gz` is decompressed while the job reads it (at
+most 512 MB decompressed, nothing decompressed written to disk). Each line becomes one record
+as described in §5.1; chunks have `source_type` `jsonl`, and the retained original is the file
+as uploaded.
+
+**Logical names and re-ingesting (#22).** Every file is stored under a logical name: the
+`source_file` of its chunks and the filename in its retained-source index entry.
+
+- A direct upload's logical name is its filename without any path. A ZIP member's is its
+  path inside the archive, POSIX-style and normalised: `a/report.pdf` and `b/report.pdf`
+  are two documents, `a/../b.txt` is `b.txt` and `./c.txt` is `c.txt`. Members at the
+  archive's top level keep their bare name. A member whose path leaves the archive
+  (`../x.txt`, an absolute path) is not ingested. Error and skip messages still name a
+  member as `<zip filename>:<member path as stored in the archive>`.
+- Each queued file is staged in a directory of its own, so no input overwrites another's
+  bytes.
+- **Within one upload the last input with a logical name wins.** That covers a name sent
+  twice in one request, a name repeated inside a ZIP, the same path in two ZIPs, and a direct
+  upload with the same name as a top-level member. Each earlier input is dropped, not
+  counted in `files_total`, and listed in the job's `skipped` as
+  `<earlier> (replaced by <later> later in this upload, same name '<logical name>')`.
+- **Re-ingesting a name replaces it**, always, even when the content is unchanged: the file
+  is parsed and chunked again with the request's settings, the new chunks are stored, and
+  only then are the name's earlier chunks deleted, so a failed store leaves the earlier
+  version whole. The earlier chunks are those with the same `source_file` and a different
+  `created_at` than the new chunks (which all share one); deletion repeats until none match
+  (Weaviate deletes at most `QUERY_MAXIMUM_RESULTS` per call), at most 100 times. It
+  proceeds only if exactly the new chunks match their own `created_at`, and afterwards
+  exactly they must remain. The job's `chunks_replaced` counts the deleted chunks.
+- If the earlier chunks can't all be deleted, the new chunks stay, the file counts as
+  failed (so the job is `partial`, or `failed` if every file failed) and `errors` gets
+  `<file>: its new chunks were stored, but earlier chunks could not all be removed
+  (<reason>); upload it again to retry`.
+- Before the first file in a job replaces earlier chunks, the collection's gold-standard
+  sessions are marked `stale` (§3.1.5), once per job, with the reason `documents were
+  re-ingested, replacing their earlier chunks: <names>`, naming that file and the job's
+  later files that also have earlier chunks (10 names, then `and N more`). The marking is
+  saved before anything is stored; if it can't be, that file fails with `<file>: could not
+  mark gold-standard sessions stale before replacing its chunks, so nothing was changed:
+  <reason>`, and the next replacing file tries again. Files with new names mark nothing.
+- The retained original follows the replacement: the name is removed from any other
+  retained digest, and a digest left with no names is deleted with its blob (see
+  `RAG_EXPORT_SPECIFICATIONS.md` §2.2).
+- Ingest jobs for one collection run one at a time, so for one name the job that runs last
+  wins and each job applies whole; the order of concurrent uploads is not promised.
+- Chunks already duplicated before this rule (a name ingested twice) stay until the name is
+  ingested again.
 
 ---
 
@@ -478,11 +574,29 @@ GET /ingest/job/{job_id}
   "files_completed": 1,
   "files_failed": 0,
   "chunks_stored": 142,
-  "errors": []
+  "chunks_replaced": 0,
+  "errors": [],
+  "skipped": []
 }
 ```
 
-`status` values: `"queued"`, `"running"`, `"completed"`, `"failed"`.
+`chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
+records written before it existed read back as `0`. `skipped` lists inputs that were not
+ingested, each with its reason: an unsupported type, or a later input with the same name.
+
+`status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
+`"failed"`.
+
+**Job records survive an API restart (#23).** Ingest, export, import and tune job records are
+kept in `{UPLOAD_DIR}/jobs/{kind}/{job_id}.json` (owner-only, atomic replacement), so
+`GET /…/job/{job_id}` keeps answering after a restart instead of `404`. Status changes and the
+final record are written at once; progress counters at most once a second per job. At startup,
+before the first request, a job still `queued` or `running` is marked interrupted, because its
+worker died with the old process. An interrupted ingest becomes `partial` when
+`files_completed > 0`, otherwise `failed`, with "Interrupted: the API restarted while this job
+was running. Re-upload the files to try again." appended to `errors`; its counters stay as
+they were. An unreadable record file is left as it is and logged. The newest 200 records per
+kind are kept; older ones are removed at startup.
 
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
@@ -492,6 +606,15 @@ that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parse
 converted text would exceed 10,000,000 characters fails with `converts to more than 10,000,000 characters of
 text, the per-file limit for every chunking strategy; split the file` (a `.json.gz` member: `was decompressed,
 but it converts to more than …`).
+
+A `.jsonl` or `.jsonl.gz` file fails as a whole, with nothing stored, at its first bad line
+(§5.1): `line N is blank` (a blank line followed by another record), `line N is not valid JSON:
+<reason> at column C`, `line N is not UTF-8 text (<reason> at byte B)`, `line N is longer than
+10,000,000 bytes, the most one line can hold; split the record across lines or files`, or
+`converts to more than 10,000,000 characters of text by line N, the per-file limit for every
+chunking strategy; split the file`. For a `.jsonl.gz` these read `was decompressed, but line N …`
+(and `was decompressed, but it converts to more than …`); a corrupt or truncated gzip and the
+512 MB limit give the `.json.gz` messages above.
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -979,6 +1102,7 @@ Standard error codes:
 |---|---|---|
 | `COLLECTION_NOT_FOUND` | 404 | Named collection does not exist |
 | `COLLECTION_EXISTS` | 409 | Collection already exists |
+| `COLLECTION_BUSY` | 409 | Delete refused while an ingest, export, import, tune or gold-standard generation job is active for the collection; generation could not get the collection's writer guard within one second |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
@@ -1115,7 +1239,9 @@ GET /export/job/{job_id}
 ```
 
 `status` is `queued`, `running`, `completed` or `failed`. On failure `error`
-carries the reason and `filename` stays null. A failed build leaves nothing
+carries the reason and `filename` stays null. Export, import and tune job records persist
+across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
+with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
 collection's export slot is released.
 
@@ -1319,7 +1445,7 @@ Every collection created through this system uses this fixed property schema:
 |---|---|---|---|
 | `content` | `text` | BM25 + vector | Chunk text content |
 | `source_file` | `text` | filterable only (BM25 disabled) | Original filename |
-| `source_type` | `text` | filterable only (BM25 disabled) | `pdf`, `docx`, `txt`, `md`, `csv`, `json` |
+| `source_type` | `text` | filterable only (BM25 disabled) | `pdf`, `docx`, `txt`, `md`, `csv`, `json`, `jsonl` |
 | `chunk_index` | `int` | filterable | Zero-based position of chunk within source document |
 | `chunk_strategy` | `text` | filterable only (BM25 disabled) | `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
 | `chunk_size` | `int` | filterable | Configured chunk size at ingest time |
@@ -1359,8 +1485,9 @@ Flat (KNN) index has no tunable parameters.
 | Markdown | `.md` | Unstructured (`partition_md`) | Heading structure preserved |
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
+| JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n`; a `\r` before it is whitespace; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. JSON Lines (`.jsonl`, `.jsonl.gz`) is skipped with its own reason (#291). Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -1423,6 +1550,20 @@ The `text2vec-ollama` Weaviate module handles embedding automatically when objec
 For each chunk, the API service creates a Weaviate object with all properties populated. Embedding is generated by Weaviate automatically on insert via the configured `text2vec-ollama` module.
 
 Inserts are batched: up to 50 objects per batch using the weaviate-client v4 context-manager pattern (`with client.batch.dynamic() as batch: batch.add_object(...)`).
+
+Inserts never create a collection. Weaviate's auto-schema is off
+(`AUTOSCHEMA_ENABLED: 'false'`, §2.1): with it on, an insert sent after its
+collection was deleted recreated the collection with inferred properties, no
+vectorizer and no registry entry (issue #40). Every collection is created explicitly
+with the §4.1 properties, so an insert into a missing collection, or one carrying a
+property the collection does not declare, fails instead. When storing a file's chunks
+fails and the job's collection no longer exists, the ingest job stops: it ends
+`failed` and adds the error `collection '<name>' was deleted while this job was
+running`; that file and every later one count as failed, files already stored stay
+counted, and no later file is parsed or retained. The underlying batch error goes to
+the API log. Only a failed store checks for the collection; other failures are
+reported per file as before. The check also runs when the job's first backend call for a
+file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 **Query-time embedding paths:**
 
@@ -1601,7 +1742,7 @@ settings, regardless of when a prior collection's save completes.
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
-- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors.
+- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
 
@@ -1718,6 +1859,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Table of collections: name, object count, index type, distance metric, created date.
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
+- A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
 
@@ -1795,6 +1937,7 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
 | `maxConnections` | 64 | 16 | 128 | HNSW build param |
 | Gold standard `sample_size` | 20 | 1 | 100 | |
+| `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
 
 ---
 
@@ -1855,6 +1998,7 @@ rag-docker/
 │   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
+│   │   ├── jobstore.py          # Job records that survive an API restart
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
 │   │   ├── model_bundle.py      # Ollama manifest + blob copy, both directions
 │   │   ├── tuning.py            # Re-chunk / re-embed / re-index, staged rebuilds
@@ -1963,10 +2107,45 @@ now lives once, in `api/services/ingest_config.py`.
       converting to 9,999,999 characters still converts and chunks; `02_ingest.sh` ingests a nested `plain.json` through the proxy and
       reads back `meta.author: Zoë Müller` with no JSON syntax. Full verification runs
       2026-10-17: all seven suites passed (9m31s; after the review fixes, 9m36s).*
+- [x] A JSON Lines file (`.jsonl` or `.jsonl.gz`, uploaded directly or in a ZIP) is stored one `key: value` record per line with `source_type` `jsonl`; a blank, malformed, non-UTF-8 or over-long line fails the whole file naming that line, and the file's text is bounded by the per-file limit while it is read (#291).
+      *`test_jsonl_ingest.py` (39 cases in the API image) covers the conversion of each kind
+      of line, CRLF, a byte-order mark, trailing blank lines, every line error and its
+      ordering, the 10,000,000-byte line limit at and one past the edge, the text limit at and
+      one past the edge, reading that stops at the line passing the limit, gzip errors and
+      prefixes, `source_type`, a job storing nothing for a bad file, and rechunk of a retained
+      `.jsonl.gz`. `test_ingest_errors.py` checks which inputs are queued. `02_ingest.sh`
+      ingests a direct `.jsonl` and `.jsonl.gz` and a `.jsonl.gz` ZIP member through the proxy,
+      reads the stored records back, and checks that a malformed line fails the file and
+      stores nothing; `06_ui.sh` checks the Import page's file picker and hint.*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`
       list naming each file and its unsupported extension, shown by the UI.*
+- [x] A damaged or unreadable ZIP refuses the whole upload with a readable 400 naming its unreadable members (`ARCHIVE_UNREADABLE`, or `ARCHIVE_UNSUPPORTED` when none is damaged), a filesystem error is `UPLOAD_WRITE_FAILED` and anything unexpected a JSON 500 `INGEST_FAILED`; `.json.gz` members ingest as JSON. An upload's ZIPs expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzip output included, or the upload is refused with `ARCHIVE_TOO_LARGE`, and the ZIP work runs off the event loop (#290, #298).
+      *#290 replaced a bare HTTP 500 for a truncated ZIP. `test_ingest_errors.py` (in the API
+      image) covers a truncated archive, wrong member offsets, bad CRCs (also in a member that
+      would be skipped), unsupported compression, an encrypted member, damaged and unsupported
+      members together (`ARCHIVE_UNREADABLE` with the generic remedy), extraction and upload-save
+      filesystem errors, the JSON 500, `.json.gz` parsing and its errors, and rechunk of a
+      retained `.json.gz`. The #297 review found the ZIP work ran on the event loop with no total
+      cap, so a small highly compressible ZIP could stall every request: `test_zip_expansion.py`
+      runs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` and covers declared sizes over
+      the cap (refused before any member is read), a total at the cap accepted and one byte
+      over refused, the total shared by two ZIPs, counting when declared sizes understate,
+      `.json.gz` and `.jsonl.gz` output, concatenated streams with zero padding, a corrupt and a
+      truncated gzip, a direct `.jsonl.gz` not counted, the cap passed after an unreadable
+      member, no member read and gzip counting stopped within one block once the cap is passed,
+      the 2 GiB default and the ZIP work running in a worker thread while the loop serves other
+      work. The PR #318 security review found that counting with zlib's gzip mode let a member
+      whose header zlib refuses (FHCRC with a bogus CRC, a reserved flag bit) count nothing
+      although the job decompresses it all: members are now counted with the job's own gzip
+      reader, and a test checks the count equals what that reader produces for plain,
+      concatenated, padded, truncated, trailing-garbage, non-gzip and both header cases. `02_ingest.sh` runs both in the verify project's API container, then
+      through the proxy refuses a truncated ZIP, ingests a ZIP of `.json`, `.json.gz` and
+      `.jsonl.gz` members, and refuses with the exact message a ZIP declaring 2,049 MiB and one
+      whose gzip member expands to 2,112 MiB, while job polls are still answered;
+      `06_ui.sh` checks the Import page shows the API's message and a failing status poll,
+      which a new ingest and the next successful poll clear.*
 - [x] Each chunking strategy produces non-empty chunks for a test PDF.
       *fixed 3, overlap 1, language 4, context_aware 4, semantic 8 chunks.*
 - [x] Chunks below `min_chunk_size` are merged and not stored as independent objects.
@@ -1989,6 +2168,66 @@ now lives once, in `api/services/ingest_config.py`.
 
 - [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
       *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes 19 checks in 1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
+
+- [x] Deleting a collection while an ingest, export, import, tune or gold-standard generation job is active for it (either spelling) answers `409 COLLECTION_BUSY` naming the job's kind and id, deletes nothing and does not wait for the job; once the job's status is terminal the delete succeeds (#40).
+      *Issue #40 reported a `DELETE` during an ingest returning `200`, the job failing
+      with batch errors, and the collection coming back with 608 objects and no
+      `created_at`. On `develop` at 3a8d462 the writer guard (since the issue was written)
+      made the `DELETE` wait for the whole job instead (223 s for a 1,373-chunk upload)
+      and then delete what it stored, and a `DELETE` that ran before a queued job's
+      worker still let the job recreate the collection. **Fixed**: one registry of active
+      jobs per canonical collection name, checked before and while the delete waits for
+      the writer guard and again once it holds it. `test_delete_busy.py` (18 cases in the
+      API image) drives each kind's real start path, checks its registration ends before
+      its status turns terminal, and arranges the request orderings with events: a job
+      registered before the delete, while the delete waits for the guard (refused within a
+      second while the guard is still held), and once the delete holds it.
+      `02_ingest.sh` sends a `DELETE` while a 180-chunk upload is still embedding (`409`,
+      objects in place), and again after the job completes (`200`, still gone 10 s later).
+      Full verification run 2026-10-17: all seven suites passed (10m57s).*
+- [x] An insert never creates a collection: an insert into a deleted collection fails and the collection stays absent (#40).
+      *Weaviate's auto-schema recreated the class with inferred properties, no
+      vectorizer and no vector index, which the app listed with `index_type: unknown`
+      and no `created_at`. **Fixed**: `AUTOSCHEMA_ENABLED: 'false'` (§2.1); every path
+      that makes a collection already created it explicitly. `02_ingest.sh` creates,
+      deletes and then inserts into a collection in the API container, and checks the
+      insert fails and nothing is recreated. The full run is the check that import,
+      tuning rebuilds and export do not rely on auto-schema.*
+- [x] An ingest job whose collection is deleted before or while it stores fails with "collection '<name>' was deleted while this job was running", stops processing files and retains no originals for them (#40).
+      *The job used to report "Stored vector is missing or invalid" (auto-schema on) or
+      a cleanup error saying accepted chunks may remain (auto-schema off), neither
+      naming the deletion. `test_delete_busy.py` covers a job admitted after a completed
+      delete, a collection deleted between two files, a store failure with the collection
+      present and a failed existence check (both reported as before), and a parse failure,
+      which does not consult the collection's existence.*
+- [x] Ingest job status survives an API restart (#23): a job that completed before the restart
+      reads back unchanged, and a job interrupted after storing a file answers `200` with
+      `status: partial`, the interruption message in `errors` and `files_completed` as it was.
+      *Every job used to answer `404 JOB_NOT_FOUND` after a restart. `02_ingest.sh`, with
+      `RAG_ALLOW_RESTART=1`, ingests a file, then uploads it with a slow text file, restarts the
+      API with `docker compose restart --timeout 0 api` once the first file is stored, and
+      checks both jobs.*
+
+- [x] Re-ingesting a file under the same logical name replaces its chunks and its retained original, even with unchanged content; the job reports `chunks_replaced`; the earlier version survives a failed store; gold-standard sessions are marked stale before a replacement and never for new names (#22).
+      *Re-ingesting used to add a second chunk set beside the first, so answers could cite
+      a superseded version, and the old digest kept claiming the name. `test_reingest.py`
+      (API image, backends mocked) covers no replacement for new names, one marking per
+      job naming the replaced files before any insert, insert before delete, unchanged
+      content, a marking failure (file failed, nothing changed, next file retries), a
+      failed insert (earlier version kept), a removal failure (`partial`, new chunks kept),
+      a deleted collection at the lookup (#40), the delete rounds, precondition and final
+      count, and retention releasing the name even when the blob write fails.
+      `02_ingest.sh` ingests `policies.txt` twice (one chunk set, `chunks_replaced` equal to
+      the first count), then a changed version (only its text remains, one digest names it,
+      the first blob is gone).*
+- [x] ZIP members are named by their normalised path inside the archive, so same-named members in different folders stay separate documents; within one upload the last input with a logical name wins and each earlier one is listed in `skipped` with its reason (#22).
+      *`a/report.pdf` and `b/report.pdf` both became `report.pdf`, and a name sent twice in
+      one request was overwritten on disk but queued twice. `ZipFile.extract` also wrote
+      `a/../b.txt` to `a/b.txt` while `b.txt` was queued. `test_reingest.py` covers a name
+      twice in one body, repeated ZIP entries, the same path in two ZIPs, a direct upload
+      against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
+      archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
+      `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
 
 ### 10.2 Query
 
@@ -2112,6 +2351,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
+- [x] A refused delete is shown in the delete dialog: the dialog stays open with the API's message as an alert, the collection stays listed, and Cancel clears the message (#40).
+      *Before, the error went to the page-level line behind the dialog's overlay, so a
+      refused delete looked like nothing happened. `ui_criteria.js` answers the `DELETE`
+      with a synthetic `409 COLLECTION_BUSY` by request interception, so no collection is
+      touched, and checks one `DELETE` was sent, the alert inside the dialog, the row and
+      the cleared message after Cancel.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
@@ -2124,6 +2369,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 - [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.
   *Evidence: suite 01 creates 140 schema changes, waits for a snapshot, writes a tail, restarts, and checks the restored snapshot index and data.*
+
+- [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept (#23).
+  *Evidence: `test_jobstore.py` (15 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job.*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
@@ -2351,6 +2599,9 @@ additional jobs or requests. Metrics operate independently of trace recording,
 sampling and log signal toggles. Only executed work contributes; cancelled
 waiters cannot finish still-running workers. Active UpDownCounters settle on
 scope exit and represent current process concurrency, not persisted history.
+Loading durable job records, including marking interrupted jobs after restart,
+does not create execution counts, durations or active work. Logical-name replacement
+backend calls use the existing finite dependency labels; source names remain excluded.
 
 Finite dimensions are validated before aggregation, restricted per instrument
 by SDK views, and checked again during protobuf rebuilding. Valid multiple

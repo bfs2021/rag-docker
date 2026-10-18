@@ -559,6 +559,35 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assert_jobs({('ingest','error'):1})
         self.assertEqual(next(r['attributes']['rag.outcome'] for r in self.logs if r['body']=='rag.job.completed'),'partial')
 
+    async def test_logical_name_ingest_and_deleted_collection_metrics(self):
+        await tracing_fixture.TracingTests.test_ingest_zip_logical_names_and_deleted_collection_outcomes(self)
+        self.assert_jobs({('ingest','ok'):1,('ingest','error'):1})
+
+    async def test_replacement_dependency_metrics_count_each_backend_call(self):
+        await tracing_fixture.TracingTests.test_replacement_dependency_calls_keep_safe_lineage(self)
+        self.assert_jobs({('ingest','ok'):1})
+        data = self.reader.get_metrics_data()
+        metrics = {m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        calls = {p.attributes['rag.dependency']:p.value
+                 for p in metrics['rag.dependency.calls'].data.data_points}
+        self.assertEqual(calls, {'weaviate.query':1, 'weaviate.aggregate':2, 'weaviate.delete':1})
+        self.assertNotIn(SECRET, repr(calls))
+
+    async def test_durable_restart_records_do_not_create_execution_metrics(self):
+        jobstore = tracing_fixture.ingest.jobstore
+        with ot.bind((self.runtime, None)):
+            for kind in jobstore.KINDS:
+                store = jobstore.JobStore(kind)
+                store.load()
+                store['restart01'] = {'status':'queued', 'errors':[]}
+                loaded = jobstore.JobStore(kind)
+                loaded.load()
+                self.assertEqual(loaded['restart01']['status'], 'failed')
+                loaded.load()
+        self.assertIsNone(self.reader.get_metrics_data())
+        self.assertEqual(self.logs, [])
+        self.assertEqual(self.memory.get_finished_spans(), ())
+
     async def test_real_import_and_tuning_caught_failure(self):
         await tracing_fixture.TracingTests.test_import_and_tuning_real_launchers_handled_failure(self)
         self.assert_jobs({('import','error'):1,('tuning','error'):1})

@@ -698,8 +698,14 @@ class TelemetryTests(unittest.TestCase):
             gold=SimpleNamespace(load_sessions_from_disk=Mock(side_effect=RuntimeError('startup') if fail else lambda:order.append('load')),
                                  reconcile_interrupted_generations=Mock())
             wc=SimpleNamespace(sweep_staging=AsyncMock(return_value=[]),close_client=lambda:order.append('close'))
-            importer=SimpleNamespace(sweep_interrupted_imports=lambda:[],sweep_stale_workdirs=lambda:[])
-            service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),weaviate_client=wc,importer=importer)
+            def job_module(kind):
+                return SimpleNamespace(_jobs=SimpleNamespace(load=lambda:(order.append(kind) or [])))
+            importer=job_module('import')
+            importer.sweep_interrupted_imports=lambda:[]
+            importer.sweep_stale_workdirs=lambda:[]
+            service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
+                                    weaviate_client=wc,importer=importer,exporter=job_module('export'),
+                                    ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
             async def exercise():
                 async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
@@ -711,6 +717,9 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(order[0],'bootstrap')
             self.assertEqual(order[-2:],['close','shutdown'])
             self.assertEqual('yield' in order,not fail)
+            if not fail:
+                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune',
+                                         'yield', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):
         release=threading.Event()

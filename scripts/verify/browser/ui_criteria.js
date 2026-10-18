@@ -296,6 +296,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await sleep(900);
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
+
+      // A refused delete (409 while a job runs, #40) is shown in the dialog. The
+      // page-level error line sits behind the overlay, where it read as nothing.
+      // The DELETE is answered here, so no collection is touched.
+      const busyMessage = "An ingest job is running for this collection ('Owned', job 0wned40). Delete the collection after the job finishes.";
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (request.method() === 'DELETE' && new URL(request.url()).pathname.startsWith('/api/collections/')) {
+          return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_BUSY', message: busyMessage, detail: { job_kind: 'ingest', job_id: '0wned40' } } }) });
+        }
+        return request.continue();
+      });
+      const target = await s.page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find(i => !i.type || i.type === 'text');
+        const name = el.placeholder;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, name);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return name;
+      });
+      await sleep(200);
+      const deletes = s.api.filter(x => x.method === 'DELETE').length;
+      await s.page.evaluate(() => {
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        if (btn && !btn.disabled) btn.click();
+      });
+      await sleep(900);
+      const refused = await s.page.evaluate(() => {
+        const dialog = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Delete Collection');
+        const box = dialog && dialog.parentElement;
+        const alert = box && box.querySelector('[role=alert]');
+        return { open: !!dialog, alert: alert ? alert.textContent : null };
+      });
+      r.check('a refused delete sends one DELETE', s.api.filter(x => x.method === 'DELETE').length === deletes + 1);
+      r.check('a refused delete keeps the dialog open and shows the message in it',
+              refused.open && refused.alert === busyMessage, JSON.stringify(refused));
+      const listed = await s.page.evaluate(t => [...document.querySelectorAll('tbody td')].some(td => td.textContent.trim() === t), target);
+      r.check('the refused collection is still listed', listed, target);
+      await clickByText(s.page, 'Cancel'); await sleep(200);
+      await s.page.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Delete');
+        if (b) b.click();
+      });
+      await sleep(300);
+      r.check('cancelling clears the message for the next attempt',
+              await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
   }
@@ -329,6 +375,28 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     fs.unlinkSync(big);
     await s.ctx.close();
+  }
+
+  // ── import file types (#291) ───────────────────────────────────────────────
+  // The picker offers JSON Lines, plain and gzipped, and the hint names it.
+  r.section('import file types');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const accept = await s.page.evaluate(() => {
+        const input = document.querySelector('#file-input');
+        return input ? input.getAttribute('accept') : null;
+      });
+      r.check('the file picker accepts .jsonl and .jsonl.gz',
+              accept === '.pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip', String(accept));
+      const hint = await bodyText(s.page);
+      r.check('the drop zone hint names JSONL among the types',
+              hint.includes('PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to 512 MB per upload'),
+              hint.slice(0, 200));
+    } finally {
+      await s.ctx.close();
+    }
   }
 
   // ── import errors (#290) ───────────────────────────────────────────────────
@@ -383,6 +451,106 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
               clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
               clicked ? text.slice(0, 200) : 'Start Ingest button not found');
       r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  // A poll error is cleared by a new ingest and by the next successful poll
+  // (#298). Job A's polls always fail; job B's first poll fails, then it
+  // completes. Polls run every 3 s.
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll-clear.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    const failure = JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } });
+    let uploads = 0, pollsB = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST') {
+        uploads += 1;
+        const job = uploads === 1 ? 'vfyclrA' : 'vfyclrB';
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: job, status: 'queued', files_queued: 1, collection: 'x' }) });
+      }
+      if (path === '/api/ingest/job/vfyclrA')
+        return request.respond({ status: 500, contentType: 'application/json', body: failure });
+      if (path === '/api/ingest/job/vfyclrB') {
+        pollsB += 1;
+        if (pollsB === 1) return request.respond({ status: 500, contentType: 'application/json', body: failure });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfyclrB', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, chunks_replaced: 0, errors: [], skipped: [] }) });
+      }
+      return request.continue();
+    });
+    const shown = text => text.includes("Could not check the import's progress: Synthetic status failure.");
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const first = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);                       // job A's first poll has failed
+      const before = shown(await bodyText(s.page));
+      const second = await clickByText(s.page, 'Start Ingest');
+      await sleep(1000);                       // job B accepted, not yet polled
+      const afterNew = await bodyText(s.page);
+      r.check('a new ingest clears a poll error',
+              first && second && before && uploads === 2 && !shown(afterNew),
+              `clicked=${first},${second} shown-before=${before} uploads=${uploads} after: ${afterNew.slice(0, 160)}`);
+      await sleep(2700);                       // job B's first poll has failed
+      const failedAgain = shown(await bodyText(s.page));
+      await sleep(3000);                       // job B's second poll has succeeded
+      const afterPoll = await bodyText(s.page);
+      r.check('the next successful poll clears a poll error',
+              failedAgain && pollsB >= 2 && !shown(afterPoll),
+              `shown-after-B's-first-poll=${failedAgain} B-polls=${pollsB} after: ${afterPoll.slice(0, 160)}`);
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
+  // ── re-ingest progress (#22) ───────────────────────────────────────────────
+  // The progress panel reports replaced chunks, and the skipped heading no
+  // longer claims every skip is an unsupported type: a later file with the
+  // same name in one upload is skipped too. Job responses are stubbed.
+  r.section('re-ingest progress');
+  for (const [replaced, label] of [[3, 'Replaced 3 chunks from a previous version'], [1, 'Replaced 1 chunk from a previous version'], [0, null]]) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-reingest.txt';
+    fs.writeFileSync(small, 'Re-ingest fixture.\n');
+    const jobId = 'vfyrein' + replaced;
+    const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (label) {
+        r.check(`chunks_replaced=${replaced} is shown as "${label}"`, clicked && text.includes(label),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check('chunks_replaced=0 shows no replacement line', clicked && text.includes('Chunks stored: 2') && !text.includes('Replaced '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+        r.check('the skipped heading is a plain "1 file skipped:" with the entry\'s own reason',
+                text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
+                text.slice(0, 300));
+      }
+      r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();

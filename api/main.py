@@ -32,7 +32,6 @@ async def lifespan(app: FastAPI):
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of staging collections failed")
         try:
-            import asyncio
             from services import importer
             partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
             if partial:
@@ -45,6 +44,22 @@ async def lifespan(app: FastAPI):
                             len(stale_dirs), ", ".join(stale_dirs))
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted imports failed")
+        # Job records survive a restart (#23). After the sweeps, so a job interrupted
+        # mid-import is reported failed and its half-built collection already swept.
+        # No worker from the previous process is alive, so any job still queued or
+        # running is marked interrupted before the first request is served.
+        from services import exporter, importer, ingest_pipeline, tuning
+        interrupted = []
+        for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
+                             ("import", importer), ("tune", tuning)):
+            try:
+                marked = await asyncio.to_thread(module._jobs.load)
+                interrupted += [f"{kind} {job_id}" for job_id in marked]
+            except Exception:                             # noqa: BLE001
+                log.exception("Could not load the %s job records", kind)
+        if interrupted:
+            log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
+                        "says so; start them again.", len(interrupted), ", ".join(interrupted))
         yield
     finally:
         try:

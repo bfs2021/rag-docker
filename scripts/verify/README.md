@@ -111,7 +111,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -190,10 +190,35 @@ and do not replace, this live acceptance.
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
 wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
 compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
-logged traceback, JSON Lines skip reasons, and that gzipped JSON members are decompressed
-within their limit with clear per-file errors. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+logged traceback, which inputs are queued (JSON Lines direct and as members, #291; a direct
+`.json.gz` and other gzip types skipped), and that gzipped JSON members are decompressed
+within their limit with clear per-file errors. Since #298 it also checks a ZIP with damaged and
+unsupported members together (`ARCHIVE_UNREADABLE`, generic remedy), `UPLOAD_WRITE_FAILED` when
+saving the upload itself fails, names with a newline logged escaped in every ingest log line that
+carries one, the retained `media_type` of gzipped files (`application/gzip`), and rechunk of a
+retained `.json.gz`. Weaviate and source retention are mocked. `02_ingest.sh` runs it
 in the verify project's API container, then checks a truncated ZIP and a ZIP of
-`.json` and `.json.gz` members through the proxy.
+`.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
+(suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
+failing status poll, and that a new ingest and the next successful poll clear that error.
+
+`scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
+upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
+to the container; the test sets it when absent): declared sizes over the cap refused before
+any member is read, a total at the cap accepted and one byte over refused, one total for every
+ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
+counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
+member read and gzip counting stopped within one block once the cap is passed, gzip headers
+that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
+counted, the count equal to what the job's gzip reader produces, the exact message and
+`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
+serves other work. `02_ingest.sh` runs it in the API container, then, at the
+default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
+gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
+`ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
+are answered within a second (a smoke check; the controlled test is the one that tells
+off-loop from on-loop work).
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -204,6 +229,74 @@ fast with bounded memory), and readable errors for invalid JSON in `.json` files
 `.json.gz` members. `02_ingest.sh` runs it in the API
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
 back to confirm they hold that text.
+
+`scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
+becomes one `key: value` record per line, separated by blank lines, with one element per
+record: object, array and scalar lines, lines with no text dropped, CRLF, a byte-order mark,
+no final newline, trailing blank lines accepted and U+2028 kept inside its line. Every line
+error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
+non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
+text limit are checked at and one past their edges, and a file far over the limit stops
+being read at the line that passes it, with a small traced peak. Gzip: the same text as plain,
+the `was decompressed, but` prefix, corrupt, truncated and over-size data. It also checks
+`source_type` `jsonl`, a job that stores nothing for a bad file beside a good one, and
+rechunk of a retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a
+direct `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back,
+and checks that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing.
+`browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
+`.jsonl` and `.jsonl.gz` and that its hint names JSONL.
+
+`scripts/tests/test_delete_busy.py` (#40) checks that `DELETE /collections/{name}` answers
+`409 COLLECTION_BUSY`, naming the job, while an ingest, export, import, tune or gold-standard
+generation job is active, and that each kind's registration ends before its status turns
+terminal. The request orderings are arranged with events: a job registered before the
+delete, one registered while the delete waits for the writer guard (refused within a
+second, not after the job), one registered once it holds the guard, and a job admitted
+after a completed delete, which fails with "collection '<name>' was deleted while this job
+was running" at its first store. Weaviate is mocked. `02_ingest.sh` runs it in the API
+container, then deletes a collection while a real ingest is still embedding (`409`, data
+in place), again after the job completes (`200`, still gone 10 s later), and checks that an
+insert into a deleted collection fails without recreating it (auto-schema is off).
+
+`scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
+and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
+that writes nothing; status changes and terminal records are written at once, owner-only;
+10,000 progress updates cause a handful of writes and the last one still reaches the disk; a
+failed write raises nothing and keeps the previous file; ids can't name another path; startup
+marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
+`failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
+a real lifespan run marks a stored running export. `02_ingest.sh` runs it in the API
+container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while an upload is part-way and checks that a
+completed job reads back unchanged and the interrupted one reads `partial` with the
+interruption message; `05_transfer.sh` does the same for a completed export and one
+interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
+
+`scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
+same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
+repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
+keep the last and list each earlier one in `skipped`; members in different folders stay
+separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
+job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
+the replaced files, before any insert, and deletes earlier chunks only after the insert; a
+marking failure fails only that file and changes nothing; a failed insert keeps the earlier
+version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
+reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+retention releasing the name (also when the blob write fails, keeping shared digests), and
+rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mocked.
+`02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
+(one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
+with one filename. With a real gold-standard session planted for the collection, it checks
+that ingesting a new name leaves the session current and a replacing re-ingest marks it
+stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
+version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
+chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
+0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+`05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
+and checks that only the new text comes back, under both names.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -292,19 +385,24 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
+| `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
+| `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
+| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -328,7 +426,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |

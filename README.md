@@ -116,7 +116,7 @@ A collection is a named vector index that holds chunks from one or more document
 
 ### 2. Ingest documents
 
-Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, or ZIP), choose a collection, and click **Start Ingest**. The page polls for progress automatically.
+Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically.
 
 Supported chunking strategies:
 

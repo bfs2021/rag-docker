@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 import time
+from datetime import datetime
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
@@ -182,6 +183,21 @@ def _delete_collection_sync(name: str) -> int:
 
 async def delete_collection(name: str) -> int:
     return await asyncio.to_thread(_delete_collection_sync, name)
+
+
+def _delete_collection_when_idle_sync(name: str) -> int:
+    # The user's delete only. Import-replace and tuning delete their own target
+    # while their job is registered, through _delete_collection_sync or the
+    # client, and must never be refused by their own registration (#40).
+    return collection_writes.delete_when_idle(name, _delete_collection_sync)
+
+
+async def delete_collection_when_idle(name: str) -> int:
+    """Delete unless a job is active for the collection.
+
+    Raises collection_writes.CollectionInUseError naming the active jobs.
+    """
+    return await asyncio.to_thread(_delete_collection_when_idle_sync, name)
 
 
 def _get_collections_sync() -> list[dict]:
@@ -370,6 +386,74 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
                     and all(_INDEX_NOT_READY in getattr(f, "message", "") for f in failed)):
                 raise
             time.sleep(_INSERT_RETRY_DELAY)
+
+
+def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
+    """Whether the collection holds any chunk stored under this logical name."""
+    coll = get_client().collections.get(collection_name)
+    return bool(telemetry.call("weaviate.query", coll.query.fetch_objects,
+        filters=Filter.by_property("source_file").equal(source_file),
+        limit=1, return_properties=[]).objects)
+
+
+class ReplaceError(RuntimeError):
+    """A name's earlier chunks could not all be removed after its new ones were
+    stored. `deleted` is how many were removed before it stopped."""
+
+    def __init__(self, message: str, deleted: int) -> None:
+        super().__init__(message)
+        self.deleted = deleted
+
+
+# Weaviate removes at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
+# delete_many, so removal repeats; this bounds it at a million chunks per file.
+_REPLACE_DELETE_ROUNDS = 100
+
+
+@collection_writes.serialized("collection_name")
+def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
+                                created_at: datetime, expected: int) -> int:
+    """Remove a name's earlier chunks after its `expected` new ones are stored (#22).
+
+    Called only after the insert has been verified, never before: if the insert
+    fails, the earlier version stays whole; if this fails, the name has
+    duplicates but nothing is lost, and uploading it again repairs it.
+
+    The new chunks all carry the same `created_at`, written by this job. They are
+    told apart by equality with that value rather than by "older than", so the
+    selection depends neither on the precision Weaviate keeps nor on earlier
+    chunks' timestamps (an imported package's can be later than now). Before
+    deleting, the equality filter must match exactly the new chunks; afterwards
+    exactly they must remain. Returns how many earlier chunks were deleted.
+    """
+    coll = get_client().collections.get(collection_name)
+    named = Filter.by_property("source_file").equal(source_file)
+
+    def count(where) -> int:
+        return telemetry.call("weaviate.aggregate", coll.aggregate.over_all, filters=where, total_count=True).total_count or 0
+
+    found = count(named & Filter.by_property("created_at").equal(created_at))
+    if found != expected:
+        raise ReplaceError(f"found {found} of its {expected} new chunks by their timestamp, "
+                           "so none of the earlier ones were removed", 0)
+    earlier = named & Filter.by_property("created_at").not_equal(created_at)
+    deleted = 0
+    for _ in range(_REPLACE_DELETE_ROUNDS):
+        result = telemetry.call("weaviate.delete", coll.data.delete_many, where=earlier)
+        deleted += result.successful or 0
+        if result.failed:
+            raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
+        if not result.matches:
+            break
+    else:
+        raise ReplaceError(f"earlier chunks were still being found after "
+                           f"{_REPLACE_DELETE_ROUNDS} delete rounds", deleted)
+    left = count(named) - expected
+    if left > 0:
+        raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
+    if left < 0:
+        raise ReplaceError(f"{-left} of its {expected} new chunks are missing afterwards", deleted)
+    return deleted
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:

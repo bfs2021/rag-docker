@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import gzip
 import io
+import json
+import zipfile
 import os
 from pathlib import Path
 import sys
@@ -331,7 +333,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(s.end_time > request_ends[s.parent.span_id] for s in self.spans('rag.export')))
 
     async def test_real_json_parser_keeps_parse_span_after_upstream_helpers(self):
-        for suffix in ('.json', '.json.gz'):
+        for suffix in ('.json', '.json.gz', '.jsonl', '.jsonl.gz'):
             for valid in (True, False):
                 with self.subTest(suffix=suffix, valid=valid):
                     self.memory.clear()
@@ -356,7 +358,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
             if path.name.startswith('bad'):
                 raise ValueError(SECRET)
             return SECRET, []
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(ingest,'_parse_file',ot.traced('rag.parse')(parse)), patch.object(ingest,'do_chunk',return_value=[SECRET]), patch.object(wc,'_insert_chunks_sync',side_effect=lambda *a: ot.call('weaviate.batch',lambda: None)), patch.object(ingest.sources,'store'):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(ingest,'_parse_file',ot.traced('rag.parse')(parse)), patch.object(ingest,'do_chunk',return_value=[SECRET]), patch.object(ingest,'_has_chunks',return_value=False), patch.object(wc,'_insert_chunks_sync',side_effect=lambda *a: ot.call('weaviate.batch',lambda: None)), patch.object(ingest.sources,'store'):
             response = await self.client.post('/ingest/upload', data={'collection':'TraceIngest'}, files=[('files',('good.txt',b'data')),('files',('bad.txt',b'data'))])
             self.assertEqual(response.status_code,202,response.text)
             job_id=response.json()['job_id']
@@ -365,6 +367,55 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ingest.get_job(job_id)['status'],'partial')
         self.assertEqual(self.spans('rag.ingest')[0].attributes['rag.outcome'],'partial')
         self.lineage('rag.ingest')
+
+    async def test_replacement_dependency_calls_keep_safe_lineage(self):
+        from datetime import datetime, timezone
+        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=[object()])),
+                  aggregate=NS(over_all=lambda **kw: NS(total_count=1)),
+                  data=NS(delete_many=lambda **kw: NS(successful=0, failed=0, matches=0)))
+        with patch.object(wc, 'get_client', return_value=NS(collections=NS(get=lambda name: coll))), ot.bind((self.runtime, None)), ot.span('rag.ingest') as parent:
+            self.assertTrue(wc._source_has_chunks_sync('TraceReplace', SECRET))
+            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, datetime.now(timezone.utc), 1), 0)
+        for name, count in (('weaviate.query', 1), ('weaviate.aggregate', 2), ('weaviate.delete', 1)):
+            self.assertEqual(len(self.spans(name)), count)
+            self.assertTrue(all(span.parent.span_id == parent.get_span_context().span_id for span in self.spans(name)))
+        self.wire()
+
+    async def test_ingest_callback_persists_failure_with_request_lineage(self):
+        store = ingest.jobstore.JobStore('ingest')
+        store.load()
+        with patch.object(ingest, '_jobs', store), patch.object(wc, 'collection_exists', AsyncMock(return_value=True)), patch.object(ingest, '_process_job_sync', side_effect=RuntimeError(SECRET)):
+            response = await self.client.post('/ingest/upload', data={'collection': 'TraceCallback'}, files={'files': ('one.txt', b'data')})
+            self.assertEqual(response.status_code, 202, response.text)
+            job_id = response.json()['job_id']
+            await self.until(lambda: bool(self.spans('rag.failure_report')))
+            record = json.loads((Path(self.temp.name) / 'jobs' / 'ingest' / (job_id + '.json')).read_text())
+            self.assertEqual((record['status'], record['errors']), ('failed', [SECRET]))
+            self.assertNotIn('trace_id', record)
+        self.lineage('rag.failure_report')
+        self.assertEqual(self.spans('rag.failure_report')[0].attributes['rag.outcome'], 'error')
+
+    async def test_ingest_zip_logical_names_and_deleted_collection_outcomes(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.writestr('nested/one.jsonl', '{"text":"' + SECRET + '"}')
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted):
+                self.memory.clear()
+                with patch.object(wc, 'collection_exists', AsyncMock(return_value=True)), patch.object(ingest, 'do_chunk', return_value=[SECRET]), patch.object(ingest, '_has_chunks', return_value=False, side_effect=ingest._CollectionDeleted('TraceZip') if deleted else None), patch.object(wc, '_insert_chunks_sync') as insert, patch.object(ingest.sources, 'store') as retain:
+                    response = await self.client.post('/ingest/upload', data={'collection': 'TraceZip'}, files={'files': ('input.zip', archive.getvalue())})
+                    self.assertEqual(response.status_code, 202, response.text)
+                    job_id = response.json()['job_id']
+                    await self.until(lambda: bool(self.spans('rag.ingest')))
+                self.assertEqual(ingest.get_job(job_id)['status'], 'failed' if deleted else 'completed')
+                self.assertEqual(self.spans('rag.ingest')[0].attributes['rag.outcome'], 'error' if deleted else 'ok')
+                if deleted:
+                    insert.assert_not_called()
+                else:
+                    self.assertEqual(insert.call_args.args[1][0]['source_file'], 'nested/one.jsonl')
+                    self.assertEqual(retain.call_args.args[1], 'nested/one.jsonl')
+                    self.assertTrue(retain.call_args.kwargs['replace'])
+                self.lineage('rag.ingest')
 
     async def test_import_and_tuning_real_launchers_handled_failure(self):
         with patch.object(importer.packager,'open_package',side_effect=importer.PackageError('INVALID',SECRET)), patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(tuning,'_existing_chunks',side_effect=ValueError(SECRET)):

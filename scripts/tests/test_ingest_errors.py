@@ -1,4 +1,6 @@
-"""Upload unpacking errors and gzipped JSON members (issue #290).
+"""Upload unpacking errors and gzipped JSON members (issue #290); which JSON
+Lines inputs are queued (#291); names logged escaped, the retained media type
+of gzipped files and rechunking a retained .json.gz (#298).
 
 Runs with the API's dependencies, inside the verify project's API container:
 
@@ -7,6 +9,7 @@ Runs with the API's dependencies, inside the verify project's API container:
 Weaviate and source retention are mocked; nothing reaches a backend.
 """
 import asyncio
+import errno
 import gzip
 import io
 import json
@@ -173,6 +176,33 @@ class UploadErrorTests(unittest.TestCase):
         self.assertEqual(body["error"]["detail"], {"file": "long.zip", "members": [
             {"member": name, "reason": "File name too long"}]})
 
+    def test_saving_the_upload_fails_is_a_readable_400(self):
+        # Saving the upload itself, before any unpacking (#298).
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with patch.object(ingest_pipeline, "_save_upload", side_effect=full):
+            status, body = self.post(upload("a.txt", b"text"))
+        self.assert_refused(status, body, "UPLOAD_WRITE_FAILED")
+        self.assertEqual(body["error"]["message"],
+                         "Could not save 'a.txt' on the server: No space left on device.")
+        self.assertEqual(body["error"]["detail"], {"file": "a.txt", "members": []})
+
+    def test_damaged_and_unsupported_members_are_unreadable_with_the_generic_remedy(self):
+        # Damage wins over an unsupported member: the code and remedy are the
+        # generic ones, not the Deflate or password advice (#298).
+        payload = b"z" * 100
+        data = zip_bytes([("a.txt", "text"), ("b.txt", payload)], zipfile.ZIP_STORED)
+        data = bad_crc(patch_header(data, 8, 10, 9), payload)
+        status, body = self.post(upload("mixed.zip", data))
+        self.assert_refused(status, body, "ARCHIVE_UNREADABLE",
+                            "'mixed.zip' is damaged and can't be read, so nothing from it was imported")
+        message = body["error"]["message"]
+        self.assertTrue(message.endswith(". Re-create the zip and upload it again."), message)
+        self.assertNotIn("Deflate", message)
+        self.assertNotIn("password", message)
+        self.assertEqual([(m["member"], m["reason"].split(":")[0])
+                          for m in body["error"]["detail"]["members"]],
+                         [("a.txt", "unsupported compression method 9"), ("b.txt", "damaged")])
+
     def test_unexpected_error_is_a_json_500_with_logged_traceback(self):
         boom = RuntimeError("boom at /internal/path")
         with patch.object(ingest_pipeline, "start_ingest_job", AsyncMock(side_effect=boom)), \
@@ -187,7 +217,7 @@ class UploadErrorTests(unittest.TestCase):
         self.assertIn("'Coll'", record.getMessage())
         self.assertIn("a.txt", record.getMessage())
 
-    def test_json_gz_member_is_queued_and_other_gz_skipped(self):
+    def test_json_gz_and_jsonl_members_are_queued_and_other_gz_skipped(self):
         data = zip_bytes([("docs/a.json", JSON_DOC),
                           ("docs/b.json.gz", gzip.compress(JSON_DOC.encode())),
                           ("docs/c.txt.gz", gzip.compress(b"text")),
@@ -201,22 +231,29 @@ class UploadErrorTests(unittest.TestCase):
         with patch.object(ingest_pipeline, "_process_job_sync", record):
             status, body = self.post(upload("batch.zip", data),
                                      upload("direct.json.gz", gzip.compress(b"{}")),
-                                     upload("direct.jsonl", b"{}\n"))
+                                     upload("other.txt.gz", gzip.compress(b"text")),
+                                     upload("direct.jsonl", b"{}\n"),
+                                     upload("Direct.JSONL.GZ", gzip.compress(b"{}\n")))
         self.assertEqual(status, 202, body)
         self.addCleanup(ingest_pipeline._jobs.pop, body["job_id"], None)
         job = ingest_pipeline.get_job(body["job_id"])
-        self.assertEqual(job["files_total"], 2)
-        jsonl = "(JSON Lines (.jsonl) isn't supported yet, see #291)"
+        self.assertEqual(job["files_total"], 6)
+        # JSON Lines is queued, direct or as a member (#291); a direct .json.gz
+        # and other gzip types are still skipped as unsupported.
         self.assertEqual(sorted(job["skipped"]), sorted([
             "batch.zip:docs/c.txt.gz (unsupported type '.gz')",
-            f"batch.zip:docs/d.jsonl {jsonl}",
-            f"batch.zip:docs/e.JSONL.gz {jsonl}",
             "direct.json.gz (unsupported type '.gz')",
-            f"direct.jsonl {jsonl}"]))
-        paths, labels = started["args"][1], started["args"][-1]
+            "other.txt.gz (unsupported type '.gz')"]))
+        self.assertFalse(any("#291" in s or "JSON Lines" in s for s in job["skipped"]))
+        # The worker's arguments end with labels, then logical names (#22).
+        paths, labels, names = started["args"][1], started["args"][-2], started["args"][-1]
         self.assertTrue(all(p.is_file() for p in paths))
-        self.assertEqual(sorted(labels[p] for p in paths),
-                         ["batch.zip:docs/a.json", "batch.zip:docs/b.json.gz"])
+        self.assertEqual(sorted(labels[p] for p in paths), sorted([
+            "batch.zip:docs/a.json", "batch.zip:docs/b.json.gz", "batch.zip:docs/d.jsonl",
+            "batch.zip:docs/e.JSONL.gz", "direct.jsonl", "Direct.JSONL.GZ"]))
+        self.assertEqual(sorted(names[p] for p in paths), sorted([
+            "docs/a.json", "docs/b.json.gz", "docs/d.jsonl", "docs/e.JSONL.gz",
+            "direct.jsonl", "Direct.JSONL.GZ"]))
 
 
 class JsonGzParseTests(unittest.TestCase):
@@ -293,6 +330,7 @@ class JobErrorTests(unittest.TestCase):
             return real_parse(path)
 
         with patch.object(wc, "_insert_chunks_sync", lambda _c, chunks: stored.extend(chunks)), \
+                patch.object(wc, "_source_has_chunks_sync", return_value=False), \
                 patch.object(ingest_pipeline.sources, "store"), \
                 patch.object(ingest_pipeline, "_parse_file", parse), \
                 self.assertLogs("services.ingest_pipeline", "WARNING") as logs:
@@ -312,6 +350,143 @@ class JobErrorTests(unittest.TestCase):
         self.assertEqual(len(logs.records), 2)
         self.assertTrue(all(r.exc_info for r in logs.records))
         self.assertFalse(tmp.exists())
+
+
+class RechunkJsonGzTests(unittest.TestCase):
+    """Rechunking parses a retained .json.gz as JSON (tuning.py hunk, #290)."""
+
+    def test_retained_json_gz_rechunks_as_json(self):
+        from services import tuning
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        digest = "a" * 64
+        blob = root / digest
+        blob.write_bytes(gzip.compress(JSON_DOC.encode()))
+        index = {"documents": {digest: {"filenames": ["policies.json.gz"]}}}
+        with patch.object(settings, "upload_dir", str(root)), \
+                patch.object(tuning.sources, "load_index", lambda _c: index), \
+                patch.object(tuning.sources, "blob_path", lambda _c, _d: blob), \
+                patch.object(tuning, "_uncovered_source_files", lambda _c, _d: []):
+            out = tuning._chunks_from_sources("Coll", "fixed", 200, 0, 0.85, 0)
+        self.assertTrue(out)
+        self.assertEqual({c["source_type"] for c in out}, {"json"})
+        self.assertEqual({c["source_file"] for c in out}, {"policies.json.gz"})
+        self.assertIn("Remote work needs manager approval.", " ".join(c["content"] for c in out))
+        # The staging folder and the decompressed temporary file are gone.
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [digest])
+
+
+class JobStoreTests(unittest.TestCase):
+    """Runs _process_job_sync over staged files with the backend mocked."""
+
+    def run_job(self, files, parse=None, store=None, has_chunks=False, mark=None):
+        tmp = Path(tempfile.mkdtemp())
+        paths, labels, names = [], {}, {}
+        for i, (name, data) in enumerate(files):
+            slot = tmp / str(i); slot.mkdir()
+            path = slot / Path(name).name
+            path.write_bytes(data)
+            paths.append(path); labels[path] = f"up.zip:{name}"; names[path] = name
+        job_id = "t" + uuid.uuid4().hex[:7]
+        ingest_pipeline._jobs[job_id] = {
+            "job_id": job_id, "status": "queued", "files_total": len(paths), "files_completed": 0,
+            "files_failed": 0, "chunks_stored": 0, "errors": [], "skipped": []}
+        self.addCleanup(ingest_pipeline._jobs.pop, job_id, None)
+        patches = [patch.object(wc, "_insert_chunks_sync", lambda _c, _chunks: None),
+                   patch.object(wc, "_source_has_chunks_sync", return_value=has_chunks),
+                   patch.object(wc, "_delete_earlier_chunks_sync", return_value=0),
+                   patch.object(ingest_pipeline.sources, "store", store or (lambda *a, **k: None))]
+        if parse is not None:
+            patches.append(patch.object(ingest_pipeline, "_parse_file", parse))
+        if mark is not None:
+            patches.append(patch.object(ingest_pipeline, "_mark_replacement_stale", mark))
+        for p in patches:
+            p.start(); self.addCleanup(p.stop)
+        ingest_pipeline._process_job_sync(job_id, paths, tmp, "Coll", "fixed", 200, 0, 0.85, 0,
+                                          labels, names)
+        return ingest_pipeline._jobs[job_id]
+
+
+class MediaTypeTests(JobStoreTests):
+    def test_retained_gzip_files_are_recorded_as_gzip(self):
+        # The retained bytes are gzip, so the index says so (#298).
+        stored = {}
+
+        def store(_collection, name, _data, media_type, replace=False):
+            stored[name] = media_type
+
+        job = self.run_job([("a.json.gz", gzip.compress(JSON_DOC.encode())),
+                            ("b.jsonl.gz", gzip.compress(b'{"k": "v"}\n')),
+                            ("c.json", JSON_DOC.encode()),
+                            ("d.jsonl", b'{"k": "v"}\n')], store=store)
+        self.assertEqual(job["status"], "completed", job["errors"])
+        self.assertEqual(stored, {"a.json.gz": "application/gzip", "b.jsonl.gz": "application/gzip",
+                                  "c.json": "application/json", "d.jsonl": None})
+
+
+class LogEscapingTests(JobStoreTests):
+    """A name holding a newline is logged escaped, so it can't forge a log
+    line (#298)."""
+
+    NAME = "evil\nWARNING forged.txt"
+
+    @staticmethod
+    def text(_path):
+        # Parsed without Unstructured: the file's content doesn't matter here.
+        return "Some text to store.", []
+
+    def assert_escaped(self, records):
+        self.assertTrue(records)
+        for record in records:
+            message = record.getMessage()
+            self.assertNotIn("\n", message)
+            self.assertIn("evil\\nWARNING forged", message)
+
+    def test_refusal_message(self):
+        temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
+        with patch.object(settings, "upload_dir", temp.name), \
+                self.assertLogs("services.ingest_pipeline", "WARNING") as logs:
+            with self.assertRaises(ingest_pipeline.UploadRejected):
+                asyncio.run(ingest_pipeline._admit_ingest_job(
+                    "t" + uuid.uuid4().hex[:7], [upload("evil\nWARNING forged.zip", truncated_zip())],
+                    "Coll", "fixed", 200, 0, 0.85, 0))
+        self.assert_escaped(logs.records)
+
+    def test_failed_file(self):
+        def parse(_path):
+            raise RuntimeError("boom")
+        with self.assertLogs("services.ingest_pipeline", "WARNING") as logs:
+            self.run_job([(self.NAME, b"text")], parse=parse)
+        self.assert_escaped(logs.records)
+
+    def test_stale_mark_failure(self):
+        def mark(*_args):
+            raise ingest_pipeline._StaleMarkFailed("sessions unavailable")
+        with self.assertLogs("services.ingest_pipeline", "WARNING") as logs:
+            job = self.run_job([(self.NAME, b"Some text to store.")], parse=self.text,
+                               has_chunks=True, mark=mark)
+        self.assert_escaped(logs.records)
+        self.assertIn("could not mark gold-standard sessions stale", job["errors"][0])
+
+    def test_failed_retention(self):
+        def store(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with self.assertLogs("services.ingest_pipeline", "ERROR") as logs:
+            job = self.run_job([(self.NAME, b"Some text to store.")], parse=self.text, store=store)
+        self.assert_escaped(logs.records)
+        self.assertEqual(job["status"], "completed", job["errors"])
+
+    def test_unexpected_upload_error(self):
+        boom = RuntimeError("boom")
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(ingest_pipeline, "start_ingest_job", AsyncMock(side_effect=boom)), \
+                self.assertLogs("routers.ingest", "ERROR") as logs:
+            asyncio.run(ingest.ingest_upload(
+                collection="Coll", strategy="fixed", chunk_size="200", chunk_overlap="0",
+                similarity_threshold="0.85", min_chunk_size="0",
+                files=[upload(self.NAME, b"text")]))
+        self.assert_escaped(logs.records)
 
 
 if __name__ == "__main__":

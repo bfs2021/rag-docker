@@ -10,6 +10,12 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
+      # Auto-schema (on by default) made an insert into a deleted collection
+      # recreate it, with inferred properties, no vectorizer and no app
+      # registration (issue #40). Every collection is created explicitly with
+      # the fixed properties, so nothing needs it; an insert into a missing
+      # collection now fails instead.
+      AUTOSCHEMA_ENABLED: 'false'
       # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
       # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
       # the IP recorded in weaviate_data no longer matches after `compose down`
