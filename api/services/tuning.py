@@ -29,9 +29,9 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
 from services import sources
@@ -43,7 +43,8 @@ from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("tune")
 _active: set[str] = set()
 _lock = threading.Lock()
 
@@ -113,11 +114,6 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _emitted_name(digest: str, entry: dict) -> str:
-    """The source_file a rebuild writes for this retained digest's chunks."""
-    return Path((entry.get("filenames") or [digest])[0]).name
-
-
 def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     """Stored source files a rebuild from the retained originals would not reproduce."""
     by_filename: dict[str, list[str]] = {}
@@ -132,8 +128,9 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        digests = by_filename.get(filename, [])
-        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+        # A rebuild emits one chunk set per (digest, name) (#22), so a name is
+        # covered when exactly one digest lists it, whichever of its names it is.
+        if len(by_filename.get(filename, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -182,14 +179,14 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # Re-chunking rebuilds one chunk set per retained digest, under its first
-    # name. A stored name is covered only when exactly one digest lists it, it
-    # is that digest's first name, and its chunks form one set (no repeated
-    # chunk_index). A second name for the same content, a re-upload (whether
-    # its retention succeeded or failed) and a name with no retained original
-    # are refused before staging: replacing from the retained subset would
-    # lose chunks, and a successful cutover discards their recovery copy.
-    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    # Re-chunking rebuilds one chunk set per (digest, name) pair, as ingest
+    # stored it (#22), so a second name for the same content is rebuilt too. A
+    # stored name is covered only when exactly one digest lists it and its
+    # chunks form one set (no repeated chunk_index). A name with more than one
+    # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
+    # sets and a name with no retained original are refused before staging:
+    # replacing from the retained subset would lose chunks, and a successful
+    # cutover discards their recovery copy.
     uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
@@ -203,6 +200,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
+        slots = 0
         for digest, entry in sorted(documents.items()):
             blob = sources.blob_path(collection, digest)
             if not blob.is_file():
@@ -211,32 +209,38 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"Retained source {digest[:12]} is missing from disk, so "
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
-            # Parsers dispatch on the file extension, so the original filename
-            # has to be restored before parsing.
-            staged = work / _emitted_name(digest, entry)
-            shutil.copyfile(blob, staged)
+            for filename in entry["filenames"]:
+                # Parsers dispatch on the file extension, so the original name
+                # has to be restored before parsing; each pair is staged in a
+                # directory of its own, so a/report.txt and b/report.txt can't
+                # collide.
+                slots += 1
+                slot = work / str(slots)
+                slot.mkdir()
+                staged = slot / PurePosixPath(filename).name
+                shutil.copyfile(blob, staged)
 
-            text, elements = _parse_file(staged)
-            chunks = do_chunk(
-                text=text,
-                strategy=strategy,
-                chunk_size=chunk_size,
-                chunk_overlap_size=chunk_overlap,
-                similarity_threshold=similarity_threshold,
-                min_chunk_size=min_chunk_size,
-                elements=elements if strategy == "context_aware" else None,
-            )
-            source_type = source_type_of(staged)
-            out.extend({
-                "content": c,
-                "source_file": staged.name,
-                "source_type": source_type,
-                "chunk_index": i,
-                "chunk_strategy": strategy,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "created_at": now,
-            } for i, c in enumerate(chunks))
+                text, elements = _parse_file(staged)
+                chunks = do_chunk(
+                    text=text,
+                    strategy=strategy,
+                    chunk_size=chunk_size,
+                    chunk_overlap_size=chunk_overlap,
+                    similarity_threshold=similarity_threshold,
+                    min_chunk_size=min_chunk_size,
+                    elements=elements if strategy == "context_aware" else None,
+                )
+                source_type = source_type_of(staged)
+                out.extend({
+                    "content": c,
+                    "source_file": filename,
+                    "source_type": source_type,
+                    "chunk_index": i,
+                    "chunk_strategy": strategy,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
+                    "created_at": now,
+                } for i, c in enumerate(chunks))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -360,6 +364,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the job finish can delete the collection at once (#40).
+        collection_writes.end_job("tune", job_id)
+        job.update(fields)
+
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -424,18 +434,19 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
             notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
                          "gold-standard sessions were left alone")
 
-        job.update(status="completed", chunks_written=written, notes=notes)
+        finish(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
         telemetry.outcome("error", exc)
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
         telemetry.outcome("error", exc)
         _log.exception("Tuning %r on %r failed", operation, collection)
-        job.update(status="failed", error_code="TUNE_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="TUNE_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
     finally:
+        collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
 
@@ -461,5 +472,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, operation, params, source_collection=source_collection))
+    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
+    collection_writes.register_job(collection, "tune", job_id)
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, operation, params, source_collection=source_collection))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
     return job_id

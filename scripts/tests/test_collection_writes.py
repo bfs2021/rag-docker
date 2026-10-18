@@ -225,7 +225,7 @@ class DeletedRecoveryTests(unittest.TestCase):
                 registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
                 with self.subTest(caller=caller, fails=fails), \
                      patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
-                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route.wc, 'delete_collection_when_idle', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
                      patch.object(route, '_registry_lock', asyncio.Lock()), \
                      patch.object(route, '_load_registry', return_value=registry), \
                      patch.object(route, '_save_registry') as save:

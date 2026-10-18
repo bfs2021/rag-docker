@@ -13,11 +13,12 @@ import logging
 import threading
 import uuid
 
-from services import packager
+from services import collection_writes, jobstore, packager
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("export")
 # collection name -> job_id of the export currently running for it
 _active: dict[str, str] = {}
 _lock = threading.Lock()
@@ -40,20 +41,25 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
     def progress(written: int) -> None:
         job["chunks_written"] = written
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the export finish can delete the collection at once (#40).
+        collection_writes.end_job("export", job_id)
+        job.update(fields)
+
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
-        job.update(status="failed", error=f"PackageError: {exc.message}",
-                   error_code=exc.code, error_detail=exc.detail)
+        finish(status="failed", error=f"PackageError: {exc.message}",
+               error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
         telemetry.outcome("error", exc)
         _log.exception("Export of %r failed", collection)
-        job["status"] = "failed"
-        job["error"] = f"{type(exc).__name__}: {exc}"
+        finish(status="failed", error=f"{type(exc).__name__}: {exc}")
     else:
-        job.update(
+        finish(
             status="completed",
             filename=result["filename"],
             size_bytes=result["size_bytes"],
@@ -65,6 +71,7 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
             warnings=result["warnings"],
         )
     finally:
+        collection_writes.end_job("export", job_id)
         with _lock:
             # Only clear the slot if it is still ours.
             if _active.get(collection) == job_id:
@@ -100,8 +107,12 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "error_code": None,
         "error_detail": None,
     }
+    # Lets DELETE /collections refuse while this export reads the collection (#40).
+    collection_writes.register_job(collection, "export", job_id)
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id

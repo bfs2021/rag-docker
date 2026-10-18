@@ -270,6 +270,7 @@ class JsonJobTests(unittest.TestCase):
         self.addCleanup(ingest_pipeline._jobs.pop, job_id, None)
         stored = []
         with patch.object(wc, "_insert_chunks_sync", lambda _c, chunks: stored.extend(chunks)), \
+                patch.object(wc, "_source_has_chunks_sync", return_value=False), \
                 patch.object(ingest_pipeline.sources, "store"):
             ingest_pipeline._process_job_sync(job_id, paths, tmp, "Coll", strategy, 1000, 0, 0.85, 0)
         return ingest_pipeline._jobs[job_id], stored

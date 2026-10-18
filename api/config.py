@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # Reported by /health and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
+    # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP
+    # in one request, gzipped members' output included (#298). A small ZIP of
+    # zeros can otherwise unpack to gigabytes and fill Docker's disk.
+    max_zip_expanded_bytes: int = 2 * 1024 * 1024 * 1024
 
     class Config:
         env_file = ".env"

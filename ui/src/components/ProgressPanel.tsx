@@ -14,6 +14,13 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {(job.chunks_replaced ?? 0) > 0 && (
+        // Re-ingesting a name replaces its chunks (#22), so the total can stay
+        // the same while the content changed.
+        <p className="mt-2 text-xs text-gray-600">
+          Replaced {job.chunks_replaced} chunk{job.chunks_replaced === 1 ? '' : 's'} from a previous version
+        </p>
+      )}
       {job.errors.length > 0 && (
         <ul className="mt-2 text-xs text-red-600 space-y-1">
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
@@ -21,10 +28,11 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
-        // count simply reads lower than what the user uploaded.
+        // count simply reads lower than what the user uploaded. Each entry
+        // says why: an unsupported type, or a later file with the same name.
         <div className="mt-2 text-xs text-amber-700">
           <p className="font-medium">
-            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped — not a supported type:
+            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped:
           </p>
           <ul className="space-y-1 mt-1">
             {job.skipped!.map((f, i) => <li key={i}>{f}</li>)}

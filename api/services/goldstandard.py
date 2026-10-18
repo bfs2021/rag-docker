@@ -18,7 +18,7 @@ from config import settings
 from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
-from services.collection_writes import aliases
+from services.collection_writes import aliases, end_job, register_job
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -802,6 +802,9 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         cancelled = True
         raise
     finally:
+        # Before the status turns terminal: a client that sees generation end
+        # can delete the collection at once (#40).
+        end_job("goldstandard", session_id)
         def finish(current):
             if persistence_failure is not None:
                 _failed_generation(current, persistence_failure)
@@ -839,6 +842,9 @@ def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None
                 "pairs": [],
             }
             session = _store_generated_session(session)
+            # Still inside the guard, so no delete can pass between publication
+            # and registration; DELETE /collections refuses from here (#40).
+            register_job(collection, "goldstandard", session["session_id"])
             return session, all_chunks
     except CollectionBusyError as exc:
         raise GoldStandardError("COLLECTION_BUSY",
@@ -859,12 +865,18 @@ async def start_generation(
         _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
-    task = asyncio.create_task(telemetry.admitted(_run_generation)(session_id, all_chunks))
+    try:
+        task = asyncio.create_task(telemetry.admitted(_run_generation)(session_id, all_chunks))
+    except BaseException:
+        end_job("goldstandard", session_id)
+        raise
     _tasks.add(task)
 
     report_failure = telemetry.admitted(_record_generation_failure)
 
     def _on_task_done(t: asyncio.Task) -> None:
+        # _run_generation ends it first; this covers a task that never ran it.
+        end_job("goldstandard", session_id)
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:

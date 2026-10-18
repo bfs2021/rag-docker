@@ -1108,8 +1108,9 @@ class SourceCoverageTests(unittest.TestCase):
     # (source_file, chunk_index) with None for no chunk_index, and the
     # names the coverage rule must report.
     DROP_CASES = {
-        "second name for the same content": (
-            [("a.txt", b"same"), ("b.txt", b"same")], [("a.txt", 0), ("b.txt", 0)], ["b.txt"]),
+        # Stored before #22 made re-ingesting replace: one name, two versions.
+        "a name with two retained versions": (
+            [("a.txt", b"v1"), ("a.txt", b"v2")], [("a.txt", 0), ("a.txt", 1)], ["a.txt"]),
         "re-upload whose retention failed": (
             [("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1), ("a.txt", 0), ("a.txt", 1)], ["a.txt"]),
         "identical re-upload, retained twice": (
@@ -1166,6 +1167,23 @@ class SourceCoverageTests(unittest.TestCase):
                 self.assertEqual([r["properties"]["source_file"] for r in cols.get("Corpus").rows.values()], ["a.txt"])
 
 
+    def test_second_name_for_the_same_content_is_rebuilt_under_both_names(self):
+        # #22 lifted this refusal: one chunk set per (digest, name), as ingested.
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            self.corpus(cols, [("a.txt", 0), ("docs/b.txt", 0)])
+            with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
+                sources.store("Corpus", "a.txt", b"same original")
+                sources.store("Corpus", "docs/b.txt", b"same original")
+                job = {}
+                with patch.dict(tuning._jobs, {"coverage": job}):
+                    tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                self.assertEqual(job["status"], "completed", job)
+                rows = cols.get("Corpus").rows.values()
+                self.assertEqual(sorted(r["properties"]["source_file"] for r in rows), ["a.txt", "docs/b.txt"])
+                self.assertEqual({r["properties"]["content"] for r in rows}, {"same original"})
+
     def test_tune_options_match_the_refusal(self):
         from routers import tuning as tuning_router
         from services import sources
@@ -1176,13 +1194,16 @@ class SourceCoverageTests(unittest.TestCase):
                    "retained original is missing, so this collection cannot be "
                    "re-chunked. Re-embedding works from the stored chunk text, which "
                    "leaves chunk boundaries unchanged, and re-indexing is available.")
-        second_name = self.DROP_CASES["second name for the same content"]
+        two_versions = self.DROP_CASES["a name with two retained versions"]
         repeated_set = self.DROP_CASES["re-upload whose retention failed"]
         cases = {
             "nothing retained": ([], [("a.txt", 0)], False, chunks_only, False),
             "fully covered": ([("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1)], True,
                               "Every tuning operation is available.", False),
-            "second name for the same content": (second_name[0], second_name[1], False, refused, False),
+            "second name for the same content": ([("a.txt", b"same"), ("b.txt", b"same")],
+                                                  [("a.txt", 0), ("b.txt", 0)], True,
+                                                  "Every tuning operation is available.", False),
+            "a name with two retained versions": (two_versions[0], two_versions[1], False, refused, False),
             "repeated chunk set": (repeated_set[0], repeated_set[1], False, refused, False),
             "retained original missing from disk": ([("a.txt", b"v1")], [("a.txt", 0)], False, refused, True),
         }
