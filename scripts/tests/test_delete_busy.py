@@ -61,6 +61,11 @@ class Backend:
 
 
 class BusyTestCase(unittest.TestCase):
+    def has_chunks(self, collection, source_file):
+        if not self.backend.exists(collection):
+            raise RuntimeError(f"could not find class {collection} in schema")
+        return False
+
     def setUp(self):
         self.addCleanup(writes._active_jobs.clear)
         writes._active_jobs.clear()
@@ -73,6 +78,9 @@ class BusyTestCase(unittest.TestCase):
         self.root = Path(temp.name)
         for change in [
             patch.object(wc, "_collection_exists_sync", side_effect=self.backend.exists),
+            # No name has earlier chunks, so nothing here replaces (#22); a
+            # deleted collection makes the lookup fail, as the backend does.
+            patch.object(wc, "_source_has_chunks_sync", side_effect=self.has_chunks),
             patch.object(wc, "_delete_collection_sync", side_effect=self.backend.delete),
             patch.object(collection_routes, "_load_registry", side_effect=lambda: dict(self.registry)),
             patch.object(collection_routes, "_save_registry", side_effect=self.save_registry),

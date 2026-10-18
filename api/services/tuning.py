@@ -28,7 +28,7 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from services import collection_writes, jobstore
 from config import settings
@@ -112,11 +112,6 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _emitted_name(digest: str, entry: dict) -> str:
-    """The source_file a rebuild writes for this retained digest's chunks."""
-    return Path((entry.get("filenames") or [digest])[0]).name
-
-
 def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     """Stored source files a rebuild from the retained originals would not reproduce."""
     by_filename: dict[str, list[str]] = {}
@@ -131,8 +126,9 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        digests = by_filename.get(filename, [])
-        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+        # A rebuild emits one chunk set per (digest, name) (#22), so a name is
+        # covered when exactly one digest lists it, whichever of its names it is.
+        if len(by_filename.get(filename, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -180,14 +176,14 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # Re-chunking rebuilds one chunk set per retained digest, under its first
-    # name. A stored name is covered only when exactly one digest lists it, it
-    # is that digest's first name, and its chunks form one set (no repeated
-    # chunk_index). A second name for the same content, a re-upload (whether
-    # its retention succeeded or failed) and a name with no retained original
-    # are refused before staging: replacing from the retained subset would
-    # lose chunks, and a successful cutover discards their recovery copy.
-    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    # Re-chunking rebuilds one chunk set per (digest, name) pair, as ingest
+    # stored it (#22), so a second name for the same content is rebuilt too. A
+    # stored name is covered only when exactly one digest lists it and its
+    # chunks form one set (no repeated chunk_index). A name with more than one
+    # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
+    # sets and a name with no retained original are refused before staging:
+    # replacing from the retained subset would lose chunks, and a successful
+    # cutover discards their recovery copy.
     uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
@@ -201,6 +197,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
+        slots = 0
         for digest, entry in sorted(documents.items()):
             blob = sources.blob_path(collection, digest)
             if not blob.is_file():
@@ -209,32 +206,38 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"Retained source {digest[:12]} is missing from disk, so "
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
-            # Parsers dispatch on the file extension, so the original filename
-            # has to be restored before parsing.
-            staged = work / _emitted_name(digest, entry)
-            shutil.copyfile(blob, staged)
+            for filename in entry["filenames"]:
+                # Parsers dispatch on the file extension, so the original name
+                # has to be restored before parsing; each pair is staged in a
+                # directory of its own, so a/report.txt and b/report.txt can't
+                # collide.
+                slots += 1
+                slot = work / str(slots)
+                slot.mkdir()
+                staged = slot / PurePosixPath(filename).name
+                shutil.copyfile(blob, staged)
 
-            text, elements = _parse_file(staged)
-            chunks = do_chunk(
-                text=text,
-                strategy=strategy,
-                chunk_size=chunk_size,
-                chunk_overlap_size=chunk_overlap,
-                similarity_threshold=similarity_threshold,
-                min_chunk_size=min_chunk_size,
-                elements=elements if strategy == "context_aware" else None,
-            )
-            source_type = source_type_of(staged)
-            out.extend({
-                "content": c,
-                "source_file": staged.name,
-                "source_type": source_type,
-                "chunk_index": i,
-                "chunk_strategy": strategy,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "created_at": now,
-            } for i, c in enumerate(chunks))
+                text, elements = _parse_file(staged)
+                chunks = do_chunk(
+                    text=text,
+                    strategy=strategy,
+                    chunk_size=chunk_size,
+                    chunk_overlap_size=chunk_overlap,
+                    similarity_threshold=similarity_threshold,
+                    min_chunk_size=min_chunk_size,
+                    elements=elements if strategy == "context_aware" else None,
+                )
+                source_type = source_type_of(staged)
+                out.extend({
+                    "content": c,
+                    "source_file": filename,
+                    "source_type": source_type,
+                    "chunk_index": i,
+                    "chunk_strategy": strategy,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
+                    "created_at": now,
+                } for i, c in enumerate(chunks))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

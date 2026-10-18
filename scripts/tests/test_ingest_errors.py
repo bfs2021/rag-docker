@@ -213,10 +213,12 @@ class UploadErrorTests(unittest.TestCase):
             f"batch.zip:docs/e.JSONL.gz {jsonl}",
             "direct.json.gz (unsupported type '.gz')",
             f"direct.jsonl {jsonl}"]))
-        paths, labels = started["args"][1], started["args"][-1]
+        # The worker's arguments end with labels, then logical names (#22).
+        paths, labels, names = started["args"][1], started["args"][-2], started["args"][-1]
         self.assertTrue(all(p.is_file() for p in paths))
         self.assertEqual(sorted(labels[p] for p in paths),
                          ["batch.zip:docs/a.json", "batch.zip:docs/b.json.gz"])
+        self.assertEqual(sorted(names[p] for p in paths), ["docs/a.json", "docs/b.json.gz"])
 
 
 class JsonGzParseTests(unittest.TestCase):
@@ -293,6 +295,7 @@ class JobErrorTests(unittest.TestCase):
             return real_parse(path)
 
         with patch.object(wc, "_insert_chunks_sync", lambda _c, chunks: stored.extend(chunks)), \
+                patch.object(wc, "_source_has_chunks_sync", return_value=False), \
                 patch.object(ingest_pipeline.sources, "store"), \
                 patch.object(ingest_pipeline, "_parse_file", parse), \
                 self.assertLogs("services.ingest_pipeline", "WARNING") as logs:

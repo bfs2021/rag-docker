@@ -209,6 +209,117 @@ import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if any('broken.pdf' in e for e in d['errors']) else 1)"
 check "the failure names the offending file" $?
 
+# ── re-ingesting a name replaces its chunks (#22) ────────────────────────────
+# Re-ingesting used to add a second chunk set beside the first, so answers could
+# cite a superseded version; ZIP members were named by basename, so a/report.txt
+# and b/report.txt merged. Controlled cases: same-name inputs in one upload,
+# ZIP path normalisation, insert-before-delete, stale marking, retention and
+# rechunk coverage.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_reingest.py)
+check "re-ingest: same-name inputs, replacement order, retention and rechunk regressions" $?
+
+RI="${PREFIX}Reingest"
+RIFIX=$(mktemp -d)
+python3 - "$FIX/policies.txt" "$RIFIX" <<'ENDPY'
+import pathlib, sys, zipfile
+v1, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+(out / "v2").mkdir()
+(out / "v2" / "policies.txt").write_text(
+    "Parking Permits. Facilities issue parking permits each January, and a permit "
+    "is valid for one named vehicle only.\n\n"
+    "Visitor Badges. Reception prints a visitor badge on arrival, and badges are "
+    "returned at the end of the day.\n")
+with zipfile.ZipFile(out / "folders.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.txt", "Alpha report. The cafeteria opens at seven every weekday.")
+    z.writestr("b/report.txt", "Beta report. The library closes at nine on Fridays.")
+assert "Travel Booking" in v1.read_text()
+ENDPY
+# What the collection holds: (source_file, content) pairs, and the retained index.
+ri_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$RI") <<'ENDPY'
+import json, sys
+from services import sources, weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    chunks = sorted([o.properties["source_file"], o.properties["content"]] for o in coll.iterator())
+    d = sources.collection_dir(sys.argv[1])
+    blobs = sorted(p.name for p in d.iterdir() if p.name != "index.json") if d.is_dir() else []
+    print(json.dumps({"chunks": chunks, "index": sources.load_index(sys.argv[1])["documents"],
+                      "blobs": blobs}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$RI"; make_collection "$RI"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+n1=$(jfield "['chunks_stored']" < /tmp/vfy_job.json)
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_again.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" <<'ENDPY'
+import json, sys
+n1 = int(sys.argv[1]); job = json.load(open('/tmp/vfy_ri_again.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+print(job["status"], job.get("chunks_replaced"), len(st["chunks"]), n1)
+sys.exit(0 if n1 > 0 and job["status"] == "completed" and job.get("chunks_replaced") == n1
+         and len(st["chunks"]) == n1 else 1)
+ENDPY
+check "ingesting the same file twice keeps one chunk set and reports chunks_replaced" $? \
+  "$(cat /tmp/vfy_ri_again.json | head -c 300)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/v2/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_v2.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+n1 = int(sys.argv[1]); v2 = hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+job = json.load(open('/tmp/vfy_ri_v2.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for _, c in st["chunks"])
+checks = {
+    "completed": job["status"] == "completed",
+    "replaced all of v1": job.get("chunks_replaced") == n1,
+    "holds only v2's chunks": len(st["chunks"]) == job["chunks_stored"],
+    "v1 text gone": "Travel Booking" not in texts,
+    "v2 text present": "Parking Permits" in texts,
+    "one digest names it": [d for d, e in st["index"].items() if "policies.txt" in e["filenames"]] == [v2],
+    "v1 blob gone": st["blobs"] == [v2],
+}
+print({k: v for k, v in checks.items() if not v} or "ok")
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a modified file replaces its chunks and its retained original" $? "$(head -c 300 /tmp/vfy_ri_v2.json)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/folders.zip"
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+ok = ("Alpha report" in names.get("a/report.txt", "")
+      and "Beta report" in names.get("b/report.txt", "") and "report.txt" not in names)
+print(sorted(names))
+sys.exit(0 if ok else 1)
+ENDPY
+check "ZIP members with one basename in two folders stay two documents, named by path" $?
+
+# Two parts with one filename: the second's bytes are stored, the first reported.
+ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_dupe.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_dupe.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for n, c in st["chunks"] if n == "dupe.txt")
+ok = (job["files_total"] == 1 and job["skipped"] == [
+          "dupe.txt (replaced by dupe.txt later in this upload, same name 'dupe.txt')"]
+      and "Parking Permits" in texts and "Travel Booking" not in texts)
+print(job["files_total"], job["skipped"])
+sys.exit(0 if ok else 1)
+ENDPY
+check "the same name twice in one upload ingests the last and reports the first" $? \
+  "$(head -c 300 /tmp/vfy_ri_dupe.json)"
+drop_collection "$RI"
+rm -rf "$RIFIX"
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
