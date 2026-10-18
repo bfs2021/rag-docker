@@ -18,7 +18,7 @@ from typing import Any
 from services import collection_writes
 from config import settings
 from models.schemas import IngestConfig
-from services.chunker import chunk as do_chunk
+from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
 
@@ -104,24 +104,54 @@ class _JsonError(ValueError):
         self.detail = detail
 
 
-class _JsonNumber(str):
-    """A JSON number kept as written in the file, so 1.50 stays 1.50."""
+class _JsonTooLarge(_JsonError):
+    """Valid JSON whose converted text would be over the per-file text limit."""
+
+    def __init__(self) -> None:
+        detail = (f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
+                  f"the per-file limit for every chunking strategy; split the file")
+        ValueError.__init__(self, detail)
+        self.detail = detail
+
+
+# The most text one JSON file may convert to (#295 review). Each line repeats its
+# full key path, so a small file with a long key over many values could otherwise
+# expand to gigabytes. This is the chunker's own per-file limit: a file whose
+# records hold more text than this is refused by every chunking strategy anyway,
+# so the bound refuses nothing that could have been ingested; it only refuses
+# before the text is built.
+MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
+
+
+class _JsonNumber:
+    """A JSON number kept as written in the file, so 1.50 stays 1.50. Not a str,
+    so element-shape checks see a number, as partition_json does."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
 
 
 def _reject_constant(name: str) -> Any:
     raise _JsonError(f"{name} is not a JSON value")
 
 
-def _read_json(path: Path) -> tuple[bool, Any]:
-    """The file's JSON value, or (False, None) for an empty file."""
+def _read_json(path: Path) -> tuple[str, Any]:
+    """The file's text without a byte-order mark, and its JSON value; the value is
+    None for an empty file (and for JSON `null`, which the text tells apart)."""
     try:
-        raw = path.read_text(encoding="utf-8")
+        # utf-8-sig: a leading byte-order mark, as some Windows tools write, is dropped.
+        raw = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise _JsonError(f"it is not UTF-8 text ({exc.reason} at byte {exc.start})") from exc
     if not raw.strip():
-        return False, None
+        return "", None
     try:
-        return True, json.loads(raw, parse_int=_JsonNumber, parse_float=_JsonNumber,
+        return raw, json.loads(raw, parse_int=_JsonNumber, parse_float=_JsonNumber,
                                 parse_constant=_reject_constant)
     except json.JSONDecodeError as exc:
         raise _JsonError(f"{exc.msg} at line {exc.lineno}, column {exc.colno}") from exc
@@ -143,40 +173,79 @@ def _json_scalar(value: Any) -> str:
     return str(value)
 
 
-def _json_lines(value: Any, path: str, out: list[str]) -> None:
+class _JsonBudget:
+    """Characters of converted text left for this file."""
+
+    def __init__(self) -> None:
+        self.left = MAX_JSON_TEXT_CHARACTERS
+
+    def spend(self, characters: int) -> None:
+        self.left -= characters
+        if self.left < 0:
+            raise _JsonTooLarge()
+
+
+# A key path is a chain of (parent, segment, length) links, written out only for a
+# line that fits the budget, so no path longer than the text it produces is built.
+def _path_child(path: Any, segment: str) -> Any:
+    return (path, segment, len(segment) + (path[2] if path else 0))
+
+
+def _path_text(path: Any) -> str:
+    parts = []
+    while path is not None:
+        parts.append(path[1])
+        path = path[0]
+    return "".join(reversed(parts))
+
+
+def _json_line(path: Any, text: str, out: list[str], budget: _JsonBudget) -> None:
+    # A newline joins this line to the one before it in the record.
+    budget.spend((path[2] + 2 if path else 0) + len(text) + (1 if out else 0))
+    out.append(f"{_path_text(path)}: {text}" if path else text)
+
+
+def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> None:
     """Append `path: value` lines for value: dotted keys, indexed arrays (#295)."""
     if isinstance(value, dict):
         for key, item in value.items():
-            _json_lines(item, f"{path}.{key}" if path else key, out)
+            _json_lines(item, _path_child(path, f".{key}" if path else key), out, budget)
     elif isinstance(value, list):
         if not value:
             return
         if all(_is_json_scalar(item) for item in value):
-            text = ", ".join(_json_scalar(item) for item in value)
-            out.append(f"{path}: {text}" if path else text)
+            items = [_json_scalar(item) for item in value]
+            # Checked before joining, so an over-long line is never built.
+            if sum(len(item) for item in items) + 2 * (len(items) - 1) > budget.left:
+                raise _JsonTooLarge()
+            _json_line(path, ", ".join(items), out, budget)
         else:
             for i, item in enumerate(value):
-                _json_lines(item, f"{path}[{i}]", out)
+                _json_lines(item, _path_child(path, f"[{i}]"), out, budget)
     else:
-        text = _json_scalar(value)
-        out.append(f"{path}: {text}" if path else text)
+        _json_line(path, _json_scalar(value), out, budget)
 
 
 def _json_records(value: Any) -> list[str]:
     """Ordinary JSON as readable text: one record per item of a top-level array
-    holding objects or arrays, otherwise one record. Records with no text are dropped."""
+    that holds any object or array, otherwise one record. Records with no text
+    are dropped."""
     if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
         groups = value
     else:
         groups = [value]
     records = []
+    budget = _JsonBudget()
     try:
         for group in groups:
             lines: list[str] = []
-            _json_lines(group, "", lines)
+            left = budget.left
+            _json_lines(group, None, lines, budget)
             text = "\n".join(lines)
             if text.strip():
                 records.append(text)
+            else:
+                budget.left = left  # a dropped record's text is not stored
     except RecursionError as exc:
         raise _JsonError("it is nested too deeply to read") from exc
     return records
@@ -185,13 +254,14 @@ def _json_records(value: Any) -> list[str]:
 def _parse_json(path: Path) -> tuple[str, list[Any]]:
     """Ordinary JSON becomes `key: value` text, one element per record. A file of
     serialized Unstructured elements is rehydrated by partition_json (#295)."""
-    has_value, value = _read_json(path)
-    if not has_value:
+    raw, value = _read_json(path)
+    if not raw:
         return "", []
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
         from unstructured.partition.json import partition_json
-        elements = partition_json(filename=str(path))
+        # The text already read, so a byte-order mark is handled the same way.
+        elements = partition_json(text=raw)
         return "\n".join(str(el) for el in elements), elements
     from unstructured.documents.elements import Text
     records = _json_records(value)
@@ -207,6 +277,8 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         _gunzip_bounded(path, plain)
         try:
             return _parse_json(plain)
+        except _JsonTooLarge as exc:
+            raise ValueError(f"was decompressed, but it {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
                 f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc

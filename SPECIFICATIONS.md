@@ -488,7 +488,10 @@ On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
 `.json.gz` member can fail with: not a valid gzip file (truncated or corrupt);
 decompressing to more than 512 MB; or JSON that can't be parsed after decompression. A `.json` file
-that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column.
+that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column; one whose
+converted text would exceed 10,000,000 characters fails with `converts to more than 10,000,000 characters of
+text, the per-file limit for every chunking strategy; split the file` (a `.json.gz` member: `was decompressed,
+but it converts to more than …`).
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -1353,7 +1356,7 @@ Flat (KNN) index has no tunable parameters.
 | Plain text | `.txt` | Unstructured (`partition_text`) | UTF-8 encoding assumed |
 | Markdown | `.md` | Unstructured (`partition_md`) | Heading structure preserved |
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
-| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array of objects or arrays gives one element per item, separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text) fails that file with "is not valid JSON: <reason>". A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
+| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 
 For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. JSON Lines (`.jsonl`, `.jsonl.gz`) is skipped with its own reason (#291). Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
 
@@ -1948,11 +1951,16 @@ now lives once, in `api/services/ingest_config.py`.
       the resolved 0.27.5 `partition_json` accepted any JSON but stored it
       pretty-printed with sorted keys and escaped non-ASCII text (`"Zo\u00eb"`),
       unlike §5.1. **Fixed**: the API converts ordinary JSON itself (§5.1).
-      `test_json_ingest.py` (27 cases in the API image) covers each conversion rule,
-      element-schema rehydration, empty files and invalid-JSON errors for `.json` and
-      `.json.gz`; `02_ingest.sh` ingests a nested `plain.json` through the proxy and
-      reads back `meta.author: Zoë Müller` with no JSON syntax. Full verification run
-      2026-10-17: all seven suites passed (9m31s).*
+      `test_json_ingest.py` (36 cases in the API image) covers each conversion rule,
+      element-schema rehydration, a byte-order mark, empty files and invalid-JSON errors
+      for `.json` and `.json.gz`. The PR #299 review found that repeated key paths let a
+      512 KB file (a 256 KB key over 65,536 values) expand to about 17 GB of text: the
+      converted text is now bounded by the chunker's 10,000,000-character per-file limit,
+      which every strategy already enforced, so nothing that could be stored is refused.
+      That 524,295-byte file now fails in 0.2 s with a 21.7 MB traced peak, and a file
+      converting to 9,999,999 characters still converts and chunks; `02_ingest.sh` ingests a nested `plain.json` through the proxy and
+      reads back `meta.author: Zoë Müller` with no JSON syntax. Full verification runs
+      2026-10-17: all seven suites passed (9m31s; after the review fixes, 9m36s).*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`

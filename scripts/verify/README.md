@@ -198,8 +198,10 @@ in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
 non-ASCII text and numbers as written, one element per top-level record, empty values and
-files giving no chunks, element-schema files still rehydrated, and readable errors for
-invalid JSON in `.json` files and `.json.gz` members. `02_ingest.sh` runs it in the API
+files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
+converted text bounded by the chunker's per-file limit (a long key over many values fails
+fast with bounded memory), and readable errors for invalid JSON in `.json` files and
+`.json.gz` members. `02_ingest.sh` runs it in the API
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
 back to confirm they hold that text.
 
