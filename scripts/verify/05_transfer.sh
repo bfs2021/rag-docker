@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E31)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E32)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -766,6 +766,51 @@ check_eq "re-chunk completes" "$tstatus" "completed"
 after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
 [ "$after_chunks" -gt "$chunks_before" ]
 check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
+
+# ── re-chunking after a replacement (#22, E17, E32) ──────────────────────────
+# Re-ingesting replaces a name's chunks and retained original, so a rebuild
+# brings back only the new version; a second name for the same content is
+# rebuilt under both names (one chunk set per digest and name).
+RC="${PREFIX}Rechunk"
+RCFIX=$(mktemp -d)
+printf '%s\n\n%s\n' \
+  "Parking Permits. Facilities issue parking permits each January, and a permit is valid for one named vehicle only." \
+  "Visitor Badges. Reception prints a visitor badge on arrival, and badges are returned at the end of the day." \
+  > "$RCFIX/policies.txt"
+cp "$RCFIX/policies.txt" "$RCFIX/copy.txt"
+drop_collection "$RC"; make_collection "$RC"
+for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RC" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$f" > /tmp/vfy_rc.json
+  rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
+  wait_for_job "/ingest/job/$rjob" 900 >/dev/null
+done
+check_eq "E32: re-chunking is offered after a replacement and a second name" \
+  "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
+api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "E32: the re-chunk completes" "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") > /tmp/vfy_rc_chunks.json <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps([[o.properties["source_file"], o.properties["content"]] for o in coll.iterator()]))
+finally:
+    wc.close_client()
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+chunks = json.load(open('/tmp/vfy_rc_chunks.json'))
+texts = " ".join(c for _, c in chunks)
+names = {n for n, _ in chunks}
+print(sorted(names), "Travel Booking" in texts)
+sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in texts
+         and "Parking Permits" in texts else 1)
+ENDPY
+check "E32: the rebuild holds only the new version, under both of its names" $?
+drop_collection "$RC"
+rm -rf "$RCFIX"
 
 # ── chunks-only refuses re-chunking ──────────────────────────────────────────
 SRCLESS="${PREFIX}Chunksonly"

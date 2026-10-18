@@ -6,13 +6,14 @@ import json
 import logging
 import mimetypes
 import os
+import posixpath
 import shutil
 import tempfile
 import uuid
 import zipfile
 import zlib
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from services import collection_writes, jobstore
@@ -348,6 +349,68 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
+def _has_chunks(collection: str, name: str) -> bool:
+    """Whether the name already has chunks, which this file will replace (#22).
+    It is the job's first backend call for a file, so a deleted collection is
+    reported here the way _store_chunks reports it (#40)."""
+    try:
+        return wc._source_has_chunks_sync(collection, name)
+    except Exception as exc:
+        if _collection_gone(collection):
+            _log.warning("Collection %r disappeared before storing chunks: %s",
+                         collection, exc, exc_info=True)
+            raise _CollectionDeleted(collection) from exc
+        raise
+
+
+class _StaleMarkFailed(Exception):
+    """Gold-standard sessions could not be marked stale before a replacement."""
+
+
+# How many replaced names a stale reason lists before "and N more".
+_MAX_NAMED_FILES = 10
+
+
+def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None:
+    """Mark the collection's gold-standard sessions stale before `name` replaces
+    its earlier chunks (#22). Their pairs cite chunks by source_file and
+    chunk_index, which the replacement changes, so they would no longer describe
+    what is stored. Saved before anything is stored: if it can't be saved, the
+    file fails and the collection is left as it was.
+
+    The reason names this file and the job's later files that also have earlier
+    chunks, because a job marks at most once.
+    """
+    try:
+        names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
+        listed = ", ".join(names[:_MAX_NAMED_FILES])
+        if len(names) > _MAX_NAMED_FILES:
+            listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+        # Imported here: goldstandard imports weaviate_client, as tuning notes.
+        from services import goldstandard
+        goldstandard.mark_stale(
+            collection, f"documents were re-ingested, replacing their earlier chunks: {listed}",
+            require_durable=True)
+    except Exception as exc:
+        raise _StaleMarkFailed(str(exc) or type(exc).__name__) from exc
+
+
+def _remove_earlier(collection: str, name: str, created_at: datetime,
+                    expected: int) -> tuple[int, str | None]:
+    """Remove a name's earlier chunks once its new ones are stored.
+
+    Returns how many were removed and, when not all of them could be, why. A
+    failure here never undoes the insert: duplicates are recoverable by uploading
+    again, lost chunks are not.
+    """
+    try:
+        return wc._delete_earlier_chunks_sync(collection, name, created_at, expected), None
+    except Exception as exc:
+        _log.error("Could not remove the earlier chunks of %r in %r", name, collection,
+                   exc_info=True)
+        return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
+
+
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -360,13 +423,21 @@ def _process_job_sync(
     similarity_threshold: float,
     min_chunk_size: int,
     labels: dict[Path, str] | None = None,
+    names: dict[Path, str] | None = None,
 ) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     deleted = False
+    # Logical names (#22): what each file is stored and replaced under.
+    names = names or {}
+    logical = [names.get(p, p.name) for p in file_paths]
+    # Gold-standard sessions are marked stale at most once per job.
+    marked = False
 
     try:
         for index, path in enumerate(file_paths):
+            name = logical[index]
+            label = (labels or {}).get(path, name)
             try:
                 text, elements = _parse_file(path)
                 source_type = source_type_of(path)
@@ -381,11 +452,12 @@ def _process_job_sync(
                     elements=elements if strategy == "context_aware" else None,
                 )
 
-                now = datetime.now(timezone.utc).isoformat()
+                created = datetime.now(timezone.utc)
+                now = created.isoformat()
                 weaviate_chunks = [
                     {
                         "content": c,
-                        "source_file": path.name,
+                        "source_file": name,
                         "source_type": source_type,
                         "chunk_index": i,
                         "chunk_strategy": strategy,
@@ -396,35 +468,61 @@ def _process_job_sync(
                     for i, c in enumerate(chunks)
                 ]
 
+                # The last ingest of a name wins (#22). Everything before the
+                # insert only reads, so a failure up to there changes nothing.
+                replacing = _has_chunks(collection, name)
+                if replacing and not marked:
+                    _mark_replacement_stale(collection, name, logical[index + 1:])
+                    marked = True
+
+                # Insert first, then remove the earlier chunks, never the other
+                # way round: a failed insert leaves the earlier version whole.
                 _store_chunks(collection, weaviate_chunks)
+                removed, problem = 0, None
+                if replacing:
+                    removed, problem = _remove_earlier(collection, name, created, len(chunks))
+                    job["chunks_replaced"] = job.get("chunks_replaced", 0) + removed
 
                 # Retain the original only after the file has been parsed,
                 # chunked and stored. A file that fails any of those steps
-                # leaves no orphan source behind.
+                # leaves no orphan source behind. replace=True releases the name
+                # from the version it replaces, so rechunk can't rebuild that.
                 try:
                     sources.store(
                         collection,
-                        path.name,
+                        name,
                         path.read_bytes(),
-                        mimetypes.guess_type(path.name)[0],
+                        mimetypes.guess_type(name)[0],
+                        replace=True,
                     )
                 except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
-                    _log.error("Could not retain source %s for %r: %s", path.name, collection, exc)
+                    _log.error("Could not retain source %s for %r: %s", name, collection, exc)
 
                 job["chunks_stored"] += len(chunks)
-                job["files_completed"] += 1
+                if problem is None:
+                    job["files_completed"] += 1
+                else:
+                    job["files_failed"] += 1
+                    job["errors"].append(
+                        f"{label}: its new chunks were stored, but earlier chunks could not "
+                        f"all be removed ({problem}); upload it again to retry")
             except _CollectionDeleted:
                 # Nothing more can be stored: this file and the rest fail.
                 job["files_failed"] += len(file_paths) - index
                 deleted = True
                 break
+            except _StaleMarkFailed as exc:
+                job["files_failed"] += 1
+                job["errors"].append(
+                    f"{label}: could not mark gold-standard sessions stale before replacing "
+                    f"its chunks, so nothing was changed: {exc}")
+                _log.warning("ingest job %s: %s not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
-                label = (labels or {}).get(path, path.name)
                 job["files_failed"] += 1
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
                 _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
@@ -481,9 +579,48 @@ def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo) -> tuple[str, b
     return None
 
 
-def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Path],
-                 skipped: list[str], labels: dict[Path, str]) -> None:
-    """Validate one uploaded ZIP, then extract its supported members into tmp_dir.
+class _Queue:
+    """The files an upload queues, one per logical name (#22).
+
+    Every input is staged in a directory of its own, so no upload or ZIP member
+    can overwrite another's bytes on disk, and the parser still sees the file's
+    own extension. When a later input has the same logical name, the earlier one
+    is dropped and reported in `skipped`: the last one wins, never silently.
+    """
+
+    def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
+        self.tmp_dir = tmp_dir
+        self.skipped = skipped
+        self.entries: dict[str, tuple[Path, str]] = {}
+        self._slots = 0
+
+    def slot(self, basename: str) -> Path:
+        self._slots += 1
+        directory = self.tmp_dir / str(self._slots)
+        directory.mkdir()
+        return directory / basename
+
+    def add(self, path: Path, logical: str, label: str) -> None:
+        earlier = self.entries.pop(logical, None)
+        if earlier is not None:
+            earlier[0].unlink(missing_ok=True)
+            self.skipped.append(
+                f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")
+        self.entries[logical] = (path, label)
+
+
+def _member_name(filename: str) -> str | None:
+    """A ZIP member's logical name: its normalised POSIX path inside the archive
+    (#22), so a/report.pdf and b/report.pdf stay two documents and a/../b.txt is
+    b.txt. None for a path that leaves the archive, which is not ingested."""
+    name = posixpath.normpath(filename)
+    if name.startswith("/") or name in (".", "..") or name.startswith("../"):
+        return None
+    return name
+
+
+def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
+    """Validate one uploaded ZIP, then queue its supported members.
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
@@ -500,16 +637,15 @@ def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Pat
             f"{remedy}",
             safe_name) from exc
 
-    resolved_tmp = tmp_dir.resolve()
     with archive as z:
         members = []
         for member in z.infolist():
             if member.is_dir():
                 continue
-            member_path = (tmp_dir / member.filename).resolve()
-            if not member_path.is_relative_to(resolved_tmp):
+            logical = _member_name(member.filename)
+            if logical is None:
                 continue
-            members.append((member, member_path))
+            members.append((member, logical))
 
         problems = []
         for member, _ in members:
@@ -536,13 +672,20 @@ def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Pat
                 safe_name,
                 [{"member": name, "reason": reason} for name, reason, _ in problems])
 
-        for member, member_path in members:
-            if not (member_path.suffix.lower() in SUPPORTED_EXTENSIONS
-                    or _is_json_gz(member_path.name)):
-                skipped.append(f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
+        for member, logical in members:
+            basename = PurePosixPath(logical).name
+            if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
+                    or _is_json_gz(basename)):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
                 continue
+            # Copied out by our own code, not ZipFile.extract, whose own path
+            # cleaning would put a/../b.txt somewhere other than where it is
+            # queued.
             try:
-                z.extract(member, tmp_dir)
+                target = queue.slot(basename)
+                with z.open(member) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
             except OSError as exc:
                 reason = _os_reason(exc)
                 raise _rejected(
@@ -550,8 +693,7 @@ def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Pat
                     f"Could not extract '{member.filename}' from '{safe_name}' on the "
                     f"server: {reason}.",
                     safe_name, [{"member": member.filename, "reason": reason}]) from exc
-            file_paths.append(member_path)
-            labels[member_path] = f"{safe_name}:{member.filename}"
+            queue.add(target, logical, f"{safe_name}:{member.filename}")
 
 
 async def start_ingest_job(
@@ -587,13 +729,11 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
-    file_paths: list[Path] = []
-    # Files the caller sent that this build cannot parse. Dropping them without
-    # a word makes a ZIP of 8 files silently report 6, with nothing saying which
-    # two were ignored or why.
+    # Files the caller sent that this build cannot parse, and inputs replaced by
+    # a later one with the same name. Dropping them without a word makes a ZIP
+    # of 8 files silently report 6, with nothing saying which two or why.
     skipped: list[str] = []
-    # How each queued file is named in the job's errors.
-    labels: dict[Path, str] = {}
+    queue = _Queue(tmp_dir, skipped)
 
     try:
         for upload in files:
@@ -601,7 +741,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             safe_name = Path(raw_name).name
             if not safe_name:
                 continue
-            dest = tmp_dir / safe_name
+            dest = queue.slot(safe_name)
             # Copy in blocks rather than `await upload.read()`, which held the
             # whole file in memory. Uploads can now reach 512 MB (issue #21),
             # and this container already runs close to its memory budget. The
@@ -615,16 +755,21 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                     safe_name) from exc
 
             if safe_name.lower().endswith(".zip"):
-                _extract_zip(dest, safe_name, tmp_dir, file_paths, skipped, labels)
+                _extract_zip(dest, safe_name, queue)
                 os.remove(dest)
             elif Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS:
-                file_paths.append(dest)
-                labels[dest] = safe_name
+                queue.add(dest, safe_name, safe_name)
             else:
                 skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
+
+    # One file per logical name, in the order of each winning input. How each
+    # is named in the job's errors, and what it is stored under.
+    file_paths = [path for path, _ in queue.entries.values()]
+    labels = {path: label for path, label in queue.entries.values()}
+    names = {path: logical for logical, (path, _) in queue.entries.items()}
 
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -640,6 +785,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         "files_completed": 0,
         "files_failed": 0,
         "chunks_stored": 0,
+        # Earlier chunks of the same names removed by this job (#22).
+        "chunks_replaced": 0,
         "errors": [],
         "skipped": skipped,
     }
@@ -673,6 +820,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         similarity_threshold,
         min_chunk_size,
         labels,
+        names,
     )
     future.add_done_callback(_on_done)
 

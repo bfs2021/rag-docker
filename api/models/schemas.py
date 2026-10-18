@@ -97,8 +97,12 @@ class JobStatusResponse(BaseModel):
     chunks_stored: int
     errors: list[str]
     # Files the caller sent that could not be parsed at all; they never
-    # became part of files_total, so without this they vanish silently.
+    # became part of files_total, so without this they vanish silently. Also
+    # inputs replaced by a later one with the same name in the upload (#22).
     skipped: list[str] = []
+    # Earlier chunks of the same names that this job removed (#22). Records
+    # written before the field existed read back as 0.
+    chunks_replaced: int = 0
 
 
 class IngestConfig(BaseModel):

@@ -128,7 +128,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();return 'Owned later upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
             reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
             def start_ingest():
@@ -147,7 +147,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
             upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
             self.assertTrue(parsed.wait(2))

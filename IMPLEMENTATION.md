@@ -792,8 +792,12 @@ class JobStatusResponse(BaseModel):
     chunks_stored: int
     errors: list[str]
     # Files the caller sent that could not be parsed at all; they never
-    # became part of files_total, so without this they vanish silently.
+    # became part of files_total, so without this they vanish silently. Also
+    # inputs replaced by a later one with the same name in the upload (#22).
     skipped: list[str] = []
+    # Earlier chunks of the same names that this job removed (#22). Records
+    # written before the field existed read back as 0.
+    chunks_replaced: int = 0
 
 
 class IngestConfig(BaseModel):
@@ -1247,6 +1251,10 @@ are copied here instead.
 Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
 re-ingesting the same document stores one copy and records the extra logical
 name. Storage is proportional to the corpus rather than to upload count.
+
+A logical name belongs to one digest at a time (#22): ingest stores with
+replace=True, so a name ingested with new content leaves the digest it had, and a
+digest left with no names is removed with its blob.
 """
 from __future__ import annotations
 
@@ -1352,19 +1360,52 @@ def restore_package(package: Path, collection: str) -> None:
     shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
 
 
-def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
-    """Retain one accepted upload. Returns its sha256."""
+def _drop_blobs(collection: str, digests: list[str]) -> None:
+    """Delete blobs the index no longer lists. Called after the index is saved,
+    so it never names a missing blob; a blob left behind is only unused space."""
+    for digest in digests:
+        try:
+            blob_path(collection, digest).unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            log.error("Could not delete unreferenced source %s of %r: %s",
+                      digest[:12], collection, exc)
+
+
+def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
+          *, replace: bool = False) -> str:
+    """Retain one accepted upload. Returns its sha256.
+
+    With replace=True (ingest, #22) the filename is first released from every
+    other digest, and digests left with no names are dropped. That happens even
+    when writing the new blob fails, so the name never keeps claiming the
+    version it replaced, which a rechunk would otherwise rebuild.
+    """
     digest = hashlib.sha256(data).hexdigest()
     target = collection_dir(collection) / digest
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    if not target.exists():
-        tmp = target.with_name(digest + ".tmp")
-        tmp.write_bytes(data)
-        tmp.replace(target)
+    index = load_index(collection)
+    orphans: list[str] = []
+    if replace:
+        for other, entry in list(index["documents"].items()):
+            if other != digest and filename in entry["filenames"]:
+                entry["filenames"] = [n for n in entry["filenames"] if n != filename]
+                if not entry["filenames"]:
+                    del index["documents"][other]
+                    orphans.append(other)
+
+    try:
+        if not target.exists():
+            tmp = target.with_name(digest + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(target)
+    except BaseException:
+        if replace:
+            _save_index(collection, index)
+            _drop_blobs(collection, orphans)
+        raise
 
     now = datetime.now(timezone.utc).isoformat()
-    index = load_index(collection)
     entry = index["documents"].get(digest)
     if entry is None:
         index["documents"][digest] = {
@@ -1379,6 +1420,7 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
             entry["filenames"].append(filename)
         entry["last_seen"] = now
     _save_index(collection, index)
+    _drop_blobs(collection, orphans)
     return digest
 
 
@@ -2185,6 +2227,7 @@ import asyncio
 import logging
 import threading
 import time
+from datetime import datetime
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
@@ -2561,6 +2604,74 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
                     and all(_INDEX_NOT_READY in getattr(f, "message", "") for f in failed)):
                 raise
             time.sleep(_INSERT_RETRY_DELAY)
+
+
+def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
+    """Whether the collection holds any chunk stored under this logical name."""
+    coll = get_client().collections.get(collection_name)
+    return bool(coll.query.fetch_objects(
+        filters=Filter.by_property("source_file").equal(source_file),
+        limit=1, return_properties=[]).objects)
+
+
+class ReplaceError(RuntimeError):
+    """A name's earlier chunks could not all be removed after its new ones were
+    stored. `deleted` is how many were removed before it stopped."""
+
+    def __init__(self, message: str, deleted: int) -> None:
+        super().__init__(message)
+        self.deleted = deleted
+
+
+# Weaviate removes at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
+# delete_many, so removal repeats; this bounds it at a million chunks per file.
+_REPLACE_DELETE_ROUNDS = 100
+
+
+@collection_writes.serialized("collection_name")
+def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
+                                created_at: datetime, expected: int) -> int:
+    """Remove a name's earlier chunks after its `expected` new ones are stored (#22).
+
+    Called only after the insert has been verified, never before: if the insert
+    fails, the earlier version stays whole; if this fails, the name has
+    duplicates but nothing is lost, and uploading it again repairs it.
+
+    The new chunks all carry the same `created_at`, written by this job. They are
+    told apart by equality with that value rather than by "older than", so the
+    selection depends neither on the precision Weaviate keeps nor on earlier
+    chunks' timestamps (an imported package's can be later than now). Before
+    deleting, the equality filter must match exactly the new chunks; afterwards
+    exactly they must remain. Returns how many earlier chunks were deleted.
+    """
+    coll = get_client().collections.get(collection_name)
+    named = Filter.by_property("source_file").equal(source_file)
+
+    def count(where) -> int:
+        return coll.aggregate.over_all(filters=where, total_count=True).total_count or 0
+
+    found = count(named & Filter.by_property("created_at").equal(created_at))
+    if found != expected:
+        raise ReplaceError(f"found {found} of its {expected} new chunks by their timestamp, "
+                           "so none of the earlier ones were removed", 0)
+    earlier = named & Filter.by_property("created_at").not_equal(created_at)
+    deleted = 0
+    for _ in range(_REPLACE_DELETE_ROUNDS):
+        result = coll.data.delete_many(where=earlier)
+        deleted += result.successful or 0
+        if result.failed:
+            raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
+        if not result.matches:
+            break
+    else:
+        raise ReplaceError(f"earlier chunks were still being found after "
+                           f"{_REPLACE_DELETE_ROUNDS} delete rounds", deleted)
+    left = count(named) - expected
+    if left > 0:
+        raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
+    if left < 0:
+        raise ReplaceError(f"{-left} of its {expected} new chunks are missing afterwards", deleted)
+    return deleted
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
@@ -3026,13 +3137,14 @@ import json
 import logging
 import mimetypes
 import os
+import posixpath
 import shutil
 import tempfile
 import uuid
 import zipfile
 import zlib
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from services import collection_writes, jobstore
@@ -3368,6 +3480,68 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
+def _has_chunks(collection: str, name: str) -> bool:
+    """Whether the name already has chunks, which this file will replace (#22).
+    It is the job's first backend call for a file, so a deleted collection is
+    reported here the way _store_chunks reports it (#40)."""
+    try:
+        return wc._source_has_chunks_sync(collection, name)
+    except Exception as exc:
+        if _collection_gone(collection):
+            _log.warning("Collection %r disappeared before storing chunks: %s",
+                         collection, exc, exc_info=True)
+            raise _CollectionDeleted(collection) from exc
+        raise
+
+
+class _StaleMarkFailed(Exception):
+    """Gold-standard sessions could not be marked stale before a replacement."""
+
+
+# How many replaced names a stale reason lists before "and N more".
+_MAX_NAMED_FILES = 10
+
+
+def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None:
+    """Mark the collection's gold-standard sessions stale before `name` replaces
+    its earlier chunks (#22). Their pairs cite chunks by source_file and
+    chunk_index, which the replacement changes, so they would no longer describe
+    what is stored. Saved before anything is stored: if it can't be saved, the
+    file fails and the collection is left as it was.
+
+    The reason names this file and the job's later files that also have earlier
+    chunks, because a job marks at most once.
+    """
+    try:
+        names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
+        listed = ", ".join(names[:_MAX_NAMED_FILES])
+        if len(names) > _MAX_NAMED_FILES:
+            listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+        # Imported here: goldstandard imports weaviate_client, as tuning notes.
+        from services import goldstandard
+        goldstandard.mark_stale(
+            collection, f"documents were re-ingested, replacing their earlier chunks: {listed}",
+            require_durable=True)
+    except Exception as exc:
+        raise _StaleMarkFailed(str(exc) or type(exc).__name__) from exc
+
+
+def _remove_earlier(collection: str, name: str, created_at: datetime,
+                    expected: int) -> tuple[int, str | None]:
+    """Remove a name's earlier chunks once its new ones are stored.
+
+    Returns how many were removed and, when not all of them could be, why. A
+    failure here never undoes the insert: duplicates are recoverable by uploading
+    again, lost chunks are not.
+    """
+    try:
+        return wc._delete_earlier_chunks_sync(collection, name, created_at, expected), None
+    except Exception as exc:
+        _log.error("Could not remove the earlier chunks of %r in %r", name, collection,
+                   exc_info=True)
+        return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
+
+
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -3380,13 +3554,21 @@ def _process_job_sync(
     similarity_threshold: float,
     min_chunk_size: int,
     labels: dict[Path, str] | None = None,
+    names: dict[Path, str] | None = None,
 ) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     deleted = False
+    # Logical names (#22): what each file is stored and replaced under.
+    names = names or {}
+    logical = [names.get(p, p.name) for p in file_paths]
+    # Gold-standard sessions are marked stale at most once per job.
+    marked = False
 
     try:
         for index, path in enumerate(file_paths):
+            name = logical[index]
+            label = (labels or {}).get(path, name)
             try:
                 text, elements = _parse_file(path)
                 source_type = source_type_of(path)
@@ -3401,11 +3583,12 @@ def _process_job_sync(
                     elements=elements if strategy == "context_aware" else None,
                 )
 
-                now = datetime.now(timezone.utc).isoformat()
+                created = datetime.now(timezone.utc)
+                now = created.isoformat()
                 weaviate_chunks = [
                     {
                         "content": c,
-                        "source_file": path.name,
+                        "source_file": name,
                         "source_type": source_type,
                         "chunk_index": i,
                         "chunk_strategy": strategy,
@@ -3416,35 +3599,61 @@ def _process_job_sync(
                     for i, c in enumerate(chunks)
                 ]
 
+                # The last ingest of a name wins (#22). Everything before the
+                # insert only reads, so a failure up to there changes nothing.
+                replacing = _has_chunks(collection, name)
+                if replacing and not marked:
+                    _mark_replacement_stale(collection, name, logical[index + 1:])
+                    marked = True
+
+                # Insert first, then remove the earlier chunks, never the other
+                # way round: a failed insert leaves the earlier version whole.
                 _store_chunks(collection, weaviate_chunks)
+                removed, problem = 0, None
+                if replacing:
+                    removed, problem = _remove_earlier(collection, name, created, len(chunks))
+                    job["chunks_replaced"] = job.get("chunks_replaced", 0) + removed
 
                 # Retain the original only after the file has been parsed,
                 # chunked and stored. A file that fails any of those steps
-                # leaves no orphan source behind.
+                # leaves no orphan source behind. replace=True releases the name
+                # from the version it replaces, so rechunk can't rebuild that.
                 try:
                     sources.store(
                         collection,
-                        path.name,
+                        name,
                         path.read_bytes(),
-                        mimetypes.guess_type(path.name)[0],
+                        mimetypes.guess_type(name)[0],
+                        replace=True,
                     )
                 except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
-                    _log.error("Could not retain source %s for %r: %s", path.name, collection, exc)
+                    _log.error("Could not retain source %s for %r: %s", name, collection, exc)
 
                 job["chunks_stored"] += len(chunks)
-                job["files_completed"] += 1
+                if problem is None:
+                    job["files_completed"] += 1
+                else:
+                    job["files_failed"] += 1
+                    job["errors"].append(
+                        f"{label}: its new chunks were stored, but earlier chunks could not "
+                        f"all be removed ({problem}); upload it again to retry")
             except _CollectionDeleted:
                 # Nothing more can be stored: this file and the rest fail.
                 job["files_failed"] += len(file_paths) - index
                 deleted = True
                 break
+            except _StaleMarkFailed as exc:
+                job["files_failed"] += 1
+                job["errors"].append(
+                    f"{label}: could not mark gold-standard sessions stale before replacing "
+                    f"its chunks, so nothing was changed: {exc}")
+                _log.warning("ingest job %s: %s not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
-                label = (labels or {}).get(path, path.name)
                 job["files_failed"] += 1
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
                 _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
@@ -3501,9 +3710,48 @@ def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo) -> tuple[str, b
     return None
 
 
-def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Path],
-                 skipped: list[str], labels: dict[Path, str]) -> None:
-    """Validate one uploaded ZIP, then extract its supported members into tmp_dir.
+class _Queue:
+    """The files an upload queues, one per logical name (#22).
+
+    Every input is staged in a directory of its own, so no upload or ZIP member
+    can overwrite another's bytes on disk, and the parser still sees the file's
+    own extension. When a later input has the same logical name, the earlier one
+    is dropped and reported in `skipped`: the last one wins, never silently.
+    """
+
+    def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
+        self.tmp_dir = tmp_dir
+        self.skipped = skipped
+        self.entries: dict[str, tuple[Path, str]] = {}
+        self._slots = 0
+
+    def slot(self, basename: str) -> Path:
+        self._slots += 1
+        directory = self.tmp_dir / str(self._slots)
+        directory.mkdir()
+        return directory / basename
+
+    def add(self, path: Path, logical: str, label: str) -> None:
+        earlier = self.entries.pop(logical, None)
+        if earlier is not None:
+            earlier[0].unlink(missing_ok=True)
+            self.skipped.append(
+                f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")
+        self.entries[logical] = (path, label)
+
+
+def _member_name(filename: str) -> str | None:
+    """A ZIP member's logical name: its normalised POSIX path inside the archive
+    (#22), so a/report.pdf and b/report.pdf stay two documents and a/../b.txt is
+    b.txt. None for a path that leaves the archive, which is not ingested."""
+    name = posixpath.normpath(filename)
+    if name.startswith("/") or name in (".", "..") or name.startswith("../"):
+        return None
+    return name
+
+
+def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
+    """Validate one uploaded ZIP, then queue its supported members.
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
@@ -3520,16 +3768,15 @@ def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Pat
             f"{remedy}",
             safe_name) from exc
 
-    resolved_tmp = tmp_dir.resolve()
     with archive as z:
         members = []
         for member in z.infolist():
             if member.is_dir():
                 continue
-            member_path = (tmp_dir / member.filename).resolve()
-            if not member_path.is_relative_to(resolved_tmp):
+            logical = _member_name(member.filename)
+            if logical is None:
                 continue
-            members.append((member, member_path))
+            members.append((member, logical))
 
         problems = []
         for member, _ in members:
@@ -3556,13 +3803,20 @@ def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Pat
                 safe_name,
                 [{"member": name, "reason": reason} for name, reason, _ in problems])
 
-        for member, member_path in members:
-            if not (member_path.suffix.lower() in SUPPORTED_EXTENSIONS
-                    or _is_json_gz(member_path.name)):
-                skipped.append(f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
+        for member, logical in members:
+            basename = PurePosixPath(logical).name
+            if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
+                    or _is_json_gz(basename)):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
                 continue
+            # Copied out by our own code, not ZipFile.extract, whose own path
+            # cleaning would put a/../b.txt somewhere other than where it is
+            # queued.
             try:
-                z.extract(member, tmp_dir)
+                target = queue.slot(basename)
+                with z.open(member) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
             except OSError as exc:
                 reason = _os_reason(exc)
                 raise _rejected(
@@ -3570,8 +3824,7 @@ def _extract_zip(dest: Path, safe_name: str, tmp_dir: Path, file_paths: list[Pat
                     f"Could not extract '{member.filename}' from '{safe_name}' on the "
                     f"server: {reason}.",
                     safe_name, [{"member": member.filename, "reason": reason}]) from exc
-            file_paths.append(member_path)
-            labels[member_path] = f"{safe_name}:{member.filename}"
+            queue.add(target, logical, f"{safe_name}:{member.filename}")
 
 
 async def start_ingest_job(
@@ -3607,13 +3860,11 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
-    file_paths: list[Path] = []
-    # Files the caller sent that this build cannot parse. Dropping them without
-    # a word makes a ZIP of 8 files silently report 6, with nothing saying which
-    # two were ignored or why.
+    # Files the caller sent that this build cannot parse, and inputs replaced by
+    # a later one with the same name. Dropping them without a word makes a ZIP
+    # of 8 files silently report 6, with nothing saying which two or why.
     skipped: list[str] = []
-    # How each queued file is named in the job's errors.
-    labels: dict[Path, str] = {}
+    queue = _Queue(tmp_dir, skipped)
 
     try:
         for upload in files:
@@ -3621,7 +3872,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             safe_name = Path(raw_name).name
             if not safe_name:
                 continue
-            dest = tmp_dir / safe_name
+            dest = queue.slot(safe_name)
             # Copy in blocks rather than `await upload.read()`, which held the
             # whole file in memory. Uploads can now reach 512 MB (issue #21),
             # and this container already runs close to its memory budget. The
@@ -3635,16 +3886,21 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                     safe_name) from exc
 
             if safe_name.lower().endswith(".zip"):
-                _extract_zip(dest, safe_name, tmp_dir, file_paths, skipped, labels)
+                _extract_zip(dest, safe_name, queue)
                 os.remove(dest)
             elif Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS:
-                file_paths.append(dest)
-                labels[dest] = safe_name
+                queue.add(dest, safe_name, safe_name)
             else:
                 skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
+
+    # One file per logical name, in the order of each winning input. How each
+    # is named in the job's errors, and what it is stored under.
+    file_paths = [path for path, _ in queue.entries.values()]
+    labels = {path: label for path, label in queue.entries.values()}
+    names = {path: logical for logical, (path, _) in queue.entries.items()}
 
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -3660,6 +3916,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         "files_completed": 0,
         "files_failed": 0,
         "chunks_stored": 0,
+        # Earlier chunks of the same names removed by this job (#22).
+        "chunks_replaced": 0,
         "errors": [],
         "skipped": skipped,
     }
@@ -3693,6 +3951,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         similarity_threshold,
         min_chunk_size,
         labels,
+        names,
     )
     future.add_done_callback(_on_done)
 
@@ -7100,7 +7359,7 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from services import collection_writes, jobstore
 from config import settings
@@ -7184,11 +7443,6 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _emitted_name(digest: str, entry: dict) -> str:
-    """The source_file a rebuild writes for this retained digest's chunks."""
-    return Path((entry.get("filenames") or [digest])[0]).name
-
-
 def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     """Stored source files a rebuild from the retained originals would not reproduce."""
     by_filename: dict[str, list[str]] = {}
@@ -7203,8 +7457,9 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        digests = by_filename.get(filename, [])
-        if len(digests) != 1 or _emitted_name(digests[0], documents[digests[0]]) != filename:
+        # A rebuild emits one chunk set per (digest, name) (#22), so a name is
+        # covered when exactly one digest lists it, whichever of its names it is.
+        if len(by_filename.get(filename, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -7252,14 +7507,14 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    # Re-chunking rebuilds one chunk set per retained digest, under its first
-    # name. A stored name is covered only when exactly one digest lists it, it
-    # is that digest's first name, and its chunks form one set (no repeated
-    # chunk_index). A second name for the same content, a re-upload (whether
-    # its retention succeeded or failed) and a name with no retained original
-    # are refused before staging: replacing from the retained subset would
-    # lose chunks, and a successful cutover discards their recovery copy.
-    # Issue #22 lifts this by rebuilding one chunk set per (digest, name).
+    # Re-chunking rebuilds one chunk set per (digest, name) pair, as ingest
+    # stored it (#22), so a second name for the same content is rebuilt too. A
+    # stored name is covered only when exactly one digest lists it and its
+    # chunks form one set (no repeated chunk_index). A name with more than one
+    # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
+    # sets and a name with no retained original are refused before staging:
+    # replacing from the retained subset would lose chunks, and a successful
+    # cutover discards their recovery copy.
     uncovered = _uncovered_source_files(collection, documents)
     if uncovered:
         raise PackageError(
@@ -7273,6 +7528,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
+        slots = 0
         for digest, entry in sorted(documents.items()):
             blob = sources.blob_path(collection, digest)
             if not blob.is_file():
@@ -7281,32 +7537,38 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"Retained source {digest[:12]} is missing from disk, so "
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
-            # Parsers dispatch on the file extension, so the original filename
-            # has to be restored before parsing.
-            staged = work / _emitted_name(digest, entry)
-            shutil.copyfile(blob, staged)
+            for filename in entry["filenames"]:
+                # Parsers dispatch on the file extension, so the original name
+                # has to be restored before parsing; each pair is staged in a
+                # directory of its own, so a/report.txt and b/report.txt can't
+                # collide.
+                slots += 1
+                slot = work / str(slots)
+                slot.mkdir()
+                staged = slot / PurePosixPath(filename).name
+                shutil.copyfile(blob, staged)
 
-            text, elements = _parse_file(staged)
-            chunks = do_chunk(
-                text=text,
-                strategy=strategy,
-                chunk_size=chunk_size,
-                chunk_overlap_size=chunk_overlap,
-                similarity_threshold=similarity_threshold,
-                min_chunk_size=min_chunk_size,
-                elements=elements if strategy == "context_aware" else None,
-            )
-            source_type = source_type_of(staged)
-            out.extend({
-                "content": c,
-                "source_file": staged.name,
-                "source_type": source_type,
-                "chunk_index": i,
-                "chunk_strategy": strategy,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "created_at": now,
-            } for i, c in enumerate(chunks))
+                text, elements = _parse_file(staged)
+                chunks = do_chunk(
+                    text=text,
+                    strategy=strategy,
+                    chunk_size=chunk_size,
+                    chunk_overlap_size=chunk_overlap,
+                    similarity_threshold=similarity_threshold,
+                    min_chunk_size=min_chunk_size,
+                    elements=elements if strategy == "context_aware" else None,
+                )
+                source_type = source_type_of(staged)
+                out.extend({
+                    "content": c,
+                    "source_file": filename,
+                    "source_type": source_type,
+                    "chunk_index": i,
+                    "chunk_strategy": strategy,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
+                    "created_at": now,
+                } for i, c in enumerate(chunks))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -9645,8 +9907,11 @@ export interface CreateCollectionBody {
 }
 export interface JobStatus {
   job_id: string; status: string; files_total: number; files_completed: number; files_failed: number; chunks_stored: number; errors: string[]
-  // Files that could not be parsed at all — never counted in files_total.
+  // Files that could not be parsed at all, or that a later file with the same
+  // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Earlier chunks of the same names this job removed (#22).
+  chunks_replaced?: number
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean
@@ -9857,6 +10122,13 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {(job.chunks_replaced ?? 0) > 0 && (
+        // Re-ingesting a name replaces its chunks (#22), so the total can stay
+        // the same while the content changed.
+        <p className="mt-2 text-xs text-gray-600">
+          Replaced {job.chunks_replaced} chunk{job.chunks_replaced === 1 ? '' : 's'} from a previous version
+        </p>
+      )}
       {job.errors.length > 0 && (
         <ul className="mt-2 text-xs text-red-600 space-y-1">
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
@@ -9864,10 +10136,11 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
-        // count simply reads lower than what the user uploaded.
+        // count simply reads lower than what the user uploaded. Each entry
+        // says why: an unsupported type, or a later file with the same name.
         <div className="mt-2 text-xs text-amber-700">
           <p className="font-medium">
-            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped — not a supported type:
+            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped:
           </p>
           <ul className="space-y-1 mt-1">
             {job.skipped!.map((f, i) => <li key={i}>{f}</li>)}
@@ -11822,6 +12095,32 @@ completed job reads back unchanged and the interrupted one reads `partial` with 
 interruption message; `05_transfer.sh` does the same for a completed export and one
 interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
 
+`scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
+same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
+repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
+keep the last and list each earlier one in `skipped`; members in different folders stay
+separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
+job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
+the replaced files, before any insert, and deletes earlier chunks only after the insert; a
+marking failure fails only that file and changes nothing; a failed insert keeps the earlier
+version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
+reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+retention releasing the name (also when the blob write fails, keeping shared digests), and
+rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mocked.
+`02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
+(one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
+with one filename. With a real gold-standard session planted for the collection, it checks
+that ingesting a new name leaves the session current and a replacing re-ingest marks it
+stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
+version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
+chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
+0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+`05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
+and checks that only the new text comes back, under both names.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -11919,6 +12218,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -14110,6 +14410,187 @@ import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if any('broken.pdf' in e for e in d['errors']) else 1)"
 check "the failure names the offending file" $?
 
+# ── re-ingesting a name replaces its chunks (#22) ────────────────────────────
+# Re-ingesting used to add a second chunk set beside the first, so answers could
+# cite a superseded version; ZIP members were named by basename, so a/report.txt
+# and b/report.txt merged. Controlled cases: same-name inputs in one upload,
+# ZIP path normalisation, insert-before-delete, stale marking, retention and
+# rechunk coverage.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_reingest.py)
+check "re-ingest: same-name inputs, replacement order, retention and rechunk regressions" $?
+
+RI="${PREFIX}Reingest"
+RIFIX=$(mktemp -d)
+python3 - "$FIX/policies.txt" "$RIFIX" <<'ENDPY'
+import pathlib, sys, zipfile
+v1, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+(out / "v2").mkdir()
+(out / "v2" / "policies.txt").write_text(
+    "Parking Permits. Facilities issue parking permits each January, and a permit "
+    "is valid for one named vehicle only.\n\n"
+    "Visitor Badges. Reception prints a visitor badge on arrival, and badges are "
+    "returned at the end of the day.\n")
+with zipfile.ZipFile(out / "folders.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.txt", "Alpha report. The cafeteria opens at seven every weekday.")
+    z.writestr("b/report.txt", "Beta report. The library closes at nine on Fridays.")
+assert "Travel Booking" in v1.read_text()
+ENDPY
+# What the collection holds: (source_file, content) pairs, and the retained index.
+ri_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$RI") <<'ENDPY'
+import json, sys
+from services import sources, weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    chunks = sorted([o.properties["source_file"], o.properties["content"]] for o in coll.iterator())
+    d = sources.collection_dir(sys.argv[1])
+    blobs = sorted(p.name for p in d.iterdir() if p.name != "index.json") if d.is_dir() else []
+    print(json.dumps({"chunks": chunks, "index": sources.load_index(sys.argv[1])["documents"],
+                      "blobs": blobs}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$RI"; make_collection "$RI"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+n1=$(jfield "['chunks_stored']" < /tmp/vfy_job.json)
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_again.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" <<'ENDPY'
+import json, sys
+n1 = int(sys.argv[1]); job = json.load(open('/tmp/vfy_ri_again.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+print(job["status"], job.get("chunks_replaced"), len(st["chunks"]), n1)
+sys.exit(0 if n1 > 0 and job["status"] == "completed" and job.get("chunks_replaced") == n1
+         and len(st["chunks"]) == n1 else 1)
+ENDPY
+check "ingesting the same file twice keeps one chunk set and reports chunks_replaced" $? \
+  "$(cat /tmp/vfy_ri_again.json | head -c 300)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/v2/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_v2.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+n1 = int(sys.argv[1]); v2 = hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+job = json.load(open('/tmp/vfy_ri_v2.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for _, c in st["chunks"])
+checks = {
+    "completed": job["status"] == "completed",
+    "replaced all of v1": job.get("chunks_replaced") == n1,
+    "holds only v2's chunks": len(st["chunks"]) == job["chunks_stored"],
+    "v1 text gone": "Travel Booking" not in texts,
+    "v2 text present": "Parking Permits" in texts,
+    "one digest names it": [d for d, e in st["index"].items() if "policies.txt" in e["filenames"]] == [v2],
+    "v1 blob gone": st["blobs"] == [v2],
+}
+print({k: v for k, v in checks.items() if not v} or "ok")
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a modified file replaces its chunks and its retained original" $? "$(head -c 300 /tmp/vfy_ri_v2.json)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/folders.zip"
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+ok = ("Alpha report" in names.get("a/report.txt", "")
+      and "Beta report" in names.get("b/report.txt", "") and "report.txt" not in names)
+print(sorted(names))
+sys.exit(0 if ok else 1)
+ENDPY
+check "ZIP members with one basename in two folders stay two documents, named by path" $?
+
+# Two parts with one filename: the second's bytes are stored, the first reported.
+ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_dupe.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_dupe.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for n, c in st["chunks"] if n == "dupe.txt")
+ok = (job["files_total"] == 1 and job["skipped"] == [
+          "dupe.txt (replaced by dupe.txt later in this upload, same name 'dupe.txt')"]
+      and "Parking Permits" in texts and "Travel Booking" not in texts)
+print(job["files_total"], job["skipped"])
+sys.exit(0 if ok else 1)
+ENDPY
+check "the same name twice in one upload ingests the last and reports the first" $? \
+  "$(head -c 300 /tmp/vfy_ri_dupe.json)"
+
+# Gold-standard sessions are marked stale only when a re-ingest replaces earlier
+# chunks, never for a brand-new name (#22). A real session, not a mocked marker.
+RIGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RI" "$RIGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ri_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "policies.txt", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "re-ingest: a synthetic gold-standard session is planted for the collection" $?
+# The API reads sessions written by another process at its next scan.
+api_get "/goldstandard/diagnostics" >/dev/null
+printf 'Fresh document. The gym opens at six.\n' > "$RIFIX/fresh.txt"
+ingest "$RI" fixed 200 40 "$RIFIX/fresh.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' and j.get('chunks_replaced')==0 else 1)"
+check "ingesting a brand-new name leaves gold-standard sessions current" $? "$(head -c 300 /tmp/vfy_ri_gs.json)"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+r=d.get('stale_reason') or ''
+print(d.get('stale'), r, j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is True and 're-ingested' in r and 'policies.txt' in r
+         and j['status']=='completed' and j.get('chunks_replaced',0)>0 else 1)"
+check "a replacing re-ingest marks the collection's gold-standard sessions stale, naming the file" $? \
+  "$(head -c 300 /tmp/vfy_ri_gs.json)"
+
+# Two concurrent uploads of one name (#22): the job that runs last wins, each
+# job is applied whole, and arrival order is not promised, so either may win.
+for v in 1 2; do
+  src="$FIX/policies.txt"; [ "$v" = 2 ] && src="$RIFIX/v2/policies.txt"
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$src;filename=race.txt" > "/tmp/vfy_ri_race$v.json" &
+done
+wait
+for v in 1 2; do
+  rj=$(jfield "['job_id']" < "/tmp/vfy_ri_race$v.json")
+  [ -n "$rj" ] && wait_for_job "/ingest/job/$rj" 900 >/dev/null
+  api_get "/ingest/job/$rj" > "/tmp/vfy_ri_race$v.done.json"
+done
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$FIX/policies.txt" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+sha = [hashlib.sha256(open(p, "rb").read()).hexdigest() for p in sys.argv[1:3]]
+jobs = [json.load(open(f"/tmp/vfy_ri_race{v}.done.json")) for v in (1, 2)]
+st = json.load(open("/tmp/vfy_ri_state.json"))
+texts = [c for n, c in st["chunks"] if n == "race.txt"]
+joined = " ".join(texts)
+v1, v2 = "Travel Booking" in joined, "Parking Permits" in joined
+win = 0 if v1 else 1
+digests = [d for d, e in st["index"].items() if "race.txt" in e["filenames"]]
+checks = {
+    "both completed": all(j.get("status") == "completed" for j in jobs),
+    "exactly one version present": v1 != v2,
+    "winner's whole chunk set": len(texts) == jobs[win].get("chunks_stored"),
+    "winner replaced the loser's set": jobs[win].get("chunks_replaced") == jobs[1 - win].get("chunks_stored"),
+    "one digest, the winner's": digests == [sha[win]],
+}
+print({k: v for k, v in checks.items() if not v} or "ok", [j.get("status") for j in jobs])
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "two concurrent uploads of one name leave exactly one job's version, whole" $?
+drop_collection "$RI"
+rm -rf "$RIFIX"
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
@@ -15013,7 +15494,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E31)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E32)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -15780,6 +16261,51 @@ check_eq "re-chunk completes" "$tstatus" "completed"
 after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
 [ "$after_chunks" -gt "$chunks_before" ]
 check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
+
+# ── re-chunking after a replacement (#22, E17, E32) ──────────────────────────
+# Re-ingesting replaces a name's chunks and retained original, so a rebuild
+# brings back only the new version; a second name for the same content is
+# rebuilt under both names (one chunk set per digest and name).
+RC="${PREFIX}Rechunk"
+RCFIX=$(mktemp -d)
+printf '%s\n\n%s\n' \
+  "Parking Permits. Facilities issue parking permits each January, and a permit is valid for one named vehicle only." \
+  "Visitor Badges. Reception prints a visitor badge on arrival, and badges are returned at the end of the day." \
+  > "$RCFIX/policies.txt"
+cp "$RCFIX/policies.txt" "$RCFIX/copy.txt"
+drop_collection "$RC"; make_collection "$RC"
+for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RC" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$f" > /tmp/vfy_rc.json
+  rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
+  wait_for_job "/ingest/job/$rjob" 900 >/dev/null
+done
+check_eq "E32: re-chunking is offered after a replacement and a second name" \
+  "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
+api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "E32: the re-chunk completes" "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") > /tmp/vfy_rc_chunks.json <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps([[o.properties["source_file"], o.properties["content"]] for o in coll.iterator()]))
+finally:
+    wc.close_client()
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+chunks = json.load(open('/tmp/vfy_rc_chunks.json'))
+texts = " ".join(c for _, c in chunks)
+names = {n for n, _ in chunks}
+print(sorted(names), "Travel Booking" in texts)
+sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in texts
+         and "Parking Permits" in texts else 1)
+ENDPY
+check "E32: the rebuild holds only the new version, under both of its names" $?
+drop_collection "$RC"
+rm -rf "$RCFIX"
 
 # ── chunks-only refuses re-chunking ──────────────────────────────────────────
 SRCLESS="${PREFIX}Chunksonly"
@@ -17308,6 +17834,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
               clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
               clicked ? text.slice(0, 200) : 'Start Ingest button not found');
       r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
+  // ── re-ingest progress (#22) ───────────────────────────────────────────────
+  // The progress panel reports replaced chunks, and the skipped heading no
+  // longer claims every skip is an unsupported type: a later file with the
+  // same name in one upload is skipped too. Job responses are stubbed.
+  r.section('re-ingest progress');
+  for (const [replaced, label] of [[3, 'Replaced 3 chunks from a previous version'], [1, 'Replaced 1 chunk from a previous version'], [0, null]]) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-reingest.txt';
+    fs.writeFileSync(small, 'Re-ingest fixture.\n');
+    const jobId = 'vfyrein' + replaced;
+    const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (label) {
+        r.check(`chunks_replaced=${replaced} is shown as "${label}"`, clicked && text.includes(label),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check('chunks_replaced=0 shows no replacement line', clicked && text.includes('Chunks stored: 2') && !text.includes('Replaced '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+        r.check('the skipped heading is a plain "1 file skipped:" with the entry\'s own reason',
+                text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
+                text.slice(0, 300));
+      }
+      r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();
@@ -19377,7 +19949,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();return 'Owned later upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
             reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
             def start_ingest():
@@ -19396,7 +19968,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
             upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
             self.assertTrue(parsed.wait(2))
@@ -20907,6 +21479,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
              patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
              patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.wc, "_source_has_chunks_sync", return_value=False), \
              patch.object(ingest_pipeline.sources, "store", side_effect=ValueError("Invalid retained source index")):
             ingest_pipeline._process_job_sync(job_id, [upload], self.root,
                                               "Invalid", "fixed", 150, 0, 0.85, 0)

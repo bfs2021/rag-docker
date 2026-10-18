@@ -486,11 +486,54 @@ members with a reason each (up to 10, then "and N more") and suggest re-creating
 
 **`.json.gz` members.** A ZIP member ending in `.json.gz` is extracted and queued like a
 supported file. The job decompresses it (at most 512 MB decompressed) and parses the result
-as JSON; its chunks have `source_type` `json` and `source_file` the member's filename, and
+as JSON; its chunks have `source_type` `json` and `source_file` the member's logical name (below), and
 the retained original is the `.json.gz` itself. A `.json.gz` uploaded directly, and other
 `.gz` members, are skipped as unsupported types. The JSON is converted to text as described in §5.1.
 `.jsonl` and `.jsonl.gz` files, direct or in a ZIP, are skipped with the reason "JSON Lines
 (.jsonl) isn't supported yet, see #291".
+
+**Logical names and re-ingesting (#22).** Every file is stored under a logical name: the
+`source_file` of its chunks and the filename in its retained-source index entry.
+
+- A direct upload's logical name is its filename without any path. A ZIP member's is its
+  path inside the archive, POSIX-style and normalised: `a/report.pdf` and `b/report.pdf`
+  are two documents, `a/../b.txt` is `b.txt` and `./c.txt` is `c.txt`. Members at the
+  archive's top level keep their bare name. A member whose path leaves the archive
+  (`../x.txt`, an absolute path) is not ingested. Error and skip messages still name a
+  member as `<zip filename>:<member path as stored in the archive>`.
+- Each queued file is staged in a directory of its own, so no input overwrites another's
+  bytes.
+- **Within one upload the last input with a logical name wins.** That covers a name sent
+  twice in one request, a name repeated inside a ZIP, the same path in two ZIPs, and a direct
+  upload with the same name as a top-level member. Each earlier input is dropped, not
+  counted in `files_total`, and listed in the job's `skipped` as
+  `<earlier> (replaced by <later> later in this upload, same name '<logical name>')`.
+- **Re-ingesting a name replaces it**, always, even when the content is unchanged: the file
+  is parsed and chunked again with the request's settings, the new chunks are stored, and
+  only then are the name's earlier chunks deleted, so a failed store leaves the earlier
+  version whole. The earlier chunks are those with the same `source_file` and a different
+  `created_at` than the new chunks (which all share one); deletion repeats until none match
+  (Weaviate deletes at most `QUERY_MAXIMUM_RESULTS` per call), at most 100 times. It
+  proceeds only if exactly the new chunks match their own `created_at`, and afterwards
+  exactly they must remain. The job's `chunks_replaced` counts the deleted chunks.
+- If the earlier chunks can't all be deleted, the new chunks stay, the file counts as
+  failed (so the job is `partial`, or `failed` if every file failed) and `errors` gets
+  `<file>: its new chunks were stored, but earlier chunks could not all be removed
+  (<reason>); upload it again to retry`.
+- Before the first file in a job replaces earlier chunks, the collection's gold-standard
+  sessions are marked `stale` (§3.1.5), once per job, with the reason `documents were
+  re-ingested, replacing their earlier chunks: <names>`, naming that file and the job's
+  later files that also have earlier chunks (10 names, then `and N more`). The marking is
+  saved before anything is stored; if it can't be, that file fails with `<file>: could not
+  mark gold-standard sessions stale before replacing its chunks, so nothing was changed:
+  <reason>`, and the next replacing file tries again. Files with new names mark nothing.
+- The retained original follows the replacement: the name is removed from any other
+  retained digest, and a digest left with no names is deleted with its blob (see
+  `RAG_EXPORT_SPECIFICATIONS.md` §2.2).
+- Ingest jobs for one collection run one at a time, so for one name the job that runs last
+  wins and each job applies whole; the order of concurrent uploads is not promised.
+- Chunks already duplicated before this rule (a name ingested twice) stay until the name is
+  ingested again.
 
 ---
 
@@ -507,9 +550,15 @@ GET /ingest/job/{job_id}
   "files_completed": 1,
   "files_failed": 0,
   "chunks_stored": 142,
-  "errors": []
+  "chunks_replaced": 0,
+  "errors": [],
+  "skipped": []
 }
 ```
+
+`chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
+records written before it existed read back as `0`. `skipped` lists inputs that were not
+ingested, each with its reason: an unsupported type, or a later input with the same name.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -1477,7 +1526,8 @@ fails and the job's collection no longer exists, the ingest job stops: it ends
 running`; that file and every later one count as failed, files already stored stay
 counted, and no later file is parsed or retained. The underlying batch error goes to
 the API log. Only a failed store checks for the collection; other failures are
-reported per file as before.
+reported per file as before. The check also runs when the job's first backend call for a
+file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 **Query-time embedding paths:**
 
@@ -1656,7 +1706,7 @@ settings, regardless of when a prior collection's save completes.
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
-- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors.
+- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
 
@@ -2085,6 +2135,27 @@ now lives once, in `api/services/ingest_config.py`.
       `RAG_ALLOW_RESTART=1`, ingests a file, then uploads it with a slow text file, restarts the
       API with `docker compose restart --timeout 0 api` once the first file is stored, and
       checks both jobs.*
+
+- [x] Re-ingesting a file under the same logical name replaces its chunks and its retained original, even with unchanged content; the job reports `chunks_replaced`; the earlier version survives a failed store; gold-standard sessions are marked stale before a replacement and never for new names (#22).
+      *Re-ingesting used to add a second chunk set beside the first, so answers could cite
+      a superseded version, and the old digest kept claiming the name. `test_reingest.py`
+      (API image, backends mocked) covers no replacement for new names, one marking per
+      job naming the replaced files before any insert, insert before delete, unchanged
+      content, a marking failure (file failed, nothing changed, next file retries), a
+      failed insert (earlier version kept), a removal failure (`partial`, new chunks kept),
+      a deleted collection at the lookup (#40), the delete rounds, precondition and final
+      count, and retention releasing the name even when the blob write fails.
+      `02_ingest.sh` ingests `policies.txt` twice (one chunk set, `chunks_replaced` equal to
+      the first count), then a changed version (only its text remains, one digest names it,
+      the first blob is gone).*
+- [x] ZIP members are named by their normalised path inside the archive, so same-named members in different folders stay separate documents; within one upload the last input with a logical name wins and each earlier one is listed in `skipped` with its reason (#22).
+      *`a/report.pdf` and `b/report.pdf` both became `report.pdf`, and a name sent twice in
+      one request was overwritten on disk but queued twice. `ZipFile.extract` also wrote
+      `a/../b.txt` to `a/b.txt` while `b.txt` was queued. `test_reingest.py` covers a name
+      twice in one body, repeated ZIP entries, the same path in two ZIPs, a direct upload
+      against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
+      archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
+      `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
 
 ### 10.2 Query
 
