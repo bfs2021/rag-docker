@@ -2,6 +2,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import gzip
 import io
 import os
 from pathlib import Path
@@ -328,6 +329,27 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         self.lineage('rag.export')
         request_ends = {s.context.span_id:s.end_time for s in self.spans('rag.request')}
         self.assertTrue(all(s.end_time > request_ends[s.parent.span_id] for s in self.spans('rag.export')))
+
+    async def test_real_json_parser_keeps_parse_span_after_upstream_helpers(self):
+        for suffix in ('.json', '.json.gz'):
+            for valid in (True, False):
+                with self.subTest(suffix=suffix, valid=valid):
+                    self.memory.clear()
+                    path = Path(self.temp.name) / (SECRET + suffix)
+                    content = ('{"text": "' + SECRET + '"}' if valid else '{').encode()
+                    path.write_bytes(gzip.compress(content) if suffix.endswith('.gz') else content)
+                    with ot.bind((self.runtime, None)), ot.span('rag.ingest') as parent:
+                        if valid:
+                            text, _ = ingest._parse_file(path)
+                            self.assertIn(SECRET, text)
+                        else:
+                            with self.assertRaises(ValueError):
+                                ingest._parse_file(path)
+                    spans = self.spans('rag.parse')
+                    self.assertEqual(len(spans), 1)
+                    self.assertEqual(spans[0].parent.span_id, parent.get_span_context().span_id)
+                    self.assertEqual(spans[0].status.status_code, trace.StatusCode.UNSET if valid else trace.StatusCode.ERROR)
+                    self.wire()
 
     async def test_ingest_real_executor_partial_failure(self):
         def parse(path):

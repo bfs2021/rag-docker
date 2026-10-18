@@ -186,6 +186,25 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
+refused as a whole with readable 400s naming their unreadable members (truncated archive,
+wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
+compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
+logged traceback, JSON Lines skip reasons, and that gzipped JSON members are decompressed
+within their limit with clear per-file errors. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+in the verify project's API container, then checks a truncated ZIP and a ZIP of
+`.json` and `.json.gz` members through the proxy.
+
+`scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
+`key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
+non-ASCII text and numbers as written, one element per top-level record, empty values and
+files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
+converted text bounded by the chunker's per-file limit (a long key over many values fails
+fast with bounded memory), and readable errors for invalid JSON in `.json` files and
+`.json.gz` members. `02_ingest.sh` runs it in the API
+container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
+back to confirm they hold that text.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -273,12 +292,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |

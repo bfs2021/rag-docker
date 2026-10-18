@@ -38,7 +38,7 @@ from services import sources
 from services import weaviate_client as wc
 from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
-from services.ingest_pipeline import _parse_file
+from services.ingest_pipeline import _parse_file, source_type_of
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -226,7 +226,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                 min_chunk_size=min_chunk_size,
                 elements=elements if strategy == "context_aware" else None,
             )
-            source_type = staged.suffix.lower().lstrip(".")
+            source_type = source_type_of(staged)
             out.extend({
                 "content": c,
                 "source_file": staged.name,
