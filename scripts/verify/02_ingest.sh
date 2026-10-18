@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/bad.jsonl" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/zip_over_gzip.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -101,6 +101,61 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if d.get('skipped', []) == [\"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\"] else 1)"
 check "only the other gzip member is skipped, as unsupported" $?
+
+# ── the expansion cap on an upload's ZIPs (#298) ────────────────────────────
+# Controlled cases with a 1 MiB cap set through the environment: declared
+# sizes, counted bytes, gzip output, several ZIPs in one upload, and ZIP work
+# running off the event loop.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_EXPANDED_BYTES=1048576 \
+  api python - < scripts/tests/test_zip_expansion.py)
+check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
+
+# The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
+too_large() {
+  local name="$1" code
+  code=$(curl -s -m 300 -o /tmp/vfy_cap.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+    -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/$name")
+  python3 - "$code" "$name" <<'ENDPY'
+import json, sys
+code, name = sys.argv[1], sys.argv[2]
+want = (f"'{name}' expands to more than 2,048 MB when unpacked, the most one upload's ZIPs "
+        f"can expand to, so nothing from it was imported. Split it into smaller zips and "
+        f"upload them in separate imports.")
+try:
+    e = json.load(open('/tmp/vfy_cap.json'))['error']
+except Exception:
+    print(code, 'not-json', 'no'); raise SystemExit
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': []}
+print(code, e['code'], 'yes' if ok else 'no')
+ENDPY
+}
+read -r code err_code text_ok <<<"$(too_large zip_over_declared.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP declaring more than 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+
+# While a gzip member's output is counted, other requests are still answered.
+# A smoke check: the count takes about a second, so the controlled test above
+# is the one that tells off-loop from on-loop work.
+too_large zip_over_gzip.zip > /tmp/vfy_cap_result.txt &
+upload_pid=$!
+probes=0; slow=0; worst=0
+while kill -0 "$upload_pid" 2>/dev/null; do
+  read -r pcode ptime <<<"$(curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}' "$API/ingest/job/vfy-none")"
+  probes=$((probes + 1))
+  if [ "$pcode" != 404 ] || python3 -c "import sys; sys.exit(0 if float('$ptime') >= 1.0 else 1)"; then
+    slow=$((slow + 1))
+  fi
+  worst=$(python3 -c "print(max(float('$worst'), float('$ptime')))")
+done
+wait "$upload_pid"
+read -r code err_code text_ok < /tmp/vfy_cap_result.txt
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+[ "$slow" = 0 ]
+check "job polls are answered while a ZIP is being counted" $? \
+  "$probes probes, $slow slow or failed, slowest ${worst}s"
 
 # ── ordinary JSON as readable text (#295) ────────────────────────────────────
 # Controlled cases: every conversion rule, file key order, non-ASCII text,

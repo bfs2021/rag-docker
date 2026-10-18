@@ -456,6 +456,60 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await s.ctx.close();
     }
   }
+  // A poll error is cleared by a new ingest and by the next successful poll
+  // (#298). Job A's polls always fail; job B's first poll fails, then it
+  // completes. Polls run every 3 s.
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll-clear.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    const failure = JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } });
+    let uploads = 0, pollsB = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST') {
+        uploads += 1;
+        const job = uploads === 1 ? 'vfyclrA' : 'vfyclrB';
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: job, status: 'queued', files_queued: 1, collection: 'x' }) });
+      }
+      if (path === '/api/ingest/job/vfyclrA')
+        return request.respond({ status: 500, contentType: 'application/json', body: failure });
+      if (path === '/api/ingest/job/vfyclrB') {
+        pollsB += 1;
+        if (pollsB === 1) return request.respond({ status: 500, contentType: 'application/json', body: failure });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfyclrB', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, chunks_replaced: 0, errors: [], skipped: [] }) });
+      }
+      return request.continue();
+    });
+    const shown = text => text.includes("Could not check the import's progress: Synthetic status failure.");
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const first = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);                       // job A's first poll has failed
+      const before = shown(await bodyText(s.page));
+      const second = await clickByText(s.page, 'Start Ingest');
+      await sleep(1000);                       // job B accepted, not yet polled
+      const afterNew = await bodyText(s.page);
+      r.check('a new ingest clears a poll error',
+              first && second && before && uploads === 2 && !shown(afterNew),
+              `clicked=${first},${second} shown-before=${before} uploads=${uploads} after: ${afterNew.slice(0, 160)}`);
+      await sleep(2700);                       // job B's first poll has failed
+      const failedAgain = shown(await bodyText(s.page));
+      await sleep(3000);                       // job B's second poll has succeeded
+      const afterPoll = await bodyText(s.page);
+      r.check('the next successful poll clears a poll error',
+              failedAgain && pollsB >= 2 && !shown(afterPoll),
+              `shown-after-B's-first-poll=${failedAgain} B-polls=${pollsB} after: ${afterPoll.slice(0, 160)}`);
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
 
   // ── re-ingest progress (#22) ───────────────────────────────────────────────
   // The progress panel reports replaced chunks, and the skipped heading no

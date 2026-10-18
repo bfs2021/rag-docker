@@ -677,6 +677,10 @@ class Settings(BaseSettings):
     # Reported by /health and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
+    # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP
+    # in one request, gzipped members' output included (#298). A small ZIP of
+    # zeros can otherwise unpack to gigabytes and fill Docker's disk.
+    max_zip_expanded_bytes: int = 2 * 1024 * 1024 * 1024
 
     class Config:
         env_file = ".env"
@@ -3157,8 +3161,10 @@ from services import weaviate_client as wc
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
 # Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
 # directly or inside a ZIP (#291). Either is decompressed when the job parses
-# it, never more than this many bytes: the per-request upload limit, so gzip
-# cannot bring in more than a plain upload could.
+# it, never more than this many bytes. The bound is per file, so several
+# gzipped members could each reach it: a ZIP's members, their gzip output
+# included, are bounded together by settings.max_zip_expanded_bytes (#298). A
+# directly uploaded .jsonl.gz is bounded by this alone.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
@@ -3763,18 +3769,21 @@ def _process_job_sync(
                 # leaves no orphan source behind. replace=True releases the name
                 # from the version it replaces, so rechunk can't rebuild that.
                 try:
+                    # A gzipped file's bytes are gzip, whatever it decompresses to.
+                    media_type, encoding = mimetypes.guess_type(name)
                     sources.store(
                         collection,
                         name,
                         path.read_bytes(),
-                        mimetypes.guess_type(name)[0],
+                        "application/gzip" if encoding else media_type,
                         replace=True,
                     )
                 except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
-                    _log.error("Could not retain source %s for %r: %s", name, collection, exc)
+                    # Names are logged with %r: one can hold a newline (#298).
+                    _log.error("Could not retain source %r for %r: %s", name, collection, exc)
 
                 job["chunks_stored"] += len(chunks)
                 if problem is None:
@@ -3794,13 +3803,13 @@ def _process_job_sync(
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
                     f"its chunks, so nothing was changed: {exc}")
-                _log.warning("ingest job %s: %s not replaced", job_id, label, exc_info=True)
+                _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
                 job["files_failed"] += 1
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
-                _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
+                _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Before the status turns terminal: a client that sees the job end
@@ -3826,22 +3835,104 @@ def _os_reason(exc: OSError) -> str:
 
 def _rejected(code: str, message: str, file: str,
               members: list[dict[str, str]] | None = None) -> UploadRejected:
-    _log.warning("Upload refused (%s): %s", code, message)
+    # %r: the message names the upload and its members, and a name can hold a
+    # newline that would otherwise forge a log line (#298).
+    _log.warning("Upload refused (%s): %r", code, message)
     return UploadRejected(code, message, file, members)
 
 
 # How many unreadable members a refusal names in its message; detail lists all.
 _MAX_NAMED_MEMBERS = 10
 
+_BLOCK = 1024 * 1024
 
-def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo) -> tuple[str, bool] | None:
-    """Why this member can't be read, and whether that is damage; None if it reads."""
+
+class _OverCap(Exception):
+    """An upload's ZIPs expand past max_zip_expanded_bytes (#298)."""
+
+
+class _ExpansionBudget:
+    """Bytes the ZIPs of one upload request may still expand to (#298).
+
+    One total for the whole request: every ZIP in it adds to it, files
+    uploaded directly add nothing. Each member's bytes count once, as
+    validation reads them; extraction reads supported members again and does
+    not count them a second time.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+
+    def fits(self, size: int) -> bool:
+        return self.used + size <= self.limit
+
+    def spend(self, size: int) -> None:
+        self.used += size
+        if self.used > self.limit:
+            raise _OverCap()
+
+
+class _GzipCount:
+    """Counts what gzip data fed to it decompresses to, keeping none of it.
+
+    A gzipped member is only decompressed by the job, later, so its output
+    would not otherwise count toward the cap. Concatenated streams, and zero
+    padding between them, are followed as the job's gzip reader follows them.
+    Invalid gzip data stops the count; the job reports that file as it always
+    has.
+    """
+
+    def __init__(self, budget: _ExpansionBudget) -> None:
+        self.budget = budget
+        self.inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self.between = False  # at the end of a stream, before the next one
+        self.stopped = False
+
+    def feed(self, data: bytes) -> None:
+        if self.stopped:
+            return
+        try:
+            while True:
+                if self.between:
+                    data = data.lstrip(b"\x00")
+                    if not data:
+                        return
+                    self.inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    self.between = False
+                out = self.inflater.decompress(data, _BLOCK)
+                self.budget.spend(len(out))
+                if self.inflater.eof:
+                    data = self.inflater.unused_data
+                    self.between = True
+                    continue
+                data = self.inflater.unconsumed_tail
+                # A full block may leave output inside zlib even with no input left.
+                if not data and len(out) < _BLOCK:
+                    return
+        except zlib.error:
+            self.stopped = True
+
+
+def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo, budget: _ExpansionBudget,
+                    gunzip: bool = False) -> tuple[str, bool] | None:
+    """Why this member can't be read, and whether that is damage; None if it reads.
+
+    Every block read is counted toward the request's expansion cap, and a
+    gzipped member's decompressed output too (#298); _OverCap stops the read.
+    """
     if member.flag_bits & 0x1:
         return "password-protected", False
+    count = _GzipCount(budget) if gunzip else None
     try:
         with z.open(member) as data:
-            while data.read(1024 * 1024):
-                pass
+            while True:
+                block = data.read(_BLOCK)
+                if not block:
+                    break
+                budget.spend(len(block))
+                if count is not None:
+                    count.feed(block)
     except NotImplementedError:
         return f"unsupported compression method {member.compress_type}", False
     except OSError as exc:
@@ -3894,12 +3985,40 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
-def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
+def _limit_text(limit: int) -> str:
+    mib = 1024 * 1024
+    if limit >= mib and limit % mib == 0:
+        return f"{limit // mib:,} MB"
+    return f"{limit:,} bytes"
+
+
+def _too_large(safe_name: str, limit: int) -> UploadRejected:
+    return _rejected(
+        "ARCHIVE_TOO_LARGE",
+        f"'{safe_name}' expands to more than {_limit_text(limit)} when unpacked, the most one "
+        f"upload's ZIPs can expand to, so nothing from it was imported. Split it into smaller "
+        f"zips and upload them in separate imports.",
+        safe_name)
+
+
+def _declared_size(members: list[tuple[zipfile.ZipInfo, str]]) -> int:
+    """What the ZIP's directory says these members decompress to."""
+    return sum(member.file_size for member, _ in members)
+
+
+def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
     """Validate one uploaded ZIP, then queue its supported members.
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
     them; nothing is repaired, and nothing from it is ingested (#290).
+
+    The request's ZIPs may expand to at most the budget (#298): the sizes this
+    ZIP declares are checked before anything is read, then the bytes actually
+    decompressed, gzipped members' output included, are counted while reading,
+    and the request is refused as soon as the total passes the cap. This runs
+    in a worker thread: it can take seconds, and on the event loop it stalled
+    every other request.
     """
     remedy = "Re-create the zip and upload it again."
     try:
@@ -3922,11 +4041,20 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
                 continue
             members.append((member, logical))
 
+        if not budget.fits(_declared_size(members)):
+            raise _too_large(safe_name, budget.limit)
+
         problems = []
-        for member, _ in members:
-            problem = _member_problem(z, member)
-            if problem is not None:
-                problems.append((member.filename, *problem))
+        try:
+            for member, logical in members:
+                basename = PurePosixPath(logical).name
+                problem = _member_problem(z, member, budget,
+                                          _is_json_gz(basename) or _is_jsonl_gz(basename))
+                if problem is not None:
+                    problems.append((member.filename, *problem))
+        except _OverCap:
+            # As soon as the total passes the cap, whatever else was found.
+            raise _too_large(safe_name, budget.limit) from None
         if problems:
             damaged = any(is_damage for _, _, is_damage in problems)
             named = "; ".join(f"{name} ({reason})"
@@ -4009,6 +4137,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     # of 8 files silently report 6, with nothing saying which two or why.
     skipped: list[str] = []
     queue = _Queue(tmp_dir, skipped)
+    # One expansion total for every ZIP in this request (#298).
+    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
 
     try:
         for upload in files:
@@ -4030,7 +4160,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                     safe_name) from exc
 
             if safe_name.lower().endswith(".zip"):
-                _extract_zip(dest, safe_name, queue)
+                # Off the event loop, like the copy above (#298).
+                await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
                 os.remove(dest)
             elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
                   or _is_jsonl_gz(safe_name)):
@@ -8305,8 +8436,9 @@ async def ingest_upload(
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
-        _log.exception("Upload to collection %r failed unexpectedly (files: %s)",
-                       collection, ", ".join(f.filename or "?" for f in files))
+        # %r: a filename can hold a newline that would forge a log line (#298).
+        _log.exception("Upload to collection %r failed unexpectedly (files: %r)",
+                       collection, [f.filename for f in files])
         return api_error(500, "INGEST_FAILED",
                          "The upload failed because of an unexpected server error. "
                          "The API log has the details.")
@@ -12202,9 +12334,30 @@ wrong member offsets, bad CRC, also in a member that would be skipped, unsupport
 compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
 logged traceback, which inputs are queued (JSON Lines direct and as members, #291; a direct
 `.json.gz` and other gzip types skipped), and that gzipped JSON members are decompressed
-within their limit with clear per-file errors. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+within their limit with clear per-file errors. Since #298 it also checks a ZIP with damaged and
+unsupported members together (`ARCHIVE_UNREADABLE`, generic remedy), `UPLOAD_WRITE_FAILED` when
+saving the upload itself fails, names with a newline logged escaped in every ingest log line that
+carries one, the retained `media_type` of gzipped files (`application/gzip`), and rechunk of a
+retained `.json.gz`. Weaviate and source retention are mocked. `02_ingest.sh` runs it
 in the verify project's API container, then checks a truncated ZIP and a ZIP of
-`.json`, `.json.gz` and `.jsonl.gz` members through the proxy.
+`.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
+(suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
+failing status poll, and that a new ingest and the next successful poll clear that error.
+
+`scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
+upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
+to the container; the test sets it when absent): declared sizes over the cap refused before
+any member is read, a total at the cap accepted and one byte over refused, one total for every
+ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
+counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, the
+exact message and `detail`, the 2 GiB default, and that ZIP work runs in a worker thread while
+the event loop serves other work. `02_ingest.sh` runs it in the API container, then, at the
+default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
+gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
+`ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
+are answered within a second (a smoke check; the controlled test is the one that tells
+off-loop from on-loop work).
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -12371,13 +12524,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
@@ -13877,6 +14031,23 @@ def write(target: pathlib.Path) -> None:
     (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
                                       encoding="utf-8")
 
+    # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
+    # files are about 2 MB. zip_over_declared.zip honestly declares a member of
+    # 2,049 MiB of zeros, refused before anything is read (about 3 s to write).
+    # zip_over_gzip.zip declares only its 2 MB gzip member, but that member,
+    # 33 concatenated gzip streams of 64 MiB of zeros, decompresses to
+    # 2,112 MiB: it is refused while its output is counted.
+    zeros = bytes(1024 * 1024)
+    member = zipfile.ZipInfo("zeros.bin", date_time=(2026, 1, 1, 0, 0, 0))
+    member.compress_type = zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(target / "zip_over_declared.zip", "w") as z:
+        with z.open(member, "w", force_zip64=True) as out:
+            for _ in range(2049):
+                out.write(zeros)
+    stream = gzip.compress(bytes(64 * 1024 * 1024), mtime=0)
+    with zipfile.ZipFile(target / "zip_over_gzip.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", stream * 33)
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -14383,7 +14554,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/bad.jsonl" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/zip_over_gzip.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -14479,6 +14650,61 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if d.get('skipped', []) == [\"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\"] else 1)"
 check "only the other gzip member is skipped, as unsupported" $?
+
+# ── the expansion cap on an upload's ZIPs (#298) ────────────────────────────
+# Controlled cases with a 1 MiB cap set through the environment: declared
+# sizes, counted bytes, gzip output, several ZIPs in one upload, and ZIP work
+# running off the event loop.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_EXPANDED_BYTES=1048576 \
+  api python - < scripts/tests/test_zip_expansion.py)
+check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
+
+# The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
+too_large() {
+  local name="$1" code
+  code=$(curl -s -m 300 -o /tmp/vfy_cap.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+    -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/$name")
+  python3 - "$code" "$name" <<'ENDPY'
+import json, sys
+code, name = sys.argv[1], sys.argv[2]
+want = (f"'{name}' expands to more than 2,048 MB when unpacked, the most one upload's ZIPs "
+        f"can expand to, so nothing from it was imported. Split it into smaller zips and "
+        f"upload them in separate imports.")
+try:
+    e = json.load(open('/tmp/vfy_cap.json'))['error']
+except Exception:
+    print(code, 'not-json', 'no'); raise SystemExit
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': []}
+print(code, e['code'], 'yes' if ok else 'no')
+ENDPY
+}
+read -r code err_code text_ok <<<"$(too_large zip_over_declared.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP declaring more than 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+
+# While a gzip member's output is counted, other requests are still answered.
+# A smoke check: the count takes about a second, so the controlled test above
+# is the one that tells off-loop from on-loop work.
+too_large zip_over_gzip.zip > /tmp/vfy_cap_result.txt &
+upload_pid=$!
+probes=0; slow=0; worst=0
+while kill -0 "$upload_pid" 2>/dev/null; do
+  read -r pcode ptime <<<"$(curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}' "$API/ingest/job/vfy-none")"
+  probes=$((probes + 1))
+  if [ "$pcode" != 404 ] || python3 -c "import sys; sys.exit(0 if float('$ptime') >= 1.0 else 1)"; then
+    slow=$((slow + 1))
+  fi
+  worst=$(python3 -c "print(max(float('$worst'), float('$ptime')))")
+done
+wait "$upload_pid"
+read -r code err_code text_ok < /tmp/vfy_cap_result.txt
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+[ "$slow" = 0 ]
+check "job polls are answered while a ZIP is being counted" $? \
+  "$probes probes, $slow slow or failed, slowest ${worst}s"
 
 # ── ordinary JSON as readable text (#295) ────────────────────────────────────
 # Controlled cases: every conversion rule, file key order, non-ASCII text,
@@ -18083,6 +18309,60 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
               clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
               clicked ? text.slice(0, 200) : 'Start Ingest button not found');
       r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  // A poll error is cleared by a new ingest and by the next successful poll
+  // (#298). Job A's polls always fail; job B's first poll fails, then it
+  // completes. Polls run every 3 s.
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll-clear.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    const failure = JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } });
+    let uploads = 0, pollsB = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST') {
+        uploads += 1;
+        const job = uploads === 1 ? 'vfyclrA' : 'vfyclrB';
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: job, status: 'queued', files_queued: 1, collection: 'x' }) });
+      }
+      if (path === '/api/ingest/job/vfyclrA')
+        return request.respond({ status: 500, contentType: 'application/json', body: failure });
+      if (path === '/api/ingest/job/vfyclrB') {
+        pollsB += 1;
+        if (pollsB === 1) return request.respond({ status: 500, contentType: 'application/json', body: failure });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfyclrB', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, chunks_replaced: 0, errors: [], skipped: [] }) });
+      }
+      return request.continue();
+    });
+    const shown = text => text.includes("Could not check the import's progress: Synthetic status failure.");
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const first = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);                       // job A's first poll has failed
+      const before = shown(await bodyText(s.page));
+      const second = await clickByText(s.page, 'Start Ingest');
+      await sleep(1000);                       // job B accepted, not yet polled
+      const afterNew = await bodyText(s.page);
+      r.check('a new ingest clears a poll error',
+              first && second && before && uploads === 2 && !shown(afterNew),
+              `clicked=${first},${second} shown-before=${before} uploads=${uploads} after: ${afterNew.slice(0, 160)}`);
+      await sleep(2700);                       // job B's first poll has failed
+      const failedAgain = shown(await bodyText(s.page));
+      await sleep(3000);                       // job B's second poll has succeeded
+      const afterPoll = await bodyText(s.page);
+      r.check('the next successful poll clears a poll error',
+              failedAgain && pollsB >= 2 && !shown(afterPoll),
+              `shown-after-B's-first-poll=${failedAgain} B-polls=${pollsB} after: ${afterPoll.slice(0, 160)}`);
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();

@@ -26,8 +26,10 @@ from services import weaviate_client as wc
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
 # Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
 # directly or inside a ZIP (#291). Either is decompressed when the job parses
-# it, never more than this many bytes: the per-request upload limit, so gzip
-# cannot bring in more than a plain upload could.
+# it, never more than this many bytes. The bound is per file, so several
+# gzipped members could each reach it: a ZIP's members, their gzip output
+# included, are bounded together by settings.max_zip_expanded_bytes (#298). A
+# directly uploaded .jsonl.gz is bounded by this alone.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
@@ -632,18 +634,21 @@ def _process_job_sync(
                 # leaves no orphan source behind. replace=True releases the name
                 # from the version it replaces, so rechunk can't rebuild that.
                 try:
+                    # A gzipped file's bytes are gzip, whatever it decompresses to.
+                    media_type, encoding = mimetypes.guess_type(name)
                     sources.store(
                         collection,
                         name,
                         path.read_bytes(),
-                        mimetypes.guess_type(name)[0],
+                        "application/gzip" if encoding else media_type,
                         replace=True,
                     )
                 except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
-                    _log.error("Could not retain source %s for %r: %s", name, collection, exc)
+                    # Names are logged with %r: one can hold a newline (#298).
+                    _log.error("Could not retain source %r for %r: %s", name, collection, exc)
 
                 job["chunks_stored"] += len(chunks)
                 if problem is None:
@@ -663,13 +668,13 @@ def _process_job_sync(
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
                     f"its chunks, so nothing was changed: {exc}")
-                _log.warning("ingest job %s: %s not replaced", job_id, label, exc_info=True)
+                _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
                 job["files_failed"] += 1
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
-                _log.warning("ingest job %s: %s failed", job_id, label, exc_info=True)
+                _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Before the status turns terminal: a client that sees the job end
@@ -695,22 +700,104 @@ def _os_reason(exc: OSError) -> str:
 
 def _rejected(code: str, message: str, file: str,
               members: list[dict[str, str]] | None = None) -> UploadRejected:
-    _log.warning("Upload refused (%s): %s", code, message)
+    # %r: the message names the upload and its members, and a name can hold a
+    # newline that would otherwise forge a log line (#298).
+    _log.warning("Upload refused (%s): %r", code, message)
     return UploadRejected(code, message, file, members)
 
 
 # How many unreadable members a refusal names in its message; detail lists all.
 _MAX_NAMED_MEMBERS = 10
 
+_BLOCK = 1024 * 1024
 
-def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo) -> tuple[str, bool] | None:
-    """Why this member can't be read, and whether that is damage; None if it reads."""
+
+class _OverCap(Exception):
+    """An upload's ZIPs expand past max_zip_expanded_bytes (#298)."""
+
+
+class _ExpansionBudget:
+    """Bytes the ZIPs of one upload request may still expand to (#298).
+
+    One total for the whole request: every ZIP in it adds to it, files
+    uploaded directly add nothing. Each member's bytes count once, as
+    validation reads them; extraction reads supported members again and does
+    not count them a second time.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+
+    def fits(self, size: int) -> bool:
+        return self.used + size <= self.limit
+
+    def spend(self, size: int) -> None:
+        self.used += size
+        if self.used > self.limit:
+            raise _OverCap()
+
+
+class _GzipCount:
+    """Counts what gzip data fed to it decompresses to, keeping none of it.
+
+    A gzipped member is only decompressed by the job, later, so its output
+    would not otherwise count toward the cap. Concatenated streams, and zero
+    padding between them, are followed as the job's gzip reader follows them.
+    Invalid gzip data stops the count; the job reports that file as it always
+    has.
+    """
+
+    def __init__(self, budget: _ExpansionBudget) -> None:
+        self.budget = budget
+        self.inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self.between = False  # at the end of a stream, before the next one
+        self.stopped = False
+
+    def feed(self, data: bytes) -> None:
+        if self.stopped:
+            return
+        try:
+            while True:
+                if self.between:
+                    data = data.lstrip(b"\x00")
+                    if not data:
+                        return
+                    self.inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    self.between = False
+                out = self.inflater.decompress(data, _BLOCK)
+                self.budget.spend(len(out))
+                if self.inflater.eof:
+                    data = self.inflater.unused_data
+                    self.between = True
+                    continue
+                data = self.inflater.unconsumed_tail
+                # A full block may leave output inside zlib even with no input left.
+                if not data and len(out) < _BLOCK:
+                    return
+        except zlib.error:
+            self.stopped = True
+
+
+def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo, budget: _ExpansionBudget,
+                    gunzip: bool = False) -> tuple[str, bool] | None:
+    """Why this member can't be read, and whether that is damage; None if it reads.
+
+    Every block read is counted toward the request's expansion cap, and a
+    gzipped member's decompressed output too (#298); _OverCap stops the read.
+    """
     if member.flag_bits & 0x1:
         return "password-protected", False
+    count = _GzipCount(budget) if gunzip else None
     try:
         with z.open(member) as data:
-            while data.read(1024 * 1024):
-                pass
+            while True:
+                block = data.read(_BLOCK)
+                if not block:
+                    break
+                budget.spend(len(block))
+                if count is not None:
+                    count.feed(block)
     except NotImplementedError:
         return f"unsupported compression method {member.compress_type}", False
     except OSError as exc:
@@ -763,12 +850,40 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
-def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
+def _limit_text(limit: int) -> str:
+    mib = 1024 * 1024
+    if limit >= mib and limit % mib == 0:
+        return f"{limit // mib:,} MB"
+    return f"{limit:,} bytes"
+
+
+def _too_large(safe_name: str, limit: int) -> UploadRejected:
+    return _rejected(
+        "ARCHIVE_TOO_LARGE",
+        f"'{safe_name}' expands to more than {_limit_text(limit)} when unpacked, the most one "
+        f"upload's ZIPs can expand to, so nothing from it was imported. Split it into smaller "
+        f"zips and upload them in separate imports.",
+        safe_name)
+
+
+def _declared_size(members: list[tuple[zipfile.ZipInfo, str]]) -> int:
+    """What the ZIP's directory says these members decompress to."""
+    return sum(member.file_size for member, _ in members)
+
+
+def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
     """Validate one uploaded ZIP, then queue its supported members.
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
     them; nothing is repaired, and nothing from it is ingested (#290).
+
+    The request's ZIPs may expand to at most the budget (#298): the sizes this
+    ZIP declares are checked before anything is read, then the bytes actually
+    decompressed, gzipped members' output included, are counted while reading,
+    and the request is refused as soon as the total passes the cap. This runs
+    in a worker thread: it can take seconds, and on the event loop it stalled
+    every other request.
     """
     remedy = "Re-create the zip and upload it again."
     try:
@@ -791,11 +906,20 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
                 continue
             members.append((member, logical))
 
+        if not budget.fits(_declared_size(members)):
+            raise _too_large(safe_name, budget.limit)
+
         problems = []
-        for member, _ in members:
-            problem = _member_problem(z, member)
-            if problem is not None:
-                problems.append((member.filename, *problem))
+        try:
+            for member, logical in members:
+                basename = PurePosixPath(logical).name
+                problem = _member_problem(z, member, budget,
+                                          _is_json_gz(basename) or _is_jsonl_gz(basename))
+                if problem is not None:
+                    problems.append((member.filename, *problem))
+        except _OverCap:
+            # As soon as the total passes the cap, whatever else was found.
+            raise _too_large(safe_name, budget.limit) from None
         if problems:
             damaged = any(is_damage for _, _, is_damage in problems)
             named = "; ".join(f"{name} ({reason})"
@@ -878,6 +1002,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     # of 8 files silently report 6, with nothing saying which two or why.
     skipped: list[str] = []
     queue = _Queue(tmp_dir, skipped)
+    # One expansion total for every ZIP in this request (#298).
+    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
 
     try:
         for upload in files:
@@ -899,7 +1025,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                     safe_name) from exc
 
             if safe_name.lower().endswith(".zip"):
-                _extract_zip(dest, safe_name, queue)
+                # Off the event loop, like the copy above (#298).
+                await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
                 os.remove(dest)
             elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
                   or _is_jsonl_gz(safe_name)):
