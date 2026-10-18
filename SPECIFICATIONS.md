@@ -491,9 +491,10 @@ all; files uploaded directly, a `.jsonl.gz` included, don't count. Before a ZIP'
 read, the total so far plus the uncompressed sizes the ZIP declares for the members validation
 reads is checked. While validation reads each member, the bytes it decompresses are counted, once
 per member (extraction reads supported members again but doesn't count them); a `.json.gz` or
-`.jsonl.gz` member is also gunzipped, only to count its output (concatenated streams and zero
-padding followed, as the job's reader does), on top of its own bytes. Invalid gzip data stops that
-member's count, and the job reports the file as usual. As soon as the total is over the cap the
+`.jsonl.gz` member is also gunzipped, only to count its output, on top of its own bytes. It is
+read with the job's own gzip reader (Python's `gzip` module), so the count is what the job would
+decompress: the same headers accepted, concatenated streams and zero padding followed. Gzip data
+that reader refuses stops that member's count, and the job reports the file as usual. As soon as the total is over the cap the
 whole request is refused, whatever else was found: 400 `ARCHIVE_TOO_LARGE`, `'<zip>' expands to
 more than 2,048 MB when unpacked, the most one upload's ZIPs can expand to, so nothing from it was
 imported. Split it into smaller zips and upload them in separate imports.` (`<zip>` is the ZIP
@@ -2131,8 +2132,13 @@ now lives once, in `api/services/ingest_config.py`.
       over refused, the total shared by two ZIPs, counting when declared sizes understate,
       `.json.gz` and `.jsonl.gz` output, concatenated streams with zero padding, a corrupt and a
       truncated gzip, a direct `.jsonl.gz` not counted, the cap passed after an unreadable
-      member, the 2 GiB default and the ZIP work running in a worker thread while the loop
-      serves other work. `02_ingest.sh` runs both in the verify project's API container, then
+      member, no member read and gzip counting stopped within one block once the cap is passed,
+      the 2 GiB default and the ZIP work running in a worker thread while the loop serves other
+      work. The PR #318 security review found that counting with zlib's gzip mode let a member
+      whose header zlib refuses (FHCRC with a bogus CRC, a reserved flag bit) count nothing
+      although the job decompresses it all: members are now counted with the job's own gzip
+      reader, and a test checks the count equals what that reader produces for plain,
+      concatenated, padded, truncated, trailing-garbage, non-gzip and both header cases. `02_ingest.sh` runs both in the verify project's API container, then
       through the proxy refuses a truncated ZIP, ingests a ZIP of `.json`, `.json.gz` and
       `.jsonl.gz` members, and refuses with the exact message a ZIP declaring 2,049 MiB and one
       whose gzip member expands to 2,112 MiB, while job polls are still answered;

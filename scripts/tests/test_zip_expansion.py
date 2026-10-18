@@ -21,6 +21,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -51,6 +52,33 @@ def upload(name, data):
     return UploadFile(file=io.BytesIO(data), filename=name)
 
 
+def with_header_crc(data):
+    """FHCRC set with a bogus header CRC: zlib's gzip mode refuses it, the
+    job's gzip reader skips the field and decompresses everything."""
+    return data[:3] + bytes([data[3] | 0x02]) + data[4:10] + b"\xde\xad" + data[10:]
+
+
+def with_reserved_flag(data):
+    """A reserved FLG bit set: also refused by zlib, read by the gzip module."""
+    return data[:3] + bytes([data[3] | 0x20]) + data[4:]
+
+
+def job_output(data):
+    """How many bytes the job's reader (the gzip module) gets from data before
+    it ends or refuses it."""
+    total = 0
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
+            while True:
+                block = gz.read(1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+    except (OSError, EOFError, zlib.error):
+        pass
+    return total
+
+
 def message(name, limit="1 MB"):
     return (f"'{name}' expands to more than {limit} when unpacked, the most one upload's ZIPs "
             f"can expand to, so nothing from it was imported. Split it into smaller zips and "
@@ -72,7 +100,9 @@ class SettingTests(unittest.TestCase):
         self.assertEqual(ingest_pipeline._limit_text(1000), "1,000 bytes")
 
 
-class CapTests(unittest.TestCase):
+class CapHarness(unittest.TestCase):
+    """Posts uploads through the router with a 1 MiB cap; no worker runs."""
+
     def setUp(self):
         self.assertEqual(CAP, 1024 * 1024, "these cases are sized for a 1 MiB cap")
         self.temp = tempfile.TemporaryDirectory()
@@ -114,6 +144,9 @@ class CapTests(unittest.TestCase):
         self.assertEqual(len(self.started), 1)
         return sorted(self.started[0][-1].values())
 
+
+
+class CapTests(CapHarness):
     # ── declared sizes ────────────────────────────────────────────────────────
     def test_declared_sizes_over_the_cap_refuse_before_reading(self):
         read = []
@@ -205,6 +238,80 @@ class CapTests(unittest.TestCase):
         data[data.index(payload)] ^= 0x01
         status, body = self.post(upload("bad.zip", bytes(data)))
         self.assertEqual((status, body["error"]["code"]), (400, "ARCHIVE_UNREADABLE"))
+
+    # ── checking stops as soon as the total passes the cap (Decision 2) ─────────
+    def test_no_member_is_read_after_the_cap_is_passed(self):
+        read = []
+        real = ingest_pipeline._member_problem
+        data = zip_bytes([("big.txt", "a" * (CAP + 1)), ("later.txt", "text"),
+                          ("last.json.gz", gzip.compress(b"{}"))])
+        with patch.object(ingest_pipeline, "_declared_size", lambda _members: 0), \
+                patch.object(ingest_pipeline, "_member_problem",
+                             lambda *a, **k: read.append(a[1].filename) or real(*a, **k)):
+            status, body = self.post(upload("stop.zip", data))
+        self.assert_too_large(status, body, "stop.zip")
+        self.assertEqual(read, ["big.txt"])
+
+    def test_counting_a_gzip_member_stops_soon_after_the_cap(self):
+        # 64 MiB of output from about 64 KiB of gzip: counting it all would
+        # spend 64 times the cap; it stops within one block of passing it.
+        most = []
+        real = ingest_pipeline._ExpansionBudget.spend
+
+        def spend(budget, size):
+            try:
+                real(budget, size)
+            finally:
+                most.append(budget.used)
+
+        data = zip_bytes([("huge.json.gz", gzip.compress(bytes(64 * CAP)))], zipfile.ZIP_STORED)
+        with patch.object(ingest_pipeline._ExpansionBudget, "spend", spend):
+            status, body = self.post(upload("huge.zip", data))
+        self.assert_too_large(status, body, "huge.zip")
+        self.assertLessEqual(max(most), CAP + ingest_pipeline._BLOCK, max(most))
+
+
+class GzipHeaderTests(CapHarness):
+    """The count reads gzip members as the job does, so a header the job
+    accepts can't make a member count nothing (PR #318 security review)."""
+
+    def test_headers_zlib_refuses_still_count(self):
+        for label, variant in (("FHCRC", with_header_crc), ("reserved flag", with_reserved_flag)):
+            with self.subTest(label):
+                data = variant(gzip.compress(b" " * (CAP + 1)))
+                # The job's reader gets it all; zlib's gzip mode refuses it.
+                self.assertEqual(job_output(data), CAP + 1)
+                with self.assertRaises(zlib.error):
+                    zlib.decompressobj(31).decompress(data)
+                status, body = self.post(upload("hdr.zip", zip_bytes([("a.json.gz", data)])))
+                self.assert_too_large(status, body, "hdr.zip")
+
+    def test_several_such_members_cannot_add_up_unseen(self):
+        part = with_header_crc(gzip.compress(b" " * (CAP // 4 + 1)))
+        data = zip_bytes([(f"m{i}.jsonl.gz", part) for i in range(4)])
+        status, body = self.post(upload("many.zip", data))
+        self.assert_too_large(status, body, "many.zip")
+
+    def test_the_count_is_what_the_job_reader_gets(self):
+        plain = gzip.compress(b"x" * 1000)
+        cases = {
+            "plain": plain,
+            "concatenated with padding": plain + b"\0" * 7 + gzip.compress(b"y" * 300),
+            "header CRC": with_header_crc(plain),
+            "reserved flag": with_reserved_flag(plain),
+            "truncated": gzip.compress(os.urandom(5000))[:3000],
+            "trailing garbage": plain + b"junk",
+            "not gzip": b"this is not gzip" * 10,
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                buf = io.BytesIO(zip_bytes([("a.json.gz", data)], zipfile.ZIP_STORED))
+                with zipfile.ZipFile(buf) as z:
+                    budget = ingest_pipeline._ExpansionBudget(10 * CAP)
+                    problem = ingest_pipeline._member_problem(z, z.infolist()[0], budget, True)
+                self.assertIsNone(problem)
+                # The member's own bytes, once, plus what the job would decompress.
+                self.assertEqual(budget.used, len(data) + job_output(data))
 
 
 class EventLoopTests(unittest.TestCase):

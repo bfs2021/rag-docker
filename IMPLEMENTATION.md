@@ -3873,45 +3873,51 @@ class _ExpansionBudget:
             raise _OverCap()
 
 
-class _GzipCount:
-    """Counts what gzip data fed to it decompresses to, keeping none of it.
+class _CountedMember:
+    """A ZIP member's data, counting every block read toward the cap (#298).
 
-    A gzipped member is only decompressed by the job, later, so its output
-    would not otherwise count toward the cap. Concatenated streams, and zero
-    padding between them, are followed as the job's gzip reader follows them.
-    Invalid gzip data stops the count; the job reports that file as it always
-    has.
+    It is what the gzip reader reads from, so an error raised here is about the
+    ZIP member itself (damage), never about its gzip data; it is kept so the
+    caller can tell the two apart.
     """
 
-    def __init__(self, budget: _ExpansionBudget) -> None:
+    def __init__(self, data: Any, budget: _ExpansionBudget) -> None:
+        self.data = data
         self.budget = budget
-        self.inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        self.between = False  # at the end of a stream, before the next one
-        self.stopped = False
+        self.error: BaseException | None = None
 
-    def feed(self, data: bytes) -> None:
-        if self.stopped:
-            return
+    def read(self, size: int = -1) -> bytes:
         try:
+            block = self.data.read(_BLOCK if size is None or size < 0 else min(size, _BLOCK))
+        except BaseException as exc:
+            self.error = exc
+            raise
+        self.budget.spend(len(block))
+        return block
+
+
+def _count_gzip_output(member: _CountedMember, budget: _ExpansionBudget) -> None:
+    """Count what a gzipped member decompresses to, keeping none of it.
+
+    The job decompresses .json.gz and .jsonl.gz members later, with gzip.open,
+    so their output would not otherwise count toward the cap. They are read
+    here with the same reader, gzip.GzipFile, so the count is what the job
+    would decompress: the same headers accepted (zlib's own gzip mode refuses
+    some the job reads in full, which let them count nothing), concatenated
+    streams and zero padding followed. Gzip data the reader refuses stops the
+    count, and the job reports that file as it always has.
+    """
+    try:
+        with gzip.GzipFile(fileobj=member, mode="rb") as gz:
             while True:
-                if self.between:
-                    data = data.lstrip(b"\x00")
-                    if not data:
-                        return
-                    self.inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                    self.between = False
-                out = self.inflater.decompress(data, _BLOCK)
-                self.budget.spend(len(out))
-                if self.inflater.eof:
-                    data = self.inflater.unused_data
-                    self.between = True
-                    continue
-                data = self.inflater.unconsumed_tail
-                # A full block may leave output inside zlib even with no input left.
-                if not data and len(out) < _BLOCK:
-                    return
-        except zlib.error:
-            self.stopped = True
+                block = gz.read(_BLOCK)
+                if not block:
+                    break
+                budget.spend(len(block))
+    except (OSError, EOFError, zlib.error):
+        if member.error is not None:
+            raise member.error
+        # Invalid gzip data: its count stops here.
 
 
 def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo, budget: _ExpansionBudget,
@@ -3923,16 +3929,15 @@ def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo, budget: _Expans
     """
     if member.flag_bits & 0x1:
         return "password-protected", False
-    count = _GzipCount(budget) if gunzip else None
     try:
         with z.open(member) as data:
-            while True:
-                block = data.read(_BLOCK)
-                if not block:
-                    break
-                budget.spend(len(block))
-                if count is not None:
-                    count.feed(block)
+            counted = _CountedMember(data, budget)
+            if gunzip:
+                _count_gzip_output(counted, budget)
+            # The rest of the member (all of it, if not gzip) is still read to
+            # its end, so damage anywhere in it is found.
+            while counted.read(_BLOCK):
+                pass
     except NotImplementedError:
         return f"unsupported compression method {member.compress_type}", False
     except OSError as exc:
@@ -12350,9 +12355,12 @@ to the container; the test sets it when absent): declared sizes over the cap ref
 any member is read, a total at the cap accepted and one byte over refused, one total for every
 ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
 counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
-one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, the
-exact message and `detail`, the 2 GiB default, and that ZIP work runs in a worker thread while
-the event loop serves other work. `02_ingest.sh` runs it in the API container, then, at the
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
+member read and gzip counting stopped within one block once the cap is passed, gzip headers
+that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
+counted, the count equal to what the job's gzip reader produces, the exact message and
+`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
+serves other work. `02_ingest.sh` runs it in the API container, then, at the
 default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
 gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
 `ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted

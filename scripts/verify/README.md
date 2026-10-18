@@ -208,9 +208,12 @@ to the container; the test sets it when absent): declared sizes over the cap ref
 any member is read, a total at the cap accepted and one byte over refused, one total for every
 ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
 counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
-one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, the
-exact message and `detail`, the 2 GiB default, and that ZIP work runs in a worker thread while
-the event loop serves other work. `02_ingest.sh` runs it in the API container, then, at the
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
+member read and gzip counting stopped within one block once the cap is passed, gzip headers
+that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
+counted, the count equal to what the job's gzip reader produces, the exact message and
+`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
+serves other work. `02_ingest.sh` runs it in the API container, then, at the
 default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
 gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
 `ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
