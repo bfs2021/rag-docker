@@ -12111,8 +12111,15 @@ rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mock
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
-with one filename. `05_transfer.sh` (E32) replaces a file, adds a second name for the new
-content, re-chunks, and checks that only the new text comes back, under both names.
+with one filename. With a real gold-standard session planted for the collection, it checks
+that ingesting a new name leaves the session current and a replacing re-ingest marks it
+stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
+version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
+chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
+0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+`05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
+and checks that only the new text comes back, under both names.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -14511,6 +14518,76 @@ sys.exit(0 if ok else 1)
 ENDPY
 check "the same name twice in one upload ingests the last and reports the first" $? \
   "$(head -c 300 /tmp/vfy_ri_dupe.json)"
+
+# Gold-standard sessions are marked stale only when a re-ingest replaces earlier
+# chunks, never for a brand-new name (#22). A real session, not a mocked marker.
+RIGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RI" "$RIGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ri_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "policies.txt", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "re-ingest: a synthetic gold-standard session is planted for the collection" $?
+# The API reads sessions written by another process at its next scan.
+api_get "/goldstandard/diagnostics" >/dev/null
+printf 'Fresh document. The gym opens at six.\n' > "$RIFIX/fresh.txt"
+ingest "$RI" fixed 200 40 "$RIFIX/fresh.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' and j.get('chunks_replaced')==0 else 1)"
+check "ingesting a brand-new name leaves gold-standard sessions current" $? "$(head -c 300 /tmp/vfy_ri_gs.json)"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+r=d.get('stale_reason') or ''
+print(d.get('stale'), r, j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is True and 're-ingested' in r and 'policies.txt' in r
+         and j['status']=='completed' and j.get('chunks_replaced',0)>0 else 1)"
+check "a replacing re-ingest marks the collection's gold-standard sessions stale, naming the file" $? \
+  "$(head -c 300 /tmp/vfy_ri_gs.json)"
+
+# Two concurrent uploads of one name (#22): the job that runs last wins, each
+# job is applied whole, and arrival order is not promised, so either may win.
+for v in 1 2; do
+  src="$FIX/policies.txt"; [ "$v" = 2 ] && src="$RIFIX/v2/policies.txt"
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$src;filename=race.txt" > "/tmp/vfy_ri_race$v.json" &
+done
+wait
+for v in 1 2; do
+  rj=$(jfield "['job_id']" < "/tmp/vfy_ri_race$v.json")
+  [ -n "$rj" ] && wait_for_job "/ingest/job/$rj" 900 >/dev/null
+  api_get "/ingest/job/$rj" > "/tmp/vfy_ri_race$v.done.json"
+done
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$FIX/policies.txt" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+sha = [hashlib.sha256(open(p, "rb").read()).hexdigest() for p in sys.argv[1:3]]
+jobs = [json.load(open(f"/tmp/vfy_ri_race{v}.done.json")) for v in (1, 2)]
+st = json.load(open("/tmp/vfy_ri_state.json"))
+texts = [c for n, c in st["chunks"] if n == "race.txt"]
+joined = " ".join(texts)
+v1, v2 = "Travel Booking" in joined, "Parking Permits" in joined
+win = 0 if v1 else 1
+digests = [d for d, e in st["index"].items() if "race.txt" in e["filenames"]]
+checks = {
+    "both completed": all(j.get("status") == "completed" for j in jobs),
+    "exactly one version present": v1 != v2,
+    "winner's whole chunk set": len(texts) == jobs[win].get("chunks_stored"),
+    "winner replaced the loser's set": jobs[win].get("chunks_replaced") == jobs[1 - win].get("chunks_stored"),
+    "one digest, the winner's": digests == [sha[win]],
+}
+print({k: v for k, v in checks.items() if not v} or "ok", [j.get("status") for j in jobs])
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "two concurrent uploads of one name leave exactly one job's version, whole" $?
 drop_collection "$RI"
 rm -rf "$RIFIX"
 
@@ -17757,6 +17834,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
               clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
               clicked ? text.slice(0, 200) : 'Start Ingest button not found');
       r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
+  // ── re-ingest progress (#22) ───────────────────────────────────────────────
+  // The progress panel reports replaced chunks, and the skipped heading no
+  // longer claims every skip is an unsupported type: a later file with the
+  // same name in one upload is skipped too. Job responses are stubbed.
+  r.section('re-ingest progress');
+  for (const [replaced, label] of [[3, 'Replaced 3 chunks from a previous version'], [1, 'Replaced 1 chunk from a previous version'], [0, null]]) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-reingest.txt';
+    fs.writeFileSync(small, 'Re-ingest fixture.\n');
+    const jobId = 'vfyrein' + replaced;
+    const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (label) {
+        r.check(`chunks_replaced=${replaced} is shown as "${label}"`, clicked && text.includes(label),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check('chunks_replaced=0 shows no replacement line', clicked && text.includes('Chunks stored: 2') && !text.includes('Replaced '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+        r.check('the skipped heading is a plain "1 file skipped:" with the entry\'s own reason',
+                text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
+                text.slice(0, 300));
+      }
+      r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();

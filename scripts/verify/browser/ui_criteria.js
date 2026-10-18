@@ -435,6 +435,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── re-ingest progress (#22) ───────────────────────────────────────────────
+  // The progress panel reports replaced chunks, and the skipped heading no
+  // longer claims every skip is an unsupported type: a later file with the
+  // same name in one upload is skipped too. Job responses are stubbed.
+  r.section('re-ingest progress');
+  for (const [replaced, label] of [[3, 'Replaced 3 chunks from a previous version'], [1, 'Replaced 1 chunk from a previous version'], [0, null]]) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-reingest.txt';
+    fs.writeFileSync(small, 'Re-ingest fixture.\n');
+    const jobId = 'vfyrein' + replaced;
+    const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (label) {
+        r.check(`chunks_replaced=${replaced} is shown as "${label}"`, clicked && text.includes(label),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check('chunks_replaced=0 shows no replacement line', clicked && text.includes('Chunks stored: 2') && !text.includes('Replaced '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+        r.check('the skipped heading is a plain "1 file skipped:" with the entry\'s own reason',
+                text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
+                text.slice(0, 300));
+      }
+      r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {

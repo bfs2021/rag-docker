@@ -317,6 +317,76 @@ sys.exit(0 if ok else 1)
 ENDPY
 check "the same name twice in one upload ingests the last and reports the first" $? \
   "$(head -c 300 /tmp/vfy_ri_dupe.json)"
+
+# Gold-standard sessions are marked stale only when a re-ingest replaces earlier
+# chunks, never for a brand-new name (#22). A real session, not a mocked marker.
+RIGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RI" "$RIGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ri_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "policies.txt", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "re-ingest: a synthetic gold-standard session is planted for the collection" $?
+# The API reads sessions written by another process at its next scan.
+api_get "/goldstandard/diagnostics" >/dev/null
+printf 'Fresh document. The gym opens at six.\n' > "$RIFIX/fresh.txt"
+ingest "$RI" fixed 200 40 "$RIFIX/fresh.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' and j.get('chunks_replaced')==0 else 1)"
+check "ingesting a brand-new name leaves gold-standard sessions current" $? "$(head -c 300 /tmp/vfy_ri_gs.json)"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+r=d.get('stale_reason') or ''
+print(d.get('stale'), r, j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is True and 're-ingested' in r and 'policies.txt' in r
+         and j['status']=='completed' and j.get('chunks_replaced',0)>0 else 1)"
+check "a replacing re-ingest marks the collection's gold-standard sessions stale, naming the file" $? \
+  "$(head -c 300 /tmp/vfy_ri_gs.json)"
+
+# Two concurrent uploads of one name (#22): the job that runs last wins, each
+# job is applied whole, and arrival order is not promised, so either may win.
+for v in 1 2; do
+  src="$FIX/policies.txt"; [ "$v" = 2 ] && src="$RIFIX/v2/policies.txt"
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$src;filename=race.txt" > "/tmp/vfy_ri_race$v.json" &
+done
+wait
+for v in 1 2; do
+  rj=$(jfield "['job_id']" < "/tmp/vfy_ri_race$v.json")
+  [ -n "$rj" ] && wait_for_job "/ingest/job/$rj" 900 >/dev/null
+  api_get "/ingest/job/$rj" > "/tmp/vfy_ri_race$v.done.json"
+done
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$FIX/policies.txt" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+sha = [hashlib.sha256(open(p, "rb").read()).hexdigest() for p in sys.argv[1:3]]
+jobs = [json.load(open(f"/tmp/vfy_ri_race{v}.done.json")) for v in (1, 2)]
+st = json.load(open("/tmp/vfy_ri_state.json"))
+texts = [c for n, c in st["chunks"] if n == "race.txt"]
+joined = " ".join(texts)
+v1, v2 = "Travel Booking" in joined, "Parking Permits" in joined
+win = 0 if v1 else 1
+digests = [d for d, e in st["index"].items() if "race.txt" in e["filenames"]]
+checks = {
+    "both completed": all(j.get("status") == "completed" for j in jobs),
+    "exactly one version present": v1 != v2,
+    "winner's whole chunk set": len(texts) == jobs[win].get("chunks_stored"),
+    "winner replaced the loser's set": jobs[win].get("chunks_replaced") == jobs[1 - win].get("chunks_stored"),
+    "one digest, the winner's": digests == [sha[win]],
+}
+print({k: v for k, v in checks.items() if not v} or "ok", [j.get("status") for j in jobs])
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "two concurrent uploads of one name leave exactly one job's version, whole" $?
 drop_collection "$RI"
 rm -rf "$RIFIX"
 

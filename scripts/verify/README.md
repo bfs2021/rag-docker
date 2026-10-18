@@ -247,8 +247,15 @@ rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mock
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
-with one filename. `05_transfer.sh` (E32) replaces a file, adds a second name for the new
-content, re-chunks, and checks that only the new text comes back, under both names.
+with one filename. With a real gold-standard session planted for the collection, it checks
+that ingesting a new name leaves the session current and a replacing re-ingest marks it
+stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
+version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
+chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
+0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+`05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
+and checks that only the new text comes back, under both names.
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
