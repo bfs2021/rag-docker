@@ -3001,6 +3001,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import gzip
+import json
 import logging
 import mimetypes
 import os
@@ -3016,7 +3017,7 @@ from typing import Any
 from services import collection_writes
 from config import settings
 from models.schemas import IngestConfig
-from services.chunker import chunk as do_chunk
+from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
 
@@ -3094,6 +3095,179 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
             f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
 
 
+class _JsonError(ValueError):
+    """A .json file that can't be read as JSON; `detail` is the parser's reason."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"is not valid JSON: {detail}")
+        self.detail = detail
+
+
+class _JsonTooLarge(_JsonError):
+    """Valid JSON whose converted text would be over the per-file text limit."""
+
+    def __init__(self) -> None:
+        detail = (f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
+                  f"the per-file limit for every chunking strategy; split the file")
+        ValueError.__init__(self, detail)
+        self.detail = detail
+
+
+# The most text one JSON file may convert to (#295 review). Each line repeats its
+# full key path, so a small file with a long key over many values could otherwise
+# expand to gigabytes. This is the chunker's own per-file limit: a file whose
+# records hold more text than this is refused by every chunking strategy anyway,
+# so the bound refuses nothing that could have been ingested; it only refuses
+# before the text is built.
+MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
+
+
+class _JsonNumber:
+    """A JSON number kept as written in the file, so 1.50 stays 1.50. Not a str,
+    so element-shape checks see a number, as partition_json does."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _reject_constant(name: str) -> Any:
+    raise _JsonError(f"{name} is not a JSON value")
+
+
+def _read_json(path: Path) -> tuple[str, Any]:
+    """The file's text without a byte-order mark, and its JSON value; the value is
+    None for an empty file (and for JSON `null`, which the text tells apart)."""
+    try:
+        # utf-8-sig: a leading byte-order mark, as some Windows tools write, is dropped.
+        raw = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise _JsonError(f"it is not UTF-8 text ({exc.reason} at byte {exc.start})") from exc
+    if not raw.strip():
+        return "", None
+    try:
+        return raw, json.loads(raw, parse_int=_JsonNumber, parse_float=_JsonNumber,
+                                parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        raise _JsonError(f"{exc.msg} at line {exc.lineno}, column {exc.colno}") from exc
+    except RecursionError as exc:
+        raise _JsonError("it is nested too deeply to read") from exc
+
+
+def _is_json_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+
+def _json_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+class _JsonBudget:
+    """Characters of converted text left for this file."""
+
+    def __init__(self) -> None:
+        self.left = MAX_JSON_TEXT_CHARACTERS
+
+    def spend(self, characters: int) -> None:
+        self.left -= characters
+        if self.left < 0:
+            raise _JsonTooLarge()
+
+
+# A key path is a chain of (parent, segment, length) links, written out only for a
+# line that fits the budget, so no path longer than the text it produces is built.
+def _path_child(path: Any, segment: str) -> Any:
+    return (path, segment, len(segment) + (path[2] if path else 0))
+
+
+def _path_text(path: Any) -> str:
+    parts = []
+    while path is not None:
+        parts.append(path[1])
+        path = path[0]
+    return "".join(reversed(parts))
+
+
+def _json_line(path: Any, text: str, out: list[str], budget: _JsonBudget) -> None:
+    # A newline joins this line to the one before it in the record.
+    budget.spend((path[2] + 2 if path else 0) + len(text) + (1 if out else 0))
+    out.append(f"{_path_text(path)}: {text}" if path else text)
+
+
+def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> None:
+    """Append `path: value` lines for value: dotted keys, indexed arrays (#295)."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _json_lines(item, _path_child(path, f".{key}" if path else key), out, budget)
+    elif isinstance(value, list):
+        if not value:
+            return
+        if all(_is_json_scalar(item) for item in value):
+            items = [_json_scalar(item) for item in value]
+            # Checked before joining, so an over-long line is never built.
+            if sum(len(item) for item in items) + 2 * (len(items) - 1) > budget.left:
+                raise _JsonTooLarge()
+            _json_line(path, ", ".join(items), out, budget)
+        else:
+            for i, item in enumerate(value):
+                _json_lines(item, _path_child(path, f"[{i}]"), out, budget)
+    else:
+        _json_line(path, _json_scalar(value), out, budget)
+
+
+def _json_records(value: Any) -> list[str]:
+    """Ordinary JSON as readable text: one record per item of a top-level array
+    that holds any object or array, otherwise one record. Records with no text
+    are dropped."""
+    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
+        groups = value
+    else:
+        groups = [value]
+    records = []
+    budget = _JsonBudget()
+    try:
+        for group in groups:
+            lines: list[str] = []
+            left = budget.left
+            _json_lines(group, None, lines, budget)
+            text = "\n".join(lines)
+            if text.strip():
+                records.append(text)
+            else:
+                budget.left = left  # a dropped record's text is not stored
+    except RecursionError as exc:
+        raise _JsonError("it is nested too deeply to read") from exc
+    return records
+
+
+def _parse_json(path: Path) -> tuple[str, list[Any]]:
+    """Ordinary JSON becomes `key: value` text, one element per record. A file of
+    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    raw, value = _read_json(path)
+    if not raw:
+        return "", []
+    from unstructured.partition.common.json_partitioning import is_element_shaped_dict
+    if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
+        from unstructured.partition.json import partition_json
+        # The text already read, so a byte-order mark is handled the same way.
+        elements = partition_json(text=raw)
+        return "\n".join(str(el) for el in elements), elements
+    from unstructured.documents.elements import Text
+    records = _json_records(value)
+    # A blank line between records, so the language splitter prefers to cut there.
+    return "\n\n".join(records), [Text(text=record) for record in records]
+
+
 def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
     fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
     os.close(fd)
@@ -3101,17 +3275,18 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
     try:
         _gunzip_bounded(path, plain)
         try:
-            from unstructured.partition.json import partition_json
-            elements = partition_json(filename=str(plain))
+            return _parse_json(plain)
+        except _JsonTooLarge as exc:
+            raise ValueError(f"was decompressed, but it {exc.detail}") from exc
+        except _JsonError as exc:
+            raise ValueError(
+                f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc
         except Exception as exc:
-            # How JSON is parsed is issue #295; this only says where it failed.
             raise ValueError(
                 f"was decompressed, but its JSON could not be parsed: "
                 f"{str(exc) or type(exc).__name__}") from exc
     finally:
         plain.unlink(missing_ok=True)
-    text = "\n".join(str(el) for el in elements)
-    return text, elements
 
 
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
@@ -3134,8 +3309,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
         from unstructured.partition.csv import partition_csv
         elements = partition_csv(filename=str(path))
     elif ext == ".json":
-        from unstructured.partition.json import partition_json
-        elements = partition_json(filename=str(path))
+        return _parse_json(path)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
@@ -11090,6 +11264,16 @@ within their limit with clear per-file errors. Weaviate and source retention are
 in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `.json` and `.json.gz` members through the proxy.
 
+`scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
+`key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
+non-ASCII text and numbers as written, one element per top-level record, empty values and
+files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
+converted text bounded by the chunker's per-file limit (a long key over many values fails
+fast with bounded memory), and readable errors for invalid JSON in `.json` files and
+`.json.gz` members. `02_ingest.sh` runs it in the API
+container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
+back to confirm they hold that text.
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -11177,13 +11361,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -12656,6 +12841,15 @@ def write(target: pathlib.Path) -> None:
         z.writestr("records.jsonl.gz", gzip.compress(b'{"a": 1}\n', mtime=0))
         z.writestr("notes.txt.gz", gzip.compress(b"unsupported\n", mtime=0))
 
+    # Issue #295. Ordinary nested JSON with non-ASCII text, stored as readable
+    # `key: value` lines rather than pretty-printed JSON with escaped characters.
+    (target / "plain.json").write_text(json.dumps({
+        "title": "Remote work policy",
+        "body": "Remote work needs written manager approval.",
+        "meta": {"author": "Zoë Müller"},
+        "tags": ["policy", "remote"],
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -13162,7 +13356,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/gz_batch.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/plain.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -13259,6 +13453,38 @@ sys.exit(0 if sorted(d.get('skipped', [])) == [
     \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
     \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
 check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
+
+# ── ordinary JSON as readable text (#295) ────────────────────────────────────
+# Controlled cases: every conversion rule, file key order, non-ASCII text,
+# element-schema rehydration, empty files and invalid JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_json_ingest.py)
+check "ordinary JSON conversion regressions" $?
+
+# The stored chunks once held pretty-printed JSON with escaped non-ASCII text.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/plain.json"
+read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$chunks" -gt 0 ]
+check "an ordinary nested JSON file ingests" $? "status=$status chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    text = "\n".join(o.properties["content"] for o in collection.iterator())
+finally:
+    wc.close_client()
+wanted = ["title: Remote work policy", "meta.author: Zoë Müller", "tags: policy, remote"]
+missing = [w for w in wanted if w not in text]
+syntax = [c for c in ("{", '"', "\\u") if c in text]
+if missing or syntax:
+    print(f"missing={missing} json-syntax={syntax}", file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "its chunks hold key: value text with non-ASCII kept" $?
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with

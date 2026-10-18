@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/gz_batch.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/plain.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -102,6 +102,38 @@ sys.exit(0 if sorted(d.get('skipped', [])) == [
     \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
     \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
 check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
+
+# ── ordinary JSON as readable text (#295) ────────────────────────────────────
+# Controlled cases: every conversion rule, file key order, non-ASCII text,
+# element-schema rehydration, empty files and invalid JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_json_ingest.py)
+check "ordinary JSON conversion regressions" $?
+
+# The stored chunks once held pretty-printed JSON with escaped non-ASCII text.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/plain.json"
+read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$chunks" -gt 0 ]
+check "an ordinary nested JSON file ingests" $? "status=$status chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    text = "\n".join(o.properties["content"] for o in collection.iterator())
+finally:
+    wc.close_client()
+wanted = ["title: Remote work policy", "meta.author: Zoë Müller", "tags: policy, remote"]
+missing = [w for w in wanted if w not in text]
+syntax = [c for c in ("{", '"', "\\u") if c in text]
+if missing or syntax:
+    print(f"missing={missing} json-syntax={syntax}", file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "its chunks hold key: value text with non-ASCII kept" $?
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
