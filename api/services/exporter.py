@@ -12,11 +12,12 @@ import logging
 import threading
 import uuid
 
-from services import collection_writes, packager
+from services import collection_writes, jobstore, packager
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("export")
 # collection name -> job_id of the export currently running for it
 _active: dict[str, str] = {}
 _lock = threading.Lock()

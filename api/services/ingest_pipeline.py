@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
@@ -29,7 +29,8 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
 GZIP_JSON_SUFFIX = ".json.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("ingest")
 _log = logging.getLogger(__name__)
 
 
@@ -654,8 +655,10 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             _log.error("ingest job %s failed: %s", job_id, exc)
             job = _jobs.get(job_id)
             if job and job["status"] not in ("completed", "partial", "failed"):
-                job["status"] = "failed"
+                # The error first: the status change is the write that saves
+                # the record (#23), and an in-place append is not seen alone.
                 job["errors"].append(str(exc))
+                job["status"] = "failed"
 
     future = asyncio.get_running_loop().run_in_executor(
         None,

@@ -3035,7 +3035,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
@@ -3049,7 +3049,8 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
 GZIP_JSON_SUFFIX = ".json.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("ingest")
 _log = logging.getLogger(__name__)
 
 
@@ -3674,8 +3675,10 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             _log.error("ingest job %s failed: %s", job_id, exc)
             job = _jobs.get(job_id)
             if job and job["status"] not in ("completed", "partial", "failed"):
-                job["status"] = "failed"
+                # The error first: the status change is the write that saves
+                # the record (#23), and an in-place append is not seen alone.
                 job["errors"].append(str(exc))
+                job["status"] = "failed"
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
@@ -5491,6 +5494,342 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
                                    {"file": "chunks.jsonl", "line": number}) from exc
 ```
 
+### api/services/jobstore.py
+
+```python
+"""Job records that survive an API restart (#23).
+
+Ingest, export, import and tune jobs used to keep their status in a plain dict,
+so any restart (a crash, an OOM kill, `docker compose restart`) turned every job
+the UI was polling into `404 JOB_NOT_FOUND`. A `JobStore` is used exactly like
+the dict it replaces (`store[job_id] = {...}`, `job = store[job_id]`,
+`job["status"] = "running"`, `job.update(...)`, `store.get(job_id)`), and once
+the API's startup has called `load()`, it also keeps one JSON file per job under
+`<UPLOAD_DIR>/jobs/<kind>/<job_id>.json`.
+
+**Unbound until loaded.** Before `load()` a store is only an in-memory dict that
+keeps the caller's own dict object. Verify helpers run inside the API container,
+on the same upload volume, and store jobs directly (some then assert on the dict
+they stored); without this rule they would leave job files that the next restart
+loads. Only a process that runs the API lifespan binds its stores.
+
+**When a change reaches the disk.** A record changed through its own methods is
+written at once when its `status` changes, and at once whenever its status is
+already terminal (import names its recovery copy after `finish`). Other changes
+(progress counters, which export and import update every few hundred chunks) are
+written at most once a second per job, and never later than about a second
+after they were made. Changes made in place to a nested list or dict
+(`job["errors"].append(...)`) are not seen by themselves; the next write
+carries them. Every job path ends with a status change, so the final record on
+disk is complete.
+
+**At startup** `load()` marks every record still `queued` or `running` as
+interrupted: its worker thread died with the old process. Unreadable files are
+left as they are and logged. The newest `RETENTION` files per kind are kept.
+
+A job record is never recovery authority: retained import and tuning data is
+owned by `collection_recovery` and the import markers (#43, #44), never by
+anything in `jobs/`.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+import time
+from collections.abc import MutableMapping
+from pathlib import Path
+
+from config import settings
+
+_log = logging.getLogger(__name__)
+
+KINDS = ("ingest", "export", "import", "tune")
+# The statuses a job never leaves; the same set scripts/verify/lib.sh waits for.
+TERMINAL = frozenset({"completed", "failed", "partial", "cancelled"})
+# Progress-only changes are written at most this often per job. Export and import
+# report progress every few hundred chunks; writing each one would be a disk-I/O
+# regression on a large export.
+THROTTLE_S = 1.0
+# Records kept per kind, newest first by modification time. About 1 KB each, so
+# the volume can't grow without bound. Nothing in jobs/ is ever recovery data.
+RETENTION = 200
+# Generated ids are 8 hex characters; anything else could name another path.
+_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+INTERRUPTED_MESSAGE = "Interrupted: the API restarted while this job was running."
+_REMEDY = {
+    "ingest": "Re-upload the files to try again.",
+    "export": "Start the export again.",
+    "import": "Start the import again.",
+    "tune": "Start the operation again.",
+}
+
+
+class _Job(dict):
+    """A record bound to its store: changes made through its methods are saved."""
+
+    __slots__ = ("_store", "_id", "_last", "_timer")
+
+    def __setitem__(self, key, value):
+        status_changed = key == "status" and self.get("status") != value
+        dict.__setitem__(self, key, value)
+        self._store._changed(self, status_changed)
+
+    def update(self, *args, **kwargs):
+        before = self.get("status")
+        dict.update(self, *args, **kwargs)
+        self._store._changed(self, self.get("status") != before)
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return dict.__getitem__(self, key)
+        dict.__setitem__(self, key, default)
+        self._store._changed(self, key == "status")
+        return default
+
+    def pop(self, key, *default):
+        status_changed = key == "status" and key in self
+        value = dict.pop(self, key, *default)
+        self._store._changed(self, status_changed)
+        return value
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, key)
+        self._store._changed(self, key == "status")
+
+
+class JobStore(MutableMapping):
+    """The job records of one kind; see the module docstring."""
+
+    def __init__(self, kind: str) -> None:
+        if kind not in KINDS:
+            raise ValueError(f"Unknown job kind {kind!r}")
+        self.kind = kind
+        self._records: dict = {}
+        self._dir: Path | None = None          # None: unbound, memory only
+        # One lock per store. Re-entrant because load() and _changed() write
+        # while holding it.
+        self._lock = threading.RLock()
+
+    # ── mapping ─────────────────────────────────────────────────────────────
+    # Lookups never touch the disk: after load() memory holds every kept record,
+    # and a job id from a URL is never turned into a path.
+
+    def __getitem__(self, job_id):
+        return self._records[job_id]
+
+    def __iter__(self):
+        return iter(list(self._records))
+
+    def __len__(self):
+        return len(self._records)
+
+    def __setitem__(self, job_id, doc):
+        if self._dir is None:
+            self._records[job_id] = doc        # the caller's own object
+            return
+        if not isinstance(job_id, str) or not _ID.fullmatch(job_id):
+            raise ValueError(f"Invalid job id {job_id!r}")
+        record = self._bind(job_id, doc)
+        with self._lock:
+            old = self._records.get(job_id)
+            if isinstance(old, _Job):
+                self._cancel(old)
+            self._records[job_id] = record
+            self._write(record, durable=True)
+
+    def __delitem__(self, job_id):
+        with self._lock:
+            record = self._records.pop(job_id)
+            if isinstance(record, _Job):
+                self._cancel(record)
+            if self._dir is not None and isinstance(job_id, str) and _ID.fullmatch(job_id):
+                try:
+                    (self._dir / f"{job_id}.json").unlink(missing_ok=True)
+                except OSError:
+                    _log.exception("Could not remove %s job record %s", self.kind, job_id)
+
+    # ── persistence ─────────────────────────────────────────────────────────
+
+    def _bind(self, job_id: str, doc) -> _Job:
+        record = _Job(doc)
+        record._store = self
+        record._id = job_id
+        record._last = 0.0
+        record._timer = None
+        return record
+
+    @staticmethod
+    def _cancel(record: _Job) -> None:
+        if record._timer is not None:
+            record._timer.cancel()
+            record._timer = None
+
+    def _changed(self, record: _Job, status_changed: bool) -> None:
+        with self._lock:
+            if status_changed or record.get("status") in TERMINAL:
+                self._cancel(record)
+                self._write(record, durable=True)
+                return
+            now = time.monotonic()
+            if now - record._last >= THROTTLE_S:
+                self._cancel(record)
+                self._write(record, durable=False)
+            elif record._timer is None:
+                # Carry this change to disk even if the job changes no further
+                # (an ingest file can embed for tens of seconds after it).
+                timer = threading.Timer(record._last + THROTTLE_S - now, self._flush, (record,))
+                timer.daemon = True
+                record._timer = timer
+                timer.start()
+
+    def _flush(self, record: _Job) -> None:
+        with self._lock:
+            # A cancelled or superseded timer does nothing, so a late timer
+            # never adds a second write to one window.
+            if record._timer is not threading.current_thread():
+                return
+            record._timer = None
+            self._write(record, durable=False)
+
+    def _write(self, record: _Job, durable: bool) -> None:
+        """Atomically replace the record's file. Never raises: a job's outcome
+        must not depend on whether its status could be saved."""
+        with self._lock:
+            if self._dir is None or self._records.get(record._id) is not record:
+                return                          # deleted or replaced meanwhile
+            tmp = None
+            try:
+                payload = json.dumps(dict(record), default=str)
+                # mkstemp creates the file 0600, like the session files.
+                fd, tmp = tempfile.mkstemp(prefix=f".{record._id}.json.", suffix=".tmp",
+                                           dir=self._dir)
+                with os.fdopen(fd, "w") as output:
+                    output.write(payload)
+                    if durable:
+                        output.flush()
+                        os.fsync(output.fileno())
+                os.replace(tmp, self._dir / f"{record._id}.json")
+                tmp = None
+                if durable:
+                    _sync_dir(self._dir)
+            except Exception:                   # noqa: BLE001 - logged, never raised
+                _log.exception("Could not save %s job %s", self.kind, record._id)
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            finally:
+                # Also after a failure, so a lasting fault is retried at the
+                # throttle's pace rather than on every change.
+                record._last = time.monotonic()
+
+    # ── startup ─────────────────────────────────────────────────────────────
+
+    def load(self) -> list[str]:
+        """Bind to the disk, apply retention and mark interrupted jobs.
+
+        Called once, by the API lifespan, before any job can start. Returns the
+        ids of the jobs it marked interrupted.
+        """
+        with self._lock:
+            directory = Path(settings.upload_dir) / "jobs" / self.kind
+            directory.mkdir(parents=True, exist_ok=True)
+            self._dir = directory
+
+            for leftover in directory.glob(".*.json.*.tmp"):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    _log.exception("Could not remove interrupted write %s", leftover)
+
+            files = [p for p in directory.glob("*.json") if not p.name.startswith(".")]
+            readable = {}
+            for path in files:
+                try:
+                    readable[path] = _read_record(path)
+                except (OSError, ValueError) as exc:
+                    # Kept as it is: never rewritten or reset (only retention,
+                    # below, removes it once it is old).
+                    _log.warning("Unreadable %s job record %s kept as it is: %s",
+                                 self.kind, path, exc)
+
+            files.sort(key=_mtime, reverse=True)
+            for path in files[RETENTION:]:
+                try:
+                    path.unlink()
+                    _log.info("Removed old %s job record %s (keeping the newest %d)",
+                              self.kind, path.name, RETENTION)
+                except OSError:
+                    _log.exception("Could not remove old job record %s", path)
+
+            marked = []
+            for path in files[:RETENTION]:
+                if path not in readable:
+                    continue
+                record = self._bind(path.stem, readable[path])
+                self._records[path.stem] = record
+                if record.get("status") not in TERMINAL:
+                    self._mark_interrupted(record)
+                    self._write(record, durable=True)
+                    marked.append(path.stem)
+            return marked
+
+    def _mark_interrupted(self, record: _Job) -> None:
+        # Plain dict methods only: one durable write afterwards, so no record
+        # reaches the disk terminal but without its message.
+        if self.kind == "ingest":
+            completed = dict.get(record, "files_completed")
+            dict.__setitem__(record, "status", "partial"
+                             if isinstance(completed, int) and completed > 0 else "failed")
+            errors = dict.get(record, "errors")
+            message = f"{INTERRUPTED_MESSAGE} {_REMEDY['ingest']}"
+            if isinstance(errors, list):
+                errors.append(message)
+            else:
+                dict.__setitem__(record, "errors", [message])
+        else:
+            dict.__setitem__(record, "status", "failed")
+            dict.__setitem__(record, "error_code", "INTERRUPTED")
+            dict.__setitem__(record, "error", f"{INTERRUPTED_MESSAGE} {_REMEDY[self.kind]}")
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.lstat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _read_record(path: Path) -> dict:
+    """The record in `path`, or ValueError/OSError saying why it is unusable."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("not a regular file")
+    if not _ID.fullmatch(path.stem):
+        raise ValueError("not a job id")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    if not isinstance(data.get("status"), str):
+        raise ValueError("no status")
+    if "job_id" in data and data["job_id"] != path.stem:
+        raise ValueError("its job_id doesn't match its name")
+    return data
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+```
+
 ### api/services/exporter.py
 
 ```python
@@ -5508,11 +5847,12 @@ import logging
 import threading
 import uuid
 
-from services import collection_writes, packager
+from services import collection_writes, jobstore, packager
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("export")
 # collection name -> job_id of the export currently running for it
 _active: dict[str, str] = {}
 _lock = threading.Lock()
@@ -5657,14 +5997,15 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
-from services import batch_write, collection_recovery, collection_writes
+from services import batch_write, collection_recovery, collection_writes, jobstore
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
 ON_CONFLICT = ("abort", "rename", "replace")
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("import")
 _active: set[str] = set()
 _lock = threading.Lock()
 
@@ -6761,7 +7102,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
 from services import sources
@@ -6773,7 +7114,8 @@ from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("tune")
 _active: set[str] = set()
 _lock = threading.Lock()
 
@@ -8660,6 +9002,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
     import logging
     from services import goldstandard, metrics
     from services import weaviate_client as wc
@@ -8678,7 +9021,6 @@ async def lifespan(app: FastAPI):
     except Exception:                                 # noqa: BLE001
         log.exception("Startup sweep of staging collections failed")
     try:
-        import asyncio
         from services import importer
         partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
         if partial:
@@ -8691,6 +9033,22 @@ async def lifespan(app: FastAPI):
                         len(stale_dirs), ", ".join(stale_dirs))
     except Exception:                                 # noqa: BLE001
         log.exception("Startup sweep of interrupted imports failed")
+    # Job records survive a restart (#23). After the sweeps, so a job interrupted
+    # mid-import is reported failed and its half-built collection already swept.
+    # No worker from the previous process is alive, so any job still queued or
+    # running is marked interrupted before the first request is served.
+    from services import exporter, importer, ingest_pipeline, tuning
+    interrupted = []
+    for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
+                         ("import", importer), ("tune", tuning)):
+        try:
+            marked = await asyncio.to_thread(module._jobs.load)
+            interrupted += [f"{kind} {job_id}" for job_id in marked]
+        except Exception:                             # noqa: BLE001
+            log.exception("Could not load the %s job records", kind)
+    if interrupted:
+        log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
+                    "says so; start them again.", len(interrupted), ", ".join(interrupted))
     yield
     from services import weaviate_client as wc
     wc.close_client()
@@ -11344,7 +11702,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -11450,6 +11808,20 @@ container, then deletes a collection while a real ingest is still embedding (`40
 in place), again after the job completes (`200`, still gone 10 s later), and checks that an
 insert into a deleted collection fails without recreating it (auto-schema is off).
 
+`scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
+and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
+that writes nothing; status changes and terminal records are written at once, owner-only;
+10,000 progress updates cause a handful of writes and the last one still reaches the disk; a
+failed write raises nothing and keeps the previous file; ids can't name another path; startup
+marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
+`failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
+a real lifespan run marks a stored running export. `02_ingest.sh` runs it in the API
+container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while an upload is part-way and checks that a
+completed job reads back unchanged and the interrupted one reads `partial` with the
+interruption message; `05_transfer.sh` does the same for a completed export and one
+interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -11542,10 +11914,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
+| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -11574,7 +11947,7 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -13802,6 +14175,12 @@ check_eq "DELETE after the job completes succeeds" "$code" "200"
 sleep 10
 check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC")" "absent"
 
+# ── job records survive an API restart (#23) ─────────────────────────────────
+# Controlled cases: unbound stores, throttled and immediate writes, failed
+# writes, startup marking of interrupted jobs, corrupt files and retention.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
+check "job store: persistence, throttling, startup marking and retention" $?
+
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "${PREFIX}NoAutoSchema" <<'ENDPY'
@@ -13832,6 +14211,76 @@ ENDPY
 ) >/tmp/vfy_autoschema.txt 2>&1
 check "an insert into a deleted collection fails and does not recreate it" $? \
   "$(tail -1 /tmp/vfy_autoschema.txt)"
+
+# ── job status survives an API restart (#23; opt-in: restarts the API) ───────
+# Before #23 every job answered 404 after a restart. A job that finished must
+# read back unchanged, and one interrupted after storing a file must read
+# `partial` with the interruption message. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the job during shutdown.
+JR="${PREFIX}JobRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "ingest job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "ingest job status across an API restart" 1 "$restart_refusal"
+else
+  drop_collection "$JR"; make_collection "$JR"
+  ingest "$JR" fixed 300 50 "$FIX/policies.txt"
+  done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
+  api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
+  # policies.txt stores in seconds; the slow file then embeds for tens of seconds.
+  slow_dir=$(mktemp -d)
+  python3 - "$slow_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(23)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+  curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
+    -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
+    -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
+  rm -rf "$slow_dir"
+  slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/ingest/job/$slow_job" > /tmp/vfy_restart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_restart_before.json'))
+print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/null)
+    case "$state" in running-stored|completed*|partial*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-stored ]; then
+    check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_restart_done.json')) == json.load(open('/tmp/vfy_restart_done_after.json')) else 1)"
+    check "a completed ingest job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_after.json -w '%{http_code}' "$API/ingest/job/$slow_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+before = json.load(open('/tmp/vfy_restart_before.json'))
+after = json.load(open('/tmp/vfy_restart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "partial"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == before["files_completed"])
+print(sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
+      "$(head -c 300 /tmp/vfy_restart_after.json)"
+  fi
+  drop_collection "$JR"
+fi
 
 drop_collection "$C"
 cleanup_prefixed
@@ -14564,7 +15013,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E30)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E31)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -15386,6 +15835,93 @@ import json,re,sys
 m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
+
+# ── export job status survives an API restart (#23; opt-in: restarts the API) ──
+# The export from the top of this suite must read back unchanged, and an export
+# killed part-way must read `failed` with INTERRUPTED, not 404. A synthetic
+# 30,000-chunk collection (supplied vectors, no embedding) exports for about
+# 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the export during shutdown.
+XR="${PREFIX}ExportRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "export job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "export job status across an API restart" 1 "$restart_refusal"
+else
+  api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done.json
+  drop_collection "$XR"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$XR" 30000 <<'ENDPY'
+import random, sys
+from datetime import datetime, timezone
+from services import batch_write
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    wc._create_collection_sync(name, "hnsw", "cosine",
+                               {"efConstruction": 128, "maxConnections": 64, "ef": 64})
+    collection = wc.get_client().collections.get(name)
+    rng, now = random.Random(23), datetime.now(timezone.utc).isoformat()
+    for base in range(0, count, 2000):
+        records = [{"properties": {"content": f"Synthetic chunk {i}. " + "lorem ipsum dolor " * 30,
+                                   "source_file": f"synthetic_{i // 100}.txt", "source_type": "txt",
+                                   "chunk_index": i % 100, "chunk_strategy": "fixed",
+                                   "chunk_size": 1000, "chunk_overlap": 0, "created_at": now},
+                    "vector": [rng.uniform(-1, 1) for _ in range(768)]}
+                   for i in range(base, min(count, base + 2000))]
+        batch_write.insert(collection, lambda r=records: iter(r), exact=False, cleanup_owned=True)
+finally:
+    wc.close_client()
+ENDPY
+  ) >/tmp/vfy_xrestart_prepare.log 2>&1
+  check "a 30,000-chunk collection is built for the interrupted export" $? \
+    "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/export/job/$xjob" > /tmp/vfy_xrestart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_xrestart_before.json'))
+print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/null)
+    case "$state" in running-writing|completed*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-writing ]; then
+    check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_xrestart_done.json')) == json.load(open('/tmp/vfy_xrestart_done_after.json')) else 1)"
+    check "a completed export job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_xrestart_after.json -w '%{http_code}' "$API/export/job/$xjob")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_xrestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the export again.")
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED" $? \
+      "$(head -c 300 /tmp/vfy_xrestart_after.json)"
+    # The killed build's leftovers are the container's (root, mode 0700): remove
+    # only the build directories that appeared during this export.
+    builds_after=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
+    stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
+    (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+  fi
+  drop_collection "$XR"
+fi
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"

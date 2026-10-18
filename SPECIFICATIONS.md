@@ -511,7 +511,19 @@ GET /ingest/job/{job_id}
 }
 ```
 
-`status` values: `"queued"`, `"running"`, `"completed"`, `"failed"`.
+`status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
+`"failed"`.
+
+**Job records survive an API restart (#23).** Ingest, export, import and tune job records are
+kept in `{UPLOAD_DIR}/jobs/{kind}/{job_id}.json` (owner-only, atomic replacement), so
+`GET /…/job/{job_id}` keeps answering after a restart instead of `404`. Status changes and the
+final record are written at once; progress counters at most once a second per job. At startup,
+before the first request, a job still `queued` or `running` is marked interrupted, because its
+worker died with the old process. An interrupted ingest becomes `partial` when
+`files_completed > 0`, otherwise `failed`, with "Interrupted: the API restarted while this job
+was running. Re-upload the files to try again." appended to `errors`; its counters stay as
+they were. An unreadable record file is left as it is and logged. The newest 200 records per
+kind are kept; older ones are removed at startup.
 
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
@@ -1143,7 +1155,9 @@ GET /export/job/{job_id}
 ```
 
 `status` is `queued`, `running`, `completed` or `failed`. On failure `error`
-carries the reason and `filename` stays null. A failed build leaves nothing
+carries the reason and `filename` stays null. Export, import and tune job records persist
+across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
+with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
 collection's export slot is released.
 
@@ -1897,6 +1911,7 @@ rag-docker/
 │   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
+│   │   ├── jobstore.py          # Job records that survive an API restart
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
 │   │   ├── model_bundle.py      # Ollama manifest + blob copy, both directions
 │   │   ├── tuning.py            # Re-chunk / re-embed / re-index, staged rebuilds
@@ -2063,6 +2078,13 @@ now lives once, in `api/services/ingest_config.py`.
       delete, a collection deleted between two files, a store failure with the collection
       present and a failed existence check (both reported as before), and a parse failure,
       which does not consult the collection's existence.*
+- [x] Ingest job status survives an API restart (#23): a job that completed before the restart
+      reads back unchanged, and a job interrupted after storing a file answers `200` with
+      `status: partial`, the interruption message in `errors` and `files_completed` as it was.
+      *Every job used to answer `404 JOB_NOT_FOUND` after a restart. `02_ingest.sh`, with
+      `RAG_ALLOW_RESTART=1`, ingests a file, then uploads it with a slow text file, restarts the
+      API with `docker compose restart --timeout 0 api` once the first file is stored, and
+      checks both jobs.*
 
 ### 10.2 Query
 
@@ -2204,6 +2226,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 - [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.
   *Evidence: suite 01 creates 140 schema changes, waits for a snapshot, writes a tail, restarts, and checks the restored snapshot index and data.*
+
+- [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept (#23).
+  *Evidence: `test_jobstore.py` (15 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job.*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
