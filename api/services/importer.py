@@ -740,7 +740,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
             # goes through _delete_collection_sync, which the registry never refuses.
-            collection_writes.register_job(target, "import", job_id)
+            # A target being deleted refuses the import (#302).
+            try:
+                collection_writes.register_job(target, "import", job_id)
+            except collection_writes.CollectionDeletingError:
+                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
+                                   {"collection": target}) from None
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.

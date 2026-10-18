@@ -451,6 +451,14 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         if collection in _active:
             raise RuntimeError(collection)
         _active.add(collection)
+    # Lets DELETE /collections refuse while this job rebuilds the collection
+    # (#40). Before the job record, so a refusal during a delete leaves none (#302).
+    try:
+        collection_writes.register_job(collection, "tune", job_id)
+    except collection_writes.CollectionDeletingError:
+        with _lock:
+            _active.discard(collection)
+        raise
 
     _jobs[job_id] = {
         "job_id": job_id,
@@ -464,8 +472,6 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
-    collection_writes.register_job(collection, "tune", job_id)
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))

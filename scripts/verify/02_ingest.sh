@@ -529,6 +529,13 @@ job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_
 check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
+# Submitted, accepted and stored chunks are counted apart (#302); a clean job's
+# three counts agree, and stored is the checked count it always was.
+read -r n_sub n_acc n_sto <<<"$(api_get "/ingest/job/$job" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(d.get('chunks_submitted'), d.get('chunks_accepted'), d.get('chunks_stored'))")"
+[ "$n_sub" = "$n_sto" ] && [ "$n_acc" = "$n_sto" ] && [ "${n_sto:-0}" -gt 0 ] 2>/dev/null
+check "a clean job reports chunks_submitted = chunks_accepted = chunks_stored" $? \
+  "submitted=$n_sub accepted=$n_acc stored=$n_sto"
 
 # ── deleting a collection while an ingest job runs (#40) ─────────────────────
 # A DELETE sent during a job used to wait for it and then remove what it stored,
@@ -537,6 +544,33 @@ check_eq "job reaches 'completed'" "$final" "completed"
 # request orderings, and the job's report when its collection disappears.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
 check "delete-while-busy: job kinds, request orderings and the job's report" $?
+# Confirmation, a delete in progress refusing new jobs, and a cancelled
+# generation start (#302); then the job write counts and the MCP delete tool.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_write_counts.py)
+check "ingest jobs count submitted, accepted and stored chunks apart" $?
+python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
+check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+
+# DELETE needs ?confirm=true, checked before the collection is looked up (#302).
+CC="${PREFIX}Confirm"
+drop_collection "$CC"; make_collection "$CC"
+confirm_code() {   # HTTP status and error code of a DELETE with this query
+  _rag_require_lock_owner
+  local http; http=$(curl -s -m 120 -o /tmp/vfy_confirm.json -w '%{http_code}' -X DELETE "$API/collections/$1$2")
+  printf '%s %s' "$http" "$(python3 -c "
+import json
+try: print(json.load(open('/tmp/vfy_confirm.json'))['error']['code'])
+except Exception: print('-')")"
+}
+check_eq "DELETE without confirm is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=false is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "?confirm=false")" "400 CONFIRMATION_REQUIRED"
+check_eq "a refused DELETE leaves the collection in place" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "True"
+check_eq "DELETE of a missing collection without confirm is 400, not 404" \
+  "$(confirm_code "${PREFIX}ConfirmMissing" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=TRUE (any case) deletes" "$(confirm_code "$CC" "?confirm=TRUE" | cut -d' ' -f1)" "200"
+check_eq "the confirmed delete removed the collection" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "False"
 
 DC="${PREFIX}DeleteBusy"
 drop_collection "$DC"; make_collection "$DC"

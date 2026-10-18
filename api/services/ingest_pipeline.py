@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from services import collection_writes, jobstore
+from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
@@ -534,6 +534,13 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
+def _count_writes(job: dict, submitted: int, accepted: int) -> None:
+    """Add a file's insert to the job's sent and acknowledged counts (#302).
+    Records made before the counters existed start them at 0."""
+    job["chunks_submitted"] = (job.get("chunks_submitted") or 0) + submitted
+    job["chunks_accepted"] = (job.get("chunks_accepted") or 0) + accepted
+
+
 def _has_chunks(collection: str, name: str) -> bool:
     """Whether the name already has chunks, which this file will replace (#22).
     It is the job's first backend call for a file, so a deleted collection is
@@ -662,7 +669,12 @@ def _process_job_sync(
 
                 # Insert first, then remove the earlier chunks, never the other
                 # way round: a failed insert leaves the earlier version whole.
-                _store_chunks(collection, weaviate_chunks)
+                try:
+                    _store_chunks(collection, weaviate_chunks)
+                except Exception as exc:
+                    _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                    raise
+                _count_writes(job, len(chunks), len(chunks))
                 removed, problem = 0, None
                 if replacing:
                     removed, problem = _remove_earlier(collection, name, created, len(chunks))
@@ -1102,6 +1114,10 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         "files_completed": 0,
         "files_failed": 0,
         "chunks_stored": 0,
+        # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
+        # counts only the checked ones (#302).
+        "chunks_submitted": 0,
+        "chunks_accepted": 0,
         # Earlier chunks of the same names removed by this job (#22).
         "chunks_replaced": 0,
         "errors": [],

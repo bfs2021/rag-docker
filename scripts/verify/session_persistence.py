@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
                 if Path(dst).stem==sid:raise OSError('Owned deletion marker failure')
                 return original_replace(src,dst)
             with patch.object(gs.os,'replace',side_effect=marker_fault):
-                deleted=await client.delete('/collections/'+collection)
+                deleted=await client.delete('/collections/'+collection+'?confirm=true')
             assert deleted.status_code==200 and deleted.json()['objects_deleted']==2,deleted.text
             assert not wc._collection_exists_sync(collection)
             from routers import collections as collection_routes

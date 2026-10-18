@@ -648,6 +648,13 @@ def api_error(status_code: int, code: str, message: str, detail=None) -> JSONRes
         status_code=status_code,
         content={"error": {"code": code, "message": message, "detail": detail}},
     )
+
+
+def collection_deleting_error(name: str) -> JSONResponse:
+    """A new job refused because a delete of its collection is in progress (#302)."""
+    from services.collection_writes import deleting_message
+    return api_error(409, "COLLECTION_DELETING", deleting_message(name),
+                     detail={"collection": name})
 ```
 
 ### api/config.py
@@ -794,6 +801,11 @@ class JobStatusResponse(BaseModel):
     files_completed: int
     files_failed: int
     chunks_stored: int
+    # Chunks sent to Weaviate and those it acknowledged without a per-chunk
+    # error, including ones removed again because the check failed (#302).
+    # Null on records written before they existed, where 0 would be untrue.
+    chunks_submitted: int | None = None
+    chunks_accepted: int | None = None
     errors: list[str]
     # Files the caller sent that could not be parsed at all; they never
     # became part of files_total, so without this they vanish silently. Also
@@ -1914,18 +1926,38 @@ def verify(collection, records, *, exact: bool) -> int:
         return expected.verify(collection, exact=exact)
 
 
+def _record_counts(exc: Exception, submitted: int, accepted: int) -> None:
+    """Attach what a failed insert sent and had acknowledged, for ingest's job
+    counts (#302): `chunks_stored` only counts checked chunks."""
+    try:
+        exc.write_counts = (submitted, accepted)
+    except Exception:                     # an exception type that refuses attributes
+        pass
+
+
+def write_counts(exc: BaseException | None) -> tuple[int, int] | None:
+    """(submitted, accepted) recorded on a failed insert's exception or its cause."""
+    for error in (exc, getattr(exc, "__cause__", None)):
+        counts = getattr(error, "write_counts", None)
+        if counts is not None:
+            return counts
+    return None
+
+
 def insert(collection, records, *, exact: bool = True, expected_count: int | None = None,
            cleanup_owned: bool = False) -> int:
     """Preflight a reusable stream, flush, then compare persisted fingerprints.
 
     Only ingestion-generated UUIDs may be rolled back individually. Import and
     tuning own new collections and retain/remove them at their operation boundary.
+    A failure carries `write_counts` = (records queued, records the flushed batch
+    acknowledged without a per-object error); 0 acknowledged if it never flushed.
     """
     factory = _factory(records)
     with ExpectedRecords() as expected:
         expected.capture(factory, expected_count, generated_only=cleanup_owned)
+        queued = accepted = 0
         try:
-            queued = 0
             with collection.batch.dynamic() as batch:
                 for position, record in enumerate(factory()):
                     record = expected.prepare(position, record)
@@ -1934,6 +1966,7 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
                 if queued != expected.count:
                     raise ValueError("Record stream changed after preflight")
             failed = collection.batch.failed_objects
+            accepted = queued - len(failed or ())
             if failed:
                 detail = getattr(failed[0], "message", None)
                 raise RuntimeError(
@@ -1941,11 +1974,14 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
                     + (f": {detail}" if detail else ""))
             return expected.verify(collection, exact=exact)
         except Exception as original:
+            _record_counts(original, queued, accepted)
             if cleanup_owned:
                 try:
                     expected.rollback(collection)
                 except Exception as cleanup:
-                    raise BatchCleanupError(original, cleanup) from original
+                    error = BatchCleanupError(original, cleanup)
+                    _record_counts(error, queued, accepted)
+                    raise error from original
             raise
 ```
 
@@ -3151,7 +3187,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from services import collection_writes, jobstore
+from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
@@ -3669,6 +3705,13 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
+def _count_writes(job: dict, submitted: int, accepted: int) -> None:
+    """Add a file's insert to the job's sent and acknowledged counts (#302).
+    Records made before the counters existed start them at 0."""
+    job["chunks_submitted"] = (job.get("chunks_submitted") or 0) + submitted
+    job["chunks_accepted"] = (job.get("chunks_accepted") or 0) + accepted
+
+
 def _has_chunks(collection: str, name: str) -> bool:
     """Whether the name already has chunks, which this file will replace (#22).
     It is the job's first backend call for a file, so a deleted collection is
@@ -3797,7 +3840,12 @@ def _process_job_sync(
 
                 # Insert first, then remove the earlier chunks, never the other
                 # way round: a failed insert leaves the earlier version whole.
-                _store_chunks(collection, weaviate_chunks)
+                try:
+                    _store_chunks(collection, weaviate_chunks)
+                except Exception as exc:
+                    _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                    raise
+                _count_writes(job, len(chunks), len(chunks))
                 removed, problem = 0, None
                 if replacing:
                     removed, problem = _remove_earlier(collection, name, created, len(chunks))
@@ -4237,6 +4285,10 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         "files_completed": 0,
         "files_failed": 0,
         "chunks_stored": 0,
+        # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
+        # counts only the checked ones (#302).
+        "chunks_submitted": 0,
+        "chunks_accepted": 0,
         # Earlier chunks of the same names removed by this job (#22).
         "chunks_replaced": 0,
         "errors": [],
@@ -4468,11 +4520,12 @@ log = logging.getLogger(__name__)
 class GoldStandardError(Exception):
     """Carries an API error code so the router does not have to guess."""
 
-    def __init__(self, code: str, message: str, status: int):
+    def __init__(self, code: str, message: str, status: int, detail=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.detail = detail
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
@@ -5228,17 +5281,47 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         cancelled = True
         raise
     finally:
-        # Before the status turns terminal: a client that sees generation end
-        # can delete the collection at once (#40).
-        end_job("goldstandard", session_id)
-        def finish(current):
-            if persistence_failure is not None:
-                _failed_generation(current, persistence_failure)
-                return
-            if current.get("status") == "generating":
-                current["status"] = ("cancelled" if cancelled else
-                    "failed" if not current["pairs"] and current.get("errors") else "completed")
-        await asyncio.to_thread(_update_session_sync, session_id, finish)
+        await _settle_generation(session_id, cancelled, persistence_failure)
+
+
+async def _settle_generation(session_id: str, cancelled: bool,
+                             persistence_failure: Exception | None = None) -> None:
+    # Before the status turns terminal: a client that sees generation end
+    # can delete the collection at once (#40).
+    end_job("goldstandard", session_id)
+    def finish(current):
+        if persistence_failure is not None:
+            _failed_generation(current, persistence_failure)
+            return
+        if current.get("status") == "generating":
+            current["status"] = ("cancelled" if cancelled else
+                "failed" if not current["pairs"] and current.get("errors") else "completed")
+    await asyncio.to_thread(_update_session_sync, session_id, finish)
+
+
+def _track_settling(session_id: str, task: asyncio.Task) -> None:
+    """Keep a settling task alive, and report it if it raises, as _on_task_done does."""
+    _tasks.add(task)
+    def done(t: asyncio.Task) -> None:
+        _tasks.discard(t)
+        exc = t.exception() if not t.cancelled() else None
+        if exc is not None:
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
+    task.add_done_callback(done)
+
+
+def _settle_abandoned_start(prepare: asyncio.Future) -> None:
+    """The request that started a generation was cancelled while it was being
+    prepared (#302). The preparation still ran to the end in its thread; if it
+    published and registered a session, nothing will generate for it, so it is
+    settled the way a cancelled generation is: registration ended, `cancelled`."""
+    if prepare.cancelled() or prepare.exception() is not None:
+        return                        # nothing was registered
+    session, _ = prepare.result()
+    session_id = session["session_id"]
+    _track_settling(session_id, asyncio.create_task(_settle_generation(session_id, cancelled=True)))
 
 
 _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
@@ -5246,7 +5329,13 @@ _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
 
 def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
-    from services.collection_writes import CollectionBusyError, guard
+    from services.collection_writes import (CollectionBusyError, delete_in_progress,
+                                            deleting_message, guard)
+    # Before the guard's one-second wait, so a delete in progress is reported as
+    # one, like the other job kinds report it (#302).
+    if delete_in_progress(collection):
+        raise GoldStandardError("COLLECTION_DELETING", deleting_message(collection), 409,
+                                detail={"collection": collection})
     try:
         with guard(collection, timeout=_GENERATION_GUARD_TIMEOUT_SECONDS):
             all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
@@ -5285,8 +5374,16 @@ async def start_generation(
 ) -> dict:
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
-    session, all_chunks = await asyncio.to_thread(
-        _prepare_generation_sync, collection, request.sample_size, request.seed)
+    # Shielded: cancelling a plain to_thread await loses the thread's result, and
+    # with it the registration it made, which then refused DELETE until a
+    # restart (#302). A cancelled caller hands the result to a settle step.
+    prepare = asyncio.ensure_future(asyncio.to_thread(
+        _prepare_generation_sync, collection, request.sample_size, request.seed))
+    try:
+        session, all_chunks = await asyncio.shield(prepare)
+    except asyncio.CancelledError:
+        prepare.add_done_callback(_settle_abandoned_start)
+        raise
     session_id = session["session_id"]
 
     try:
@@ -6501,6 +6598,15 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         if running is not None:
             raise RuntimeError(running)
         _active[collection] = job_id
+    # Lets DELETE /collections refuse while this export reads the collection
+    # (#40). Before the job record, so a refusal during a delete leaves none (#302).
+    try:
+        collection_writes.register_job(collection, "export", job_id)
+    except collection_writes.CollectionDeletingError:
+        with _lock:
+            if _active.get(collection) == job_id:
+                del _active[collection]
+        raise
 
     _jobs[job_id] = {
         "job_id": job_id,
@@ -6518,9 +6624,6 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         "error_code": None,
         "error_detail": None,
     }
-    # Lets DELETE /collections refuse while this export reads the collection (#40).
-    collection_writes.register_job(collection, "export", job_id)
-
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
@@ -7274,7 +7377,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
             # goes through _delete_collection_sync, which the registry never refuses.
-            collection_writes.register_job(target, "import", job_id)
+            # A target being deleted refuses the import (#302).
+            try:
+                collection_writes.register_job(target, "import", job_id)
+            except collection_writes.CollectionDeletingError:
+                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
+                                   {"collection": target}) from None
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -8103,6 +8211,14 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         if collection in _active:
             raise RuntimeError(collection)
         _active.add(collection)
+    # Lets DELETE /collections refuse while this job rebuilds the collection
+    # (#40). Before the job record, so a refusal during a delete leaves none (#302).
+    try:
+        collection_writes.register_job(collection, "tune", job_id)
+    except collection_writes.CollectionDeletingError:
+        with _lock:
+            _active.discard(collection)
+        raise
 
     _jobs[job_id] = {
         "job_id": job_id,
@@ -8116,8 +8232,6 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
-    collection_writes.register_job(collection, "tune", job_id)
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
@@ -8413,7 +8527,11 @@ def _busy_error(name: str, jobs: list[tuple[str, str]]):
 
 
 @router.delete("/{name}", status_code=200)
-async def delete_collection(name: str):
+async def delete_collection(name: str, confirm: str | None = None):
+    # Checked first, before the collection is even looked up, and as text, so a
+    # value other than `true` is a 400 like a missing one, never a 422 (#302).
+    if (confirm or "").lower() != "true":
+        return api_error(400, "CONFIRMATION_REQUIRED", "Add ?confirm=true to confirm deletion.")
     if not await wc.collection_exists(name):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
@@ -8453,7 +8571,8 @@ from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadRespo
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -8510,6 +8629,8 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
         )
+    except CollectionDeletingError:
+        return collection_deleting_error(collection)
     except ingest_pipeline.UploadRejected as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     except ValueError as exc:
@@ -8646,7 +8767,8 @@ from models.schemas import (
 )
 from services import exporter, importer, packager
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_deleting_error
 
 router = APIRouter()
 
@@ -8660,6 +8782,8 @@ async def start_export(body: ExportRequest):
                          f"Collection '{body.collection}' not found.")
     try:
         job_id = await exporter.start_export_job(body.collection, body.include_models)
+    except CollectionDeletingError:
+        return collection_deleting_error(body.collection)
     except RuntimeError as exc:
         # start_export_job puts the already-running job id in the exception.
         return api_error(
@@ -8755,7 +8879,8 @@ from models.schemas import (
 )
 from services import sources, tuning
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_deleting_error
 
 router = APIRouter(prefix="/tune")
 
@@ -8765,6 +8890,8 @@ async def _start(collection: str, operation: str, params: dict):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         job_id = await tuning.start_tune_job(collection, operation, params)
+    except CollectionDeletingError:
+        return collection_deleting_error(collection)
     except RuntimeError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
                          f"'{exc}' is already being tuned.",
@@ -8881,7 +9008,7 @@ async def generate(body: GenerateRequest):
             seed=body.seed,
         )
     except gs.GoldStandardError as exc:
-        return api_error(exc.status, exc.code, exc.message)
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     return GenerateResponse(**result)
 
 
@@ -10234,6 +10361,10 @@ export interface JobStatus {
   skipped?: string[]
   // Earlier chunks of the same names this job removed (#22).
   chunks_replaced?: number
+  // Chunks sent to Weaviate and those it acknowledged (#302); null on records
+  // written before the fields existed. chunks_stored counts the checked ones.
+  chunks_submitted?: number | null
+  chunks_accepted?: number | null
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean
@@ -10432,6 +10563,11 @@ import { JobStatus } from '../api/client'
 
 export default function ProgressPanel({ job }: { job: JobStatus }) {
   const pct = job.files_total > 0 ? Math.round((job.files_completed / job.files_total) * 100) : 0
+  // Shown only when sending, acknowledgement and the check disagree (#302), so a
+  // clean job looks as it always did. Older records carry no counts at all.
+  const counted = typeof job.chunks_submitted === 'number' && typeof job.chunks_accepted === 'number'
+  const writesDiffer = counted &&
+    !(job.chunks_submitted === job.chunks_stored && job.chunks_accepted === job.chunks_stored)
   return (
     <div className="mt-4 p-4 border rounded bg-gray-50">
       <div className="flex justify-between text-sm mb-1">
@@ -10444,6 +10580,11 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {writesDiffer && (
+        <p className="mt-2 text-xs text-gray-600">
+          Submitted {job.chunks_submitted} · accepted {job.chunks_accepted} · stored {job.chunks_stored}
+        </p>
+      )}
       {(job.chunks_replaced ?? 0) > 0 && (
         // Re-ingesting a name replaces its chunks (#22), so the total can stay
         // the same while the content changed.
@@ -12454,6 +12595,24 @@ was running" at its first store. Weaviate is mocked. `02_ingest.sh` runs it in t
 container, then deletes a collection while a real ingest is still embedding (`409`, data
 in place), again after the job completes (`200`, still gone 10 s later), and checks that an
 insert into a deleted collection fails without recreating it (auto-schema is off).
+
+`test_delete_busy.py` also covers #302. A `DELETE` without `?confirm=true` (case-insensitive)
+answers `400 CONFIRMATION_REQUIRED` before the collection is looked up. A `DELETE` held inside
+its backend delete refuses new jobs: the ingest, export, tune and generate routes answer
+`409 COLLECTION_DELETING` and leave nothing behind, generation without its one-second guard
+wait, and an import of the collection ends `failed` with that code; a delete still waiting
+for another writer is not in progress, and one that waits behind a writer with no job deletes
+once it lets go. A gold-standard start cancelled mid-preparation ends its registration and
+leaves its session `cancelled`. Import-replace's own delete runs through `importer._run`.
+`scripts/tests/test_write_counts.py` (#302, API container) checks `chunks_submitted` and
+`chunks_accepted`: the writer's counts on each kind of failure, a retried file counted once,
+job totals, and `null` on an older record. `scripts/tests/test_mcp_delete.py` runs on the host
+with the MCP SDK stubbed and checks `rag_delete_collection` sends `confirm=true` with `name`
+still its only input. `02_ingest.sh` runs all three, then checks on the live verify stack the
+`400` cases, a `confirm=TRUE` delete, and that a clean job's three counts agree.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's
+"Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
+answered `409 COLLECTION_DELETING` to check its message is shown.
 
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
@@ -15149,6 +15308,13 @@ job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_
 check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
+# Submitted, accepted and stored chunks are counted apart (#302); a clean job's
+# three counts agree, and stored is the checked count it always was.
+read -r n_sub n_acc n_sto <<<"$(api_get "/ingest/job/$job" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(d.get('chunks_submitted'), d.get('chunks_accepted'), d.get('chunks_stored'))")"
+[ "$n_sub" = "$n_sto" ] && [ "$n_acc" = "$n_sto" ] && [ "${n_sto:-0}" -gt 0 ] 2>/dev/null
+check "a clean job reports chunks_submitted = chunks_accepted = chunks_stored" $? \
+  "submitted=$n_sub accepted=$n_acc stored=$n_sto"
 
 # ── deleting a collection while an ingest job runs (#40) ─────────────────────
 # A DELETE sent during a job used to wait for it and then remove what it stored,
@@ -15157,6 +15323,33 @@ check_eq "job reaches 'completed'" "$final" "completed"
 # request orderings, and the job's report when its collection disappears.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
 check "delete-while-busy: job kinds, request orderings and the job's report" $?
+# Confirmation, a delete in progress refusing new jobs, and a cancelled
+# generation start (#302); then the job write counts and the MCP delete tool.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_write_counts.py)
+check "ingest jobs count submitted, accepted and stored chunks apart" $?
+python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
+check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+
+# DELETE needs ?confirm=true, checked before the collection is looked up (#302).
+CC="${PREFIX}Confirm"
+drop_collection "$CC"; make_collection "$CC"
+confirm_code() {   # HTTP status and error code of a DELETE with this query
+  _rag_require_lock_owner
+  local http; http=$(curl -s -m 120 -o /tmp/vfy_confirm.json -w '%{http_code}' -X DELETE "$API/collections/$1$2")
+  printf '%s %s' "$http" "$(python3 -c "
+import json
+try: print(json.load(open('/tmp/vfy_confirm.json'))['error']['code'])
+except Exception: print('-')")"
+}
+check_eq "DELETE without confirm is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=false is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "?confirm=false")" "400 CONFIRMATION_REQUIRED"
+check_eq "a refused DELETE leaves the collection in place" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "True"
+check_eq "DELETE of a missing collection without confirm is 400, not 404" \
+  "$(confirm_code "${PREFIX}ConfirmMissing" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=TRUE (any case) deletes" "$(confirm_code "$CC" "?confirm=TRUE" | cut -d' ' -f1)" "200"
+check_eq "the confirmed delete removed the collection" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "False"
 
 DC="${PREFIX}DeleteBusy"
 drop_collection "$DC"; make_collection "$DC"
@@ -15647,7 +15840,7 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
                 if Path(dst).stem==sid:raise OSError('Owned deletion marker failure')
                 return original_replace(src,dst)
             with patch.object(gs.os,'replace',side_effect=marker_fault):
-                deleted=await client.delete('/collections/'+collection)
+                deleted=await client.delete('/collections/'+collection+'?confirm=true')
             assert deleted.status_code==200 and deleted.json()['objects_deleted']==2,deleted.text
             assert not wc._collection_exists_sync(collection)
             from routers import collections as collection_routes
@@ -18509,6 +18702,83 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── ingest write counts and a delete in progress (#302) ──────────────────
+  // The progress panel shows submitted, accepted and stored chunks only when
+  // they differ; a clean job and an older record without the counts look as
+  // before. An upload refused while its collection is being deleted shows the
+  // API's message. Responses are stubbed.
+  r.section('ingest write counts');
+  const countCases = [
+    ['differing counts', { chunks_submitted: 10, chunks_accepted: 10, chunks_stored: 0, status: 'failed', files_completed: 0, files_failed: 1 }, 'Submitted 10 · accepted 10 · stored 0'],
+    ['equal counts', { chunks_submitted: 2, chunks_accepted: 2, chunks_stored: 2, status: 'completed', files_completed: 1, files_failed: 0 }, null],
+    ['a record without the counts', { chunks_stored: 5, status: 'completed', files_completed: 1, files_failed: 0 }, null],
+  ];
+  for (const [label, fields, line] of countCases) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-counts.txt';
+    fs.writeFileSync(small, 'Write counts fixture.\n');
+    const jobId = 'vfycnt' + countCases.findIndex(c => c[0] === label);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, files_total: 1, errors: [], skipped: [], chunks_replaced: 0, ...fields }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (line) {
+        r.check(`${label}: the panel shows "${line}"`, clicked && text.includes(line),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check(`${label}: the panel shows no submitted/accepted line`,
+                clicked && text.includes(`Chunks stored: ${fields.chunks_stored}`) && !text.includes('Submitted '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      }
+      r.check(`write counts fixture (${label}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-deleting.txt';
+    fs.writeFileSync(small, 'Deleting fixture.\n');
+    const message = "Collection 'VfyGone' is being deleted. Start the job again once the delete finishes; the collection must be created again first.";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_DELETING', message, detail: { collection: 'VfyGone' } } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(1500);
+      const text = await bodyText(s.page);
+      r.check('an upload refused with 409 COLLECTION_DELETING shows its message', clicked && text.includes(message),
+              clicked ? text.slice(0, 300) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
@@ -20848,7 +21118,7 @@ print('PASS independent API lifespan restores recovery, exact records and histor
     restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
     if restarted.returncode:print(restarted.stderr,flush=True)
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
-    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:])
+    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:]+'?confirm=true')
     check(deletion.status_code==200 and deletion.json()['objects_deleted']==len(before),'explicit lowercase-alias DELETE removes the retained backend copy')
     check(not await asyncio.to_thread(paths[0].exists) and not await asyncio.to_thread(snapshot.parent.parent.exists),'explicit recovery deletion retires exactly its ownership journal and metadata snapshots')
 
@@ -20912,7 +21182,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
             await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
             await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
         await asyncio.to_thread(collection_routes._save_registry, {canonical:'owned', alias:'owned', neighbor:'neighbor'})
-        response=await api.delete('/collections/'+caller)
+        response=await api.delete('/collections/'+caller+'?confirm=true')
         registry=await asyncio.to_thread(collection_routes._load_registry)
         check(registry=={neighbor:'neighbor'},'registry removes both aliases and preserves case-distinct neighbor')
         check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
@@ -21105,11 +21375,40 @@ def serialized(argument):
 
 _jobs_lock = threading.Lock()
 _active_jobs = {}
+# Collections a delete is removing right now, canonical name -> count (#302).
+# A delete enters it under _jobs_lock in the same step as its last busy check,
+# so a job either registers first and refuses the delete, or is refused here.
+_deleting = {}
+
+
+class CollectionDeletingError(Exception):
+    """A job was refused because a delete of its collection is in progress.
+
+    Not a RuntimeError: the export and tune routes read RuntimeError as "already
+    running", which this is not.
+    """
+
+    def __init__(self, collection):
+        super().__init__(collection)
+        self.collection = collection
+
+
+def deleting_message(name):
+    return (f"Collection '{name}' is being deleted. Start the job again once the delete "
+            "finishes; the collection must be created again first.")
 
 
 def register_job(collection, kind, job_id):
+    """Register a job; raises CollectionDeletingError while a delete is in progress."""
     with _jobs_lock:
+        if canonical(collection) in _deleting:
+            raise CollectionDeletingError(collection)
         _active_jobs.setdefault(canonical(collection), []).append((kind, job_id))
+
+
+def delete_in_progress(collection):
+    with _jobs_lock:
+        return canonical(collection) in _deleting
 
 
 def end_job(kind, job_id):
@@ -21143,21 +21442,32 @@ def delete_when_idle(collection, delete, poll=0.25):
 
     The guard is awaited only while no job is registered, rechecked every `poll`
     seconds, so a job admitted while the delete waits still refuses it promptly.
-    A job admitted after the last check is not refused: its worker waits for this
-    guard and then meets a deleted collection, which cannot be recreated
-    (AUTOSCHEMA_ENABLED is off) and which ingest reports as deleted.
+    Once the delete holds the guard and its last check finds no job, the delete
+    is in progress until it returns: a job registering then is refused with
+    CollectionDeletingError (#302) instead of meeting a deleted collection.
     """
     def refuse_if_busy():
         jobs = active_jobs(collection)
         if jobs:
             raise CollectionInUseError(collection, jobs)
 
+    name = canonical(collection)
     refuse_if_busy()
     while True:
         try:
             with guard(collection, timeout=poll):
-                refuse_if_busy()
-                return delete(collection)
+                with _jobs_lock:
+                    jobs = list(_active_jobs.get(name, ()))
+                    if jobs:
+                        raise CollectionInUseError(collection, jobs)
+                    _deleting[name] = _deleting.get(name, 0) + 1
+                try:
+                    return delete(collection)
+                finally:
+                    with _jobs_lock:
+                        _deleting[name] -= 1
+                        if not _deleting[name]:
+                            del _deleting[name]
         except CollectionBusyError:
             refuse_if_busy()
 ```
@@ -21396,7 +21706,7 @@ class DeletedRecoveryTests(unittest.TestCase):
                      patch.object(route, '_registry_lock', asyncio.Lock()), \
                      patch.object(route, '_load_registry', return_value=registry), \
                      patch.object(route, '_save_registry') as save:
-                    asyncio.run(route.delete_collection(caller))
+                    asyncio.run(route.delete_collection(caller, confirm='true'))
                     if fails:
                         save.assert_not_called()
                         self.assertEqual(len(registry), 3)

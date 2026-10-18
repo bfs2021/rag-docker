@@ -2,6 +2,11 @@ import { JobStatus } from '../api/client'
 
 export default function ProgressPanel({ job }: { job: JobStatus }) {
   const pct = job.files_total > 0 ? Math.round((job.files_completed / job.files_total) * 100) : 0
+  // Shown only when sending, acknowledgement and the check disagree (#302), so a
+  // clean job looks as it always did. Older records carry no counts at all.
+  const counted = typeof job.chunks_submitted === 'number' && typeof job.chunks_accepted === 'number'
+  const writesDiffer = counted &&
+    !(job.chunks_submitted === job.chunks_stored && job.chunks_accepted === job.chunks_stored)
   return (
     <div className="mt-4 p-4 border rounded bg-gray-50">
       <div className="flex justify-between text-sm mb-1">
@@ -14,6 +19,11 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {writesDiffer && (
+        <p className="mt-2 text-xs text-gray-600">
+          Submitted {job.chunks_submitted} · accepted {job.chunks_accepted} · stored {job.chunks_stored}
+        </p>
+      )}
       {(job.chunks_replaced ?? 0) > 0 && (
         // Re-ingesting a name replaces its chunks (#22), so the total can stay
         // the same while the content changed.

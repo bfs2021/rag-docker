@@ -36,7 +36,7 @@ async def generate(body: GenerateRequest):
             seed=body.seed,
         )
     except gs.GoldStandardError as exc:
-        return api_error(exc.status, exc.code, exc.message)
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     return GenerateResponse(**result)
 
 

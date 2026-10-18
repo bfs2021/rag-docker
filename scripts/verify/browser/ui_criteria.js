@@ -557,6 +557,83 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── ingest write counts and a delete in progress (#302) ──────────────────
+  // The progress panel shows submitted, accepted and stored chunks only when
+  // they differ; a clean job and an older record without the counts look as
+  // before. An upload refused while its collection is being deleted shows the
+  // API's message. Responses are stubbed.
+  r.section('ingest write counts');
+  const countCases = [
+    ['differing counts', { chunks_submitted: 10, chunks_accepted: 10, chunks_stored: 0, status: 'failed', files_completed: 0, files_failed: 1 }, 'Submitted 10 · accepted 10 · stored 0'],
+    ['equal counts', { chunks_submitted: 2, chunks_accepted: 2, chunks_stored: 2, status: 'completed', files_completed: 1, files_failed: 0 }, null],
+    ['a record without the counts', { chunks_stored: 5, status: 'completed', files_completed: 1, files_failed: 0 }, null],
+  ];
+  for (const [label, fields, line] of countCases) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-counts.txt';
+    fs.writeFileSync(small, 'Write counts fixture.\n');
+    const jobId = 'vfycnt' + countCases.findIndex(c => c[0] === label);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, files_total: 1, errors: [], skipped: [], chunks_replaced: 0, ...fields }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (line) {
+        r.check(`${label}: the panel shows "${line}"`, clicked && text.includes(line),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check(`${label}: the panel shows no submitted/accepted line`,
+                clicked && text.includes(`Chunks stored: ${fields.chunks_stored}`) && !text.includes('Submitted '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      }
+      r.check(`write counts fixture (${label}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-deleting.txt';
+    fs.writeFileSync(small, 'Deleting fixture.\n');
+    const message = "Collection 'VfyGone' is being deleted. Start the job again once the delete finishes; the collection must be created again first.";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_DELETING', message, detail: { collection: 'VfyGone' } } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(1500);
+      const text = await bodyText(s.page);
+      r.check('an upload refused with 409 COLLECTION_DELETING shows its message', clicked && text.includes(message),
+              clicked ? text.slice(0, 300) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
