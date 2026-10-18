@@ -274,6 +274,12 @@ check_eq "DELETE after the job completes succeeds" "$code" "200"
 sleep 10
 check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC")" "absent"
 
+# ── job records survive an API restart (#23) ─────────────────────────────────
+# Controlled cases: unbound stores, throttled and immediate writes, failed
+# writes, startup marking of interrupted jobs, corrupt files and retention.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
+check "job store: persistence, throttling, startup marking and retention" $?
+
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "${PREFIX}NoAutoSchema" <<'ENDPY'
@@ -304,6 +310,76 @@ ENDPY
 ) >/tmp/vfy_autoschema.txt 2>&1
 check "an insert into a deleted collection fails and does not recreate it" $? \
   "$(tail -1 /tmp/vfy_autoschema.txt)"
+
+# ── job status survives an API restart (#23; opt-in: restarts the API) ───────
+# Before #23 every job answered 404 after a restart. A job that finished must
+# read back unchanged, and one interrupted after storing a file must read
+# `partial` with the interruption message. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the job during shutdown.
+JR="${PREFIX}JobRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "ingest job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "ingest job status across an API restart" 1 "$restart_refusal"
+else
+  drop_collection "$JR"; make_collection "$JR"
+  ingest "$JR" fixed 300 50 "$FIX/policies.txt"
+  done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
+  api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
+  # policies.txt stores in seconds; the slow file then embeds for tens of seconds.
+  slow_dir=$(mktemp -d)
+  python3 - "$slow_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(23)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+  curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
+    -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
+    -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
+  rm -rf "$slow_dir"
+  slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/ingest/job/$slow_job" > /tmp/vfy_restart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_restart_before.json'))
+print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/null)
+    case "$state" in running-stored|completed*|partial*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-stored ]; then
+    check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_restart_done.json')) == json.load(open('/tmp/vfy_restart_done_after.json')) else 1)"
+    check "a completed ingest job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_after.json -w '%{http_code}' "$API/ingest/job/$slow_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+before = json.load(open('/tmp/vfy_restart_before.json'))
+after = json.load(open('/tmp/vfy_restart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "partial"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == before["files_completed"])
+print(sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
+      "$(head -c 300 /tmp/vfy_restart_after.json)"
+  fi
+  drop_collection "$JR"
+fi
 
 drop_collection "$C"
 cleanup_prefixed

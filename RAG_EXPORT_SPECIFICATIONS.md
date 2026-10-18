@@ -566,6 +566,7 @@ first request, which is what makes this safe.
 | New-target partial import | a small version-4 marker bound by SHA-256 to a compact SQLite expectation snapshot, and by a random instance token to the schema description (`rag-import:<token>`) the import gives the collection it creates | only for the collection carrying the marker's token: verify the full stored records and delete a proven mismatch. A collection without the token was created later under that name: keep it and retire the marker. Preserve on unreadable/legacy metadata or backend read failure. A version-3 marker carries no token and never deletes: in state `building` it is kept and logged; in state `cleanup` its cleanup is finished |
 | Orphaned expectation snapshot | a `<32 hex>.sqlite3` file in the markers folder that no marker names | delete it; if any marker cannot be parsed, delete none |
 | Extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete the abandoned workspace; recovery sidecars are stored outside it |
+| Job record left `queued` or `running` | its file under `UPLOAD_DIR/jobs/<kind>/` | mark it interrupted: export, import and tune `failed` with `INTERRUPTED`, ingest `partial` (a file was stored) or `failed`; keep the newest 200 records per kind. A job record never authorizes or blocks any cleanup above |
 
 Recovery ownership is atomic and flushed before the destructive step. Cleanup
 intent is also durable, so a failure after backend deletion does not leave a
@@ -731,6 +732,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
 | `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Reindex and re-embed from stored chunks remain available. |
 | `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
+| `INTERRUPTED` | the API restarted while the export, import or tune job was queued or running; start it again (#23) |
 
 ---
 
@@ -780,6 +782,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
 | E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
+| E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` (import and tune likewise, by `test_jobstore.py`) |
 
 ---
 

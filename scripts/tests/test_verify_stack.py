@@ -397,7 +397,7 @@ class RestartGuardTests(unittest.TestCase):
         self.assertEqual(self.reason(COMPOSE_PROJECT_NAME='rag-verify'), '')
 
     def test_every_restart_section_asks_first(self):
-        for name in ('01_infrastructure.sh', '04_goldstandard.sh', '05_transfer.sh'):
+        for name in ('01_infrastructure.sh', '02_ingest.sh', '04_goldstandard.sh', '05_transfer.sh'):
             with self.subTest(suite=name):
                 text = (VERIFY / name).read_text()
                 block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]

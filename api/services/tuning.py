@@ -30,7 +30,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services import collection_writes
+from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
 from services import sources
@@ -42,7 +42,8 @@ from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("tune")
 _active: set[str] = set()
 _lock = threading.Lock()
 

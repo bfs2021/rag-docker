@@ -43,14 +43,15 @@ from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
-from services import batch_write, collection_recovery, collection_writes
+from services import batch_write, collection_recovery, collection_writes, jobstore
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
 ON_CONFLICT = ("abort", "rename", "replace")
 
-_jobs: dict[str, dict] = {}
+# Job records survive an API restart (#23); see jobstore.py.
+_jobs = jobstore.JobStore("import")
 _active: set[str] = set()
 _lock = threading.Lock()
 
