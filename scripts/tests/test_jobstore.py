@@ -8,11 +8,13 @@ Disposable directories only; nothing reaches a backend. The lifespan case runs
 in a child process, so the module stores of this process stay unbound.
 """
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -22,7 +24,7 @@ API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().par
 sys.path.insert(0, API_DIR)
 
 from config import settings
-from services import ingest_pipeline, jobstore
+from services import collection_writes, exporter, importer, ingest_pipeline, jobstore, tuning
 
 INGEST_MESSAGE = ("Interrupted: the API restarted while this job was running. "
                   "Re-upload the files to try again.")
@@ -281,6 +283,222 @@ asyncio.run(run())
         job = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual((job["status"], job["error_code"]), ("failed", "INTERRUPTED"))
         self.assertIn("Marked 1 job(s) interrupted by the restart: export abcd1234", result.stderr)
+
+
+class PruneTests(StoreTestCase):
+    """Retention while the API runs (#309)."""
+
+    def setUp(self):
+        super().setUp()
+        change = patch.object(jobstore, "RETENTION", 3)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def path(self, kind, job_id):
+        return self.root / "jobs" / kind / f"{job_id}.json"
+
+    def add(self, store, job_id, status, saved=None):
+        store[job_id] = {"job_id": job_id, "status": status}
+        if saved is not None:
+            store[job_id]._saved = saved
+        return store[job_id]
+
+    def test_the_finished_records_saved_longest_ago_go_from_memory_and_disk(self):
+        store = self.bound()
+        for n, job_id in enumerate(("r2", "r1", "r3")):
+            self.add(store, job_id, "completed", saved=[200.0, 100.0, 300.0][n])
+        with self.assertLogs("services.jobstore", "INFO") as logs:
+            self.add(store, "r4", "queued")
+        self.assertEqual(set(store), {"r2", "r3", "r4"})
+        self.assertFalse(self.path("export", "r1").exists())
+        self.assertTrue(all(self.path("export", i).exists() for i in ("r2", "r3", "r4")))
+        self.assertTrue(any("Removed old export job record r1" in line for line in logs.output))
+        self.assertIsNone(store.get("r1"))                    # the endpoint's 404
+
+    def test_queued_and_running_records_are_never_removed(self):
+        store = self.bound("import")
+        self.add(store, "a1", "running", saved=1.0)
+        self.add(store, "a2", "queued", saved=2.0)
+        self.add(store, "a3", "running", saved=3.0)
+        self.add(store, "a4", "queued")
+        self.add(store, "a5", "failed")                       # the record just stored stays
+        self.assertEqual(len(store), 5)
+        store["a1"]["status"] = "completed"
+        store["a1"]._saved = 1.0
+        store["a5"]._saved = 5.0
+        self.add(store, "a6", "partial")
+        self.assertEqual(set(store), {"a2", "a3", "a4", "a6"})
+        self.assertFalse(self.path("import", "a1").exists())
+        self.assertFalse(self.path("import", "a5").exists())
+
+    def test_records_from_startup_are_ordered_by_their_file_time(self):
+        self.put("tune", "l1", {"job_id": "l1", "status": "completed"}, age=200)
+        self.put("tune", "l2", {"job_id": "l2", "status": "failed"}, age=300)
+        self.put("tune", "l3", {"job_id": "l3", "status": "completed"}, age=100)
+        store = jobstore.JobStore("tune")
+        store.load()
+        self.add(store, "n1", "queued")
+        self.assertEqual(set(store), {"l1", "l3", "n1"})
+        self.assertFalse(self.path("tune", "l2").exists())
+
+    def test_a_removed_record_cancels_its_pending_write(self):
+        store = self.bound()
+        for job_id, saved in (("t1", 1.0), ("t2", 2.0), ("t3", 3.0)):
+            self.add(store, job_id, "completed", saved=saved)
+        timer = threading.Timer(60, lambda: None)
+        store["t1"]._timer = timer
+        timer.start()
+        self.add(store, "t4", "running")
+        self.assertNotIn("t1", store)
+        self.assertFalse(timer.is_alive() and not timer.finished.is_set())
+
+    def test_an_unbound_store_never_prunes(self):
+        store = jobstore.JobStore("export")
+        for n in range(5):
+            store[f"u{n}"] = {"status": "completed"}
+        self.assertEqual(len(store), 5)
+
+    def test_a_failed_file_removal_is_logged_and_the_record_still_dropped(self):
+        store = self.bound()
+        for job_id, saved in (("e1", 1.0), ("e2", 2.0), ("e3", 3.0)):
+            self.add(store, job_id, "completed", saved=saved)
+        with patch.object(Path, "unlink", side_effect=OSError("read-only")), \
+             self.assertLogs("services.jobstore", "ERROR"):
+            self.add(store, "e4", "queued")                  # no exception
+        self.assertEqual(set(store), {"e2", "e3", "e4"})
+        self.assertTrue(self.path("export", "e1").exists())   # startup retention removes it
+
+    def test_replacing_a_record_prunes_nothing(self):
+        store = self.bound()
+        for job_id in ("p1", "p2", "p3", "p4"):
+            self.add(store, job_id, "running")
+        store["p1"]["status"] = "completed"
+        store["p2"] = {"job_id": "p2", "status": "running"}
+        self.assertEqual(set(store), {"p1", "p2", "p3", "p4"})
+
+
+class Recording(jobstore.JobStore):
+    """A bound store that notes which thread stores each record, and can hold
+    that write until released."""
+
+    def __init__(self, kind, hold=False):
+        super().__init__(kind)
+        self.threads, self.ids = [], []
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.stored = threading.Event()
+        if not hold:
+            self.release.set()
+
+    def __setitem__(self, job_id, doc):
+        self.threads.append(threading.get_ident())
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        super().__setitem__(job_id, doc)
+        self.stored.set()
+
+
+class StartTests(StoreTestCase):
+    """The four job starts store their first record off the event loop, and a
+    start cancelled during that write leaves nothing behind (#309)."""
+
+    KINDS = {"export": (exporter, "_run"), "import": (importer, "_run"),
+             "tune": (tuning, "_run"), "ingest": (ingest_pipeline, "_process_job_sync")}
+
+    def harness(self, kind, hold=False):
+        module, worker = self.KINDS[kind]
+        store = Recording(kind, hold)
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(module, "_jobs", store),
+                       patch.object(module, worker, side_effect=lambda *a, **k: calls.append(a))):
+            change.start()
+            self.addCleanup(change.stop)
+        return module, store, calls
+
+    @staticmethod
+    def start(kind, name):
+        if kind == "export":
+            return exporter.start_export_job(name)
+        if kind == "import":
+            return importer.start_import_job(name, "abort")
+        if kind == "tune":
+            return tuning.start_tune_job(name, "reindex", {})
+        upload = type("Upload", (), {"filename": "a.txt", "file": io.BytesIO(b"hello world")})()
+        return ingest_pipeline.start_ingest_job([upload], name, "fixed", 300, 0, 0.85, 50)
+
+    def guards_free(self, kind, module, name):
+        key = collection_writes.canonical(name) if kind == "tune" else name
+        active = key in module._active if kind != "ingest" else False
+        return not active and collection_writes.active_jobs(name) == []
+
+    def test_each_start_stores_its_record_off_the_event_loop(self):
+        for kind in self.KINDS:
+            with self.subTest(kind=kind):
+                module, store, calls = self.harness(kind)
+                name = f"Vfy309{kind.capitalize()}"
+
+                async def run():
+                    loop_thread = threading.get_ident()
+                    job_id = await self.start(kind, name)
+                    stored = job_id in store and self.path_exists(kind, job_id)
+                    for _ in range(500):
+                        if calls:
+                            break
+                        await asyncio.sleep(0.01)
+                    return loop_thread, job_id, stored
+
+                loop_thread, job_id, stored = asyncio.run(run())
+                self.assertEqual(store.ids, [job_id])
+                self.assertNotEqual(store.threads, [loop_thread])
+                self.assertTrue(stored)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(store[job_id]["status"], "queued")
+                # the stub worker never ran, so release what it would have
+                collection_writes.end_job(kind, job_id)
+                if kind == "export":
+                    module._active.pop(name, None)
+                elif kind == "tune":
+                    module._active.discard(collection_writes.canonical(name))
+                elif kind == "import":
+                    module._active.discard(name)
+
+    def path_exists(self, kind, job_id):
+        return (self.root / "jobs" / kind / f"{job_id}.json").exists()
+
+    def test_a_start_cancelled_during_its_write_leaves_nothing_behind(self):
+        for kind in self.KINDS:
+            with self.subTest(kind=kind):
+                module, store, calls = self.harness(kind, hold=True)
+                name = f"Vfy309Cancel{kind.capitalize()}"
+
+                async def run():
+                    task = asyncio.ensure_future(self.start(kind, name))
+                    entered = await asyncio.get_running_loop().run_in_executor(
+                        None, store.entered.wait, 10)
+                    self.assertTrue(entered)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    freed = self.guards_free(kind, module, name)
+                    store.release.set()
+                    job_id = store.ids[0]
+                    # the abandoned write still stores the record; then it goes
+                    self.assertTrue(await asyncio.get_running_loop().run_in_executor(
+                        None, store.stored.wait, 10))
+                    for _ in range(500):
+                        if job_id not in store and not self.path_exists(kind, job_id):
+                            break
+                        await asyncio.sleep(0.01)
+                    return freed, job_id
+
+                freed, job_id = asyncio.run(run())
+                self.assertTrue(freed)
+                self.assertNotIn(job_id, store)
+                self.assertFalse(self.path_exists(kind, job_id))
+                self.assertEqual(calls, [])
+                if kind == "ingest":
+                    self.assertEqual([p.name for p in self.root.iterdir()], ["jobs"])
 
 
 class IngestFallbackTests(StoreTestCase):

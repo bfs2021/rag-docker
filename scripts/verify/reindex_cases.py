@@ -234,9 +234,11 @@ class ReindexTests(unittest.TestCase):
         self.assertTrue(all(name.startswith('OwnedReindex') for name,_,_,_ in self.backend.created))
     def test_alias_jobs_share_the_same_active_identity(self):
         import asyncio
-        from unittest.mock import AsyncMock
+        from services import jobstore
         async def check():
-            with patch.object(tuning,'_active',set()),patch.object(tuning.asyncio,'to_thread',new=AsyncMock(return_value=None)):
+            # The start stores its record through JobStore.create() in a thread
+            # (#309), so asyncio.to_thread stays real; the worker is stubbed.
+            with patch.object(tuning,'_active',set()),patch.object(tuning,'_jobs',jobstore.JobStore('tune')),patch.object(tuning,'_run'):
                 identity=await tuning.start_tune_job('ownedReindex','reindex',{})
                 self.assertEqual(tuning._jobs[identity]['collection'],'OwnedReindex')
                 with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})

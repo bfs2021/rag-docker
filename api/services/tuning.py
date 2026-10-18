@@ -460,18 +460,26 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
             _active.discard(collection)
         raise
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "collection": collection,
-        "operation": operation,
-        "chunks_total": 0,
-        "chunks_written": 0,
-        "notes": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guards; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "collection": collection,
+            "operation": operation,
+            "chunks_total": 0,
+            "chunks_written": 0,
+            "notes": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        collection_writes.end_job("tune", job_id)
+        with _lock:
+            _active.discard(collection)
+        raise
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))

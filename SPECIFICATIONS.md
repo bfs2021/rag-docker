@@ -627,7 +627,11 @@ worker died with the old process. An interrupted ingest becomes `partial` when
 `files_completed > 0`, otherwise `failed`, with "Interrupted: the API restarted while this job
 was running. Re-upload the files to try again." appended to `errors`; its counters stay as
 they were. An unreadable record file is left as it is and logged. The newest 200 records per
-kind are kept; older ones are removed at startup.
+kind are kept: at startup by file time, and while the API runs, starting a job past 200 removes
+the finished records saved longest ago (a `queued` or `running` one never is). A removed job
+answers `404 JOB_NOT_FOUND`, as it would after a restart. A job's first record is written off
+the event loop; a start whose request is cancelled during that write leaves no record and
+releases its guards (#309).
 
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
@@ -2434,8 +2438,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.
   *Evidence: suite 01 creates 140 schema changes, waits for a snapshot, writes a tail, restarts, and checks the restored snapshot index and data.*
 
-- [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept (#23).
-  *Evidence: `test_jobstore.py` (15 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job.*
+- [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
+  *Evidence: `test_jobstore.py` (24 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation; with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.

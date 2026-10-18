@@ -24,9 +24,22 @@ after they were made. Changes made in place to a nested list or dict
 carries them. Every job path ends with a status change, so the final record on
 disk is complete.
 
+**Starting a job.** The job starts store their first record with `create()`,
+which writes it from a worker thread: that write is durable (fsync), and it can
+wait on the store lock while a worker thread saves, so it stays off the event
+loop. A start cancelled during that write releases its own guards, and its
+record is removed once the write ends: no client was given that id (#309).
+
 **At startup** `load()` marks every record still `queued` or `running` as
 interrupted: its worker thread died with the old process. Unreadable files are
-left as they are and logged. The newest `RETENTION` files per kind are kept.
+left as they are and logged.
+
+**Retention.** The newest `RETENTION` records per kind are kept, while the API
+runs as well as at startup. At startup `load()` keeps the newest files by
+modification time. While running, storing a new record past `RETENTION` removes
+the finished records saved longest ago, from memory and from disk; a removed
+job reads 404, as it would after a restart. A `queued` or `running` record is
+never removed, so a store can briefly hold more while that many jobs run (#309).
 
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
@@ -34,6 +47,7 @@ anything in `jobs/`.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -55,8 +69,10 @@ TERMINAL = frozenset({"completed", "failed", "partial", "cancelled"})
 # report progress every few hundred chunks; writing each one would be a disk-I/O
 # regression on a large export.
 THROTTLE_S = 1.0
-# Records kept per kind, newest first by modification time. About 1 KB each, so
-# the volume can't grow without bound. Nothing in jobs/ is ever recovery data.
+# Records kept per kind: by file modification time at startup, and while the API
+# runs by removing the finished records saved longest ago once a new one passes
+# the limit (never a queued or running one). About 1 KB each, so the volume
+# can't grow without bound. Nothing in jobs/ is ever recovery data.
 RETENTION = 200
 # Generated ids are 8 hex characters; anything else could name another path.
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -73,7 +89,9 @@ _REMEDY = {
 class _Job(dict):
     """A record bound to its store: changes made through its methods are saved."""
 
-    __slots__ = ("_store", "_id", "_last", "_timer")
+    # _last: monotonic time of the last write attempt (the throttle);
+    # _saved: wall-clock time of the last write attempt (retention order).
+    __slots__ = ("_store", "_id", "_last", "_saved", "_timer")
 
     def __setitem__(self, key, value):
         status_changed = key == "status" and self.get("status") != value
@@ -142,6 +160,8 @@ class JobStore(MutableMapping):
                 self._cancel(old)
             self._records[job_id] = record
             self._write(record, durable=True)
+            if old is None:
+                self._prune(job_id)
 
     def __delitem__(self, job_id):
         with self._lock:
@@ -154,6 +174,36 @@ class JobStore(MutableMapping):
                 except OSError:
                     _log.exception("Could not remove %s job record %s", self.kind, job_id)
 
+    async def create(self, job_id, doc) -> None:
+        """Store a new record from a worker thread, off the event loop (#309).
+
+        Shielded: cancelling a plain to_thread await loses track of the thread,
+        which still stores the record. If the caller is cancelled, the record is
+        removed once that write ends, off the loop too, and the cancellation
+        propagates; the caller releases its own guards.
+        """
+        loop = asyncio.get_running_loop()
+        write = asyncio.ensure_future(asyncio.to_thread(self.__setitem__, job_id, doc))
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            def _abandoned(task: asyncio.Future) -> None:
+                if not task.cancelled() and task.exception() is not None:
+                    _log.error("Could not store abandoned %s job %s: %s",
+                               self.kind, job_id, task.exception())
+                loop.run_in_executor(None, self._discard, job_id)
+            write.add_done_callback(_abandoned)
+            raise
+
+    def _discard(self, job_id) -> None:
+        """Remove a record if it is there; never raises."""
+        try:
+            with self._lock:
+                if job_id in self._records:
+                    del self[job_id]
+        except Exception:                       # noqa: BLE001 - logged, never raised
+            _log.exception("Could not remove abandoned %s job %s", self.kind, job_id)
+
     # ── persistence ─────────────────────────────────────────────────────────
 
     def _bind(self, job_id: str, doc) -> _Job:
@@ -161,8 +211,29 @@ class JobStore(MutableMapping):
         record._store = self
         record._id = job_id
         record._last = 0.0
+        record._saved = 0.0
         record._timer = None
         return record
+
+    def _prune(self, keep: str) -> None:
+        """Remove the finished records saved longest ago past RETENTION; never
+        a queued or running one, nor `keep`. Never raises. Caller holds the lock."""
+        excess = len(self._records) - RETENTION
+        if excess <= 0:
+            return
+        finished = sorted((r for job_id, r in self._records.items()
+                           if job_id != keep and isinstance(r, _Job)
+                           and r.get("status") in TERMINAL),
+                          key=lambda r: r._saved)
+        for record in finished[:excess]:
+            del self._records[record._id]
+            self._cancel(record)
+            try:
+                (self._dir / f"{record._id}.json").unlink(missing_ok=True)
+                _log.info("Removed old %s job record %s (keeping the newest %d)",
+                          self.kind, record._id, RETENTION)
+            except OSError:
+                _log.exception("Could not remove old job record %s", record._id)
 
     @staticmethod
     def _cancel(record: _Job) -> None:
@@ -229,6 +300,7 @@ class JobStore(MutableMapping):
                 # Also after a failure, so a lasting fault is retried at the
                 # throttle's pace rather than on every change.
                 record._last = time.monotonic()
+                record._saved = time.time()
 
     # ── startup ─────────────────────────────────────────────────────────────
 
@@ -274,6 +346,7 @@ class JobStore(MutableMapping):
                 if path not in readable:
                     continue
                 record = self._bind(path.stem, readable[path])
+                record._saved = _mtime(path)
                 self._records[path.stem] = record
                 if record.get("status") not in TERMINAL:
                     self._mark_interrupted(record)
