@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/plain.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -68,6 +68,72 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── unreadable archives and gzipped JSON members (#290) ──────────────────────
+# Controlled cases: truncated archives, wrong member offsets, bad CRCs (also in
+# skipped members), unsupported compression, encryption and unwritable members;
+# JSON Lines skip reasons; gzip corruption, size bound and unparseable JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_ingest_errors.py)
+check "upload unpacking errors and gzipped JSON regressions" $?
+
+# A truncated ZIP, like an incomplete download, once ended in a bare HTTP 500.
+code=$(curl -s -m 120 -o /tmp/vfy_trunc.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/truncated.zip")
+read -r err_code names_file <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_trunc.json'))['error']
+except Exception: print('not-json no'); raise SystemExit
+print(e['code'], 'yes' if \"'truncated.zip' is damaged and can't be read\" in e['message'] else 'no')")"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_UNREADABLE ] && [ "$names_file" = yes ]
+check "a truncated ZIP is refused with a readable 400 naming it" $? \
+  "HTTP=$code code=$err_code names-file=$names_file"
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 "$FIX/gz_batch.zip"
+read -r status completed gz_errors <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], len(d['errors']))")"
+[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$gz_errors" = 0 ]
+check "a ZIP's .json and .json.gz members both ingest" $? \
+  "status=$status completed=$completed errors=$gz_errors (want completed 2)"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if sorted(d.get('skipped', [])) == [
+    \"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\",
+    \"gz_batch.zip:records.jsonl.gz (JSON Lines (.jsonl) isn't supported yet, see #291)\"] else 1)"
+check "JSON Lines is skipped with its own reason, other gzip as unsupported" $?
+
+# ── ordinary JSON as readable text (#295) ────────────────────────────────────
+# Controlled cases: every conversion rule, file key order, non-ASCII text,
+# element-schema rehydration, empty files and invalid JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_json_ingest.py)
+check "ordinary JSON conversion regressions" $?
+
+# The stored chunks once held pretty-printed JSON with escaped non-ASCII text.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/plain.json"
+read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$chunks" -gt 0 ]
+check "an ordinary nested JSON file ingests" $? "status=$status chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    text = "\n".join(o.properties["content"] for o in collection.iterator())
+finally:
+    wc.close_client()
+wanted = ["title: Remote work policy", "meta.author: Zoë Müller", "tags: policy, remote"]
+missing = [w for w in wanted if w not in text]
+syntax = [c for c in ("{", '"', "\\u") if c in text]
+if missing or syntax:
+    print(f"missing={missing} json-syntax={syntax}", file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "its chunks hold key: value text with non-ASCII kept" $?
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with

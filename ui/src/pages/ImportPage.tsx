@@ -19,6 +19,9 @@ export default function ImportPage() {
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
   const [error, setError] = useState('')
+  // A failed status poll, shown instead of ignored (#290). Polling carries on,
+  // and the next successful poll clears it.
+  const [pollError, setPollError] = useState('')
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
@@ -39,8 +42,11 @@ export default function ImportPage() {
       try {
         const j = await api.getJobStatus(jobId)
         setJob(j)
+        setPollError('')
         if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
-      } catch { /* ignore */ }
+      } catch (e: unknown) {
+        setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }, 3000)
     return () => clearInterval(interval)
   }, [jobId])
@@ -72,6 +78,7 @@ export default function ImportPage() {
   async function startIngest() {
     if (!files.length || !collection) return
     setError('')
+    setPollError('')
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -171,6 +178,7 @@ export default function ImportPage() {
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
       {job && <ProgressPanel job={job} />}
+      {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
