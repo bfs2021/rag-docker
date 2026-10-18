@@ -297,9 +297,13 @@ class JsonGzParseTests(unittest.TestCase):
 
     def test_decompressed_size_is_bounded(self):
         path = self.gz(gzip.compress(b" " * 5000))
-        with patch.object(ingest_pipeline, "MAX_GZIP_DECOMPRESSED_BYTES", 1000), \
-                self.assertRaisesRegex(ValueError, "decompresses to more than .* MB, the limit"):
+        # A .json.gz member stops at the JSON input limit (#300), not the 512 MB gzip one.
+        with patch.object(ingest_pipeline, "MAX_JSON_INPUT_BYTES", 1000), \
+                self.assertRaises(ValueError) as caught:
             ingest_pipeline._parse_file(path)
+        self.assertEqual(str(caught.exception),
+                         "decompresses to more than 1,000 bytes, the most one JSON file can hold; "
+                         "split the file or convert it to JSON Lines")
         self.assert_no_temp_left(["doc.json.gz"])
 
     def test_unparseable_json_after_decompression(self):

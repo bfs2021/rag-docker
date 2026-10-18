@@ -505,7 +505,7 @@ API keeps answering other requests meanwhile. The member-count and compression-r
 #28's.
 
 **`.json.gz` members.** A ZIP member ending in `.json.gz` is extracted and queued like a
-supported file. The job decompresses it (at most 512 MB decompressed) and parses the result
+supported file. The job decompresses it (at most 30,000,000 bytes decompressed, the JSON input limit of §5.1; #300) and parses the result
 as JSON; its chunks have `source_type` `json` and `source_file` the member's logical name (below), and
 the retained original is the `.json.gz` itself. A `.json.gz` uploaded directly, and other
 `.gz` members, are skipped as unsupported types. The JSON is converted to text as described in §5.1.
@@ -601,11 +601,16 @@ kind are kept; older ones are removed at startup.
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
 `.json.gz` member can fail with: not a valid gzip file (truncated or corrupt);
-decompressing to more than 512 MB; or JSON that can't be parsed after decompression. A `.json` file
+`decompresses to more than 30,000,000 bytes, the most one JSON file can hold; split the file or
+convert it to JSON Lines` (decompression stops there; #300); or JSON that can't be parsed after
+decompression. A `.json` file over 30,000,000 bytes fails, before it is read, with `is larger than
+30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines`. A `.json` file
 that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column; one whose
 converted text would exceed 10,000,000 characters fails with `converts to more than 10,000,000 characters of
 text, the per-file limit for every chunking strategy; split the file` (a `.json.gz` member: `was decompressed,
-but it converts to more than …`).
+but it converts to more than …`); one with more than 1,000,000 records fails with `has more than 1,000,000
+records, the most one file can hold; split the file` (a `.json.gz` member: `was decompressed, but it has more
+than …`).
 
 A `.jsonl` or `.jsonl.gz` file fails as a whole, with nothing stored, at its first bad line
 (§5.1): `line N is blank` (a blank line followed by another record), `line N is not valid JSON:
@@ -613,8 +618,9 @@ A `.jsonl` or `.jsonl.gz` file fails as a whole, with nothing stored, at its fir
 10,000,000 bytes, the most one line can hold; split the record across lines or files`, or
 `converts to more than 10,000,000 characters of text by line N, the per-file limit for every
 chunking strategy; split the file`. For a `.jsonl.gz` these read `was decompressed, but line N …`
-(and `was decompressed, but it converts to more than …`); a corrupt or truncated gzip and the
-512 MB limit give the `.json.gz` messages above.
+(and `was decompressed, but it converts to more than …`); a corrupt or truncated gzip gives the
+`.json.gz` message above, and passing the 512 MB limit gives `decompresses to more than 512 MB,
+the limit for one compressed file; nothing from it was stored`.
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -1482,10 +1488,10 @@ Flat (KNN) index has no tunable parameters.
 | Plain text | `.txt` | Unstructured (`partition_text`) | UTF-8 encoding assumed |
 | Markdown | `.md` | Unstructured (`partition_md`) | Heading structure preserved |
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
-| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
+| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n`; a `\r` before it is whitespace; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -2104,7 +2110,15 @@ now lives once, in `api/services/ingest_config.py`.
       That 524,295-byte file now fails in 0.2 s with a 21.7 MB traced peak, and a file
       converting to 9,999,999 characters still converts and chunks; `02_ingest.sh` ingests a nested `plain.json` through the proxy and
       reads back `meta.author: Zoë Müller` with no JSON syntax. Full verification runs
-      2026-10-17: all seven suites passed (9m31s; after the review fixes, 9m36s).*
+      2026-10-17: all seven suites passed (9m31s; after the review fixes, 9m36s).
+      The PR #299 review's follow-ups (#300): the blank lines between records now count
+      toward that limit, a file keeps at most 1,000,000 records, and JSON input is limited to
+      30,000,000 bytes before it is parsed (a `.json.gz` member stops decompressing there), each
+      failing that file alone with its own message. `test_json_ingest.py` covers each limit at
+      and one past its edge, a file of 1,000,001 tiny records failing fast without building
+      elements, and the traced peaks of deep keys, an over-long scalar array and an
+      element-schema file's parse; `02_ingest.sh` sends one file over each limit beside
+      `plain.json` and checks the exact errors.*
 - [x] A JSON Lines file (`.jsonl` or `.jsonl.gz`, uploaded directly or in a ZIP) is stored one `key: value` record per line with `source_type` `jsonl`; a blank, malformed, non-UTF-8 or over-long line fails the whole file naming that line, and the file's text is bounded by the per-file limit while it is read (#291).
       *`test_jsonl_ingest.py` (39 cases in the API image) covers the conversion of each kind
       of line, CRLF, a byte-order mark, trailing blank lines, every line error and its

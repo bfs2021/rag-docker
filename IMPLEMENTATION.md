@@ -3161,10 +3161,11 @@ from services import weaviate_client as wc
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
 # Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
 # directly or inside a ZIP (#291). Either is decompressed when the job parses
-# it, never more than this many bytes. The bound is per file, so several
-# gzipped members could each reach it: a ZIP's members, their gzip output
-# included, are bounded together by settings.max_zip_expanded_bytes (#298). A
-# directly uploaded .jsonl.gz is bounded by this alone.
+# it: a .json.gz never past MAX_JSON_INPUT_BYTES (#300), a .jsonl.gz never past
+# MAX_GZIP_DECOMPRESSED_BYTES. The bounds are per file, so several gzipped
+# members could each reach them: a ZIP's members, their gzip output included,
+# are bounded together by settings.max_zip_expanded_bytes (#298). A directly
+# uploaded .jsonl.gz is bounded by its own limit alone.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
@@ -3235,7 +3236,8 @@ def _gzip_too_large() -> ValueError:
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
-    """Decompress src into dest in blocks, refusing more than the limit."""
+    """Decompress a .json.gz into dest in blocks, stopping as soon as the output
+    passes the JSON input limit (#300)."""
     written = 0
     try:
         with gzip.open(src, "rb") as gz, dest.open("wb") as out:
@@ -3244,8 +3246,8 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
                 if not block:
                     break
                 written += len(block)
-                if written > MAX_GZIP_DECOMPRESSED_BYTES:
-                    raise _gzip_too_large()
+                if written > MAX_JSON_INPUT_BYTES:
+                    raise ValueError(_json_input_too_large("decompresses to more than"))
                 out.write(block)
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
@@ -3277,6 +3279,33 @@ class _JsonTooLarge(_JsonError):
 # so the bound refuses nothing that could have been ingested; it only refuses
 # before the text is built.
 MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
+# The most bytes of one JSON file that are parsed (#300). A .json file is parsed
+# whole, before the text bound can be checked, and parsing takes up to about 34
+# times the file's size (`[[1],[1],...]`), so this bounds one file's parse at
+# about 1 GB. A .json.gz member stops decompressing here. JSON Lines files are
+# read a line at a time and have their own limits.
+MAX_JSON_INPUT_BYTES = 30_000_000
+# The most records one JSON file may keep (#300). Each kept record of a
+# top-level array becomes its own element, and the text bound alone still
+# allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
+# blank line between records). A file of more than this many records averages
+# under 8 characters a record; any other passes the text bound first.
+MAX_JSON_RECORDS = 1_000_000
+
+
+def _json_input_too_large(verb: str) -> str:
+    return (f"{verb} {MAX_JSON_INPUT_BYTES:,} bytes, the most one JSON file can hold; "
+            f"split the file or convert it to JSON Lines")
+
+
+class _JsonTooManyRecords(_JsonError):
+    """Valid JSON with more kept records than one file may hold (#300)."""
+
+    def __init__(self) -> None:
+        detail = (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+                  f"split the file")
+        ValueError.__init__(self, detail)
+        self.detail = detail
 
 
 class _JsonNumber:
@@ -3399,6 +3428,10 @@ def _json_records(value: Any) -> list[str]:
             _json_lines(group, None, lines, budget)
             text = "\n".join(lines)
             if text.strip():
+                if records:
+                    budget.spend(2)  # the blank line before this record (#300)
+                if len(records) == MAX_JSON_RECORDS:
+                    raise _JsonTooManyRecords()
                 records.append(text)
             else:
                 budget.left = left  # a dropped record's text is not stored
@@ -3410,12 +3443,18 @@ def _json_records(value: Any) -> list[str]:
 def _parse_json(path: Path) -> tuple[str, list[Any]]:
     """Ordinary JSON becomes `key: value` text, one element per record. A file of
     serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    # Checked before anything is read: the parse is the cost (#300).
+    if path.stat().st_size > MAX_JSON_INPUT_BYTES:
+        raise ValueError(_json_input_too_large("is larger than"))
     raw, value = _read_json(path)
     if not raw:
         return "", []
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
         from unstructured.partition.json import partition_json
+        # partition_json parses the text again: drop the first parse first, so
+        # the two are not held together (#300).
+        value = None
         # The text already read, so a byte-order mark is handled the same way.
         elements = partition_json(text=raw)
         return "\n".join(str(el) for el in elements), elements
@@ -3433,7 +3472,7 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         _gunzip_bounded(path, plain)
         try:
             return _parse_json(plain)
-        except _JsonTooLarge as exc:
+        except (_JsonTooLarge, _JsonTooManyRecords) as exc:
             raise ValueError(f"was decompressed, but it {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
@@ -12373,9 +12412,20 @@ non-ASCII text and numbers as written, one element per top-level record, empty v
 files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
 converted text bounded by the chunker's per-file limit (a long key over many values fails
 fast with bounded memory), and readable errors for invalid JSON in `.json` files and
-`.json.gz` members. `02_ingest.sh` runs it in the API
+`.json.gz` members. For #300 it also checks the bounds on what one JSON file may cost: the
+blank lines between records charged to the text limit (exactly at the limit, and one dropped
+record refunded), the 1,000,000-record cap (records with no text not counted; a file of
+1,000,001 tiny records fails fast with a bounded peak and builds no elements), the
+30,000,000-byte input limit at and one past the edge (element-schema files and a byte-order
+mark included), a `.json.gz` member that stops decompressing at that limit, the exact messages,
+a job where over-limit files fail alone, the traced peak of deep long keys and of an over-long
+scalar array, and that an element-schema file's first parse is freed before `partition_json`
+runs. `02_ingest.sh` runs it in the API
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
-back to confirm they hold that text.
+back to confirm they hold that text. It then uploads `json_over_size.json` (30,000,001 bytes),
+`json_many_records.json` (1,000,001 records), `json_over_size_gz.zip` (a `.json.gz` member one
+byte over the limit when decompressed) and `plain.json` together, and checks that the job is
+`partial`, each over-limit file fails with its exact message, and `plain.json` is stored.
 
 `scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
 becomes one `key: value` record per line, separated by blank lines, with one element per
@@ -12532,7 +12582,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
@@ -14056,6 +14106,19 @@ def write(target: pathlib.Path) -> None:
     with zipfile.ZipFile(target / "zip_over_gzip.zip", "w", zipfile.ZIP_STORED) as z:
         z.writestr("big.json.gz", stream * 33)
 
+    # Issue #300. JSON files are parsed whole, so their input is limited to
+    # 30,000,000 bytes, and a file may keep at most 1,000,000 records.
+    # json_over_size.json is valid JSON one byte over the limit (spaces after
+    # the value); json_many_records.json is 1,000,001 tiny records (about
+    # 4 MB); json_over_size_gz.zip holds a .json.gz member that decompresses
+    # to one byte over the limit.
+    over = b'{"k": "v"}'
+    over += b" " * (30_000_001 - len(over))
+    (target / "json_over_size.json").write_bytes(over)
+    (target / "json_many_records.json").write_text("[" + ",".join(["[1]"] * 1_000_001) + "]")
+    with zipfile.ZipFile(target / "json_over_size_gz.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", gzip.compress(over, mtime=0))
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -14562,7 +14625,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/zip_over_gzip.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/json_over_size_gz.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -14745,6 +14808,29 @@ if missing or syntax:
 ENDPY
 )
 check "its chunks hold key: value text with non-ASCII kept" $?
+
+# JSON input, records and text are bounded (#300): each over-limit file fails
+# alone with its own reason, and the good file beside them is stored.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/json_over_size.json" "$FIX/json_many_records.json" \
+  "$FIX/json_over_size_gz.zip" "$FIX/plain.json"
+read -r status chunks errors_ok <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = {
+    'json_over_size.json: is larger than 30,000,000 bytes, the most one JSON file can hold; '
+    'split the file or convert it to JSON Lines',
+    'json_many_records.json: has more than 1,000,000 records, the most one file can hold; '
+    'split the file',
+    'json_over_size_gz.zip:big.json.gz: decompresses to more than 30,000,000 bytes, the most '
+    'one JSON file can hold; split the file or convert it to JSON Lines',
+}
+ok = len(d['errors']) == 3 and set(d['errors']) == want
+if not ok:
+    import sys; print(repr(d['errors']), file=sys.stderr)
+print(d['status'], d['chunks_stored'], 'yes' if ok else 'no')")"
+[ "$status" = partial ] && [ "$chunks" -gt 0 ] && [ "$errors_ok" = yes ]
+check "over-size, over-cap and over-size .json.gz JSON fail alone with their reasons" $? \
+  "status=$status chunks=$chunks exact-errors=$errors_ok"
 
 # ── JSON Lines (#291) ────────────────────────────────────────────────────────
 # Controlled cases: conversion per line, blank and malformed lines, the line
