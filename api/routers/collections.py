@@ -14,7 +14,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
-from services.collection_writes import aliases
+from services.collection_writes import CollectionInUseError, aliases
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -87,13 +87,39 @@ async def create_collection(body: CreateCollectionRequest):
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
 
+# How a refused delete names the job in the way (#40). The UI shows the message
+# as it is, so each one reads as a sentence on its own.
+_BUSY_PHRASES = {
+    "ingest": "An ingest job is running for this collection",
+    "export": "An export job is running for this collection",
+    "import": "An import job is running for this collection",
+    "tune": "A tuning job is running for this collection",
+    "goldstandard": "A gold-standard generation job is running for this collection",
+}
+
+
+def _busy_error(name: str, jobs: list[tuple[str, str]]):
+    kind, job_id = jobs[0]
+    phrase = _BUSY_PHRASES.get(kind, f"A {kind} job is running for this collection")
+    return api_error(
+        409, "COLLECTION_BUSY",
+        f"{phrase} ('{name}', job {job_id}). Delete the collection after the job finishes.",
+        detail={"collection": name, "job_kind": kind, "job_id": job_id,
+                "jobs": [{"job_kind": k, "job_id": j} for k, j in jobs]})
+
+
 @router.delete("/{name}", status_code=200)
 async def delete_collection(name: str):
     if not await wc.collection_exists(name):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
     try:
-        count = await wc.delete_collection(name)
+        # Refused, not queued, while a job is active: waiting deleted the job's
+        # data after it finished, and a delete that ran first let a queued
+        # ingest recreate the collection (#40).
+        count = await wc.delete_collection_when_idle(name)
+    except CollectionInUseError as exc:
+        return _busy_error(name, exc.jobs)
     except Exception as exc:
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.", str(exc))
 

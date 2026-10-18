@@ -692,6 +692,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the import finish can delete the collection at once (#40).
+        collection_writes.end_job("import", job_id)
+        job.update(fields)
+
     try:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
@@ -729,6 +735,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
             if exists and on_conflict == "rename":
                 target = _rename_target(original, id8)
+
+            # The target is final: DELETE /collections refuses it from here until
+            # this job ends (#40). Replace's own delete of the old target below
+            # goes through _delete_collection_sync, which the registry never refuses.
+            collection_writes.register_job(target, "import", job_id)
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -770,13 +781,13 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     _log.exception("Could not remove staging collection %r", temp_collection)
                 staged = False
 
-            job.update(status="completed", collection=target, original_collection=original,
-                       chunks_written=written, renamed=(target != canonical(original)),
-                       notes=notes)
+            finish(status="completed", collection=target, original_collection=original,
+                   chunks_written=written, renamed=(target != canonical(original)),
+                   notes=notes)
 
     except PackageError as exc:
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
         if staged and temp_collection:
             # The real build failed after the target was deleted. Keeping the
             # staging collection means the data is recoverable, not lost.
@@ -786,8 +797,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
-        job.update(status="failed", error_code="IMPORT_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="IMPORT_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
@@ -808,6 +819,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             except Exception:
                 _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
+        collection_writes.end_job("import", job_id)
         with _lock:
             _active.discard(filename)
 

@@ -354,6 +354,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
+    def finish(**fields) -> None:
+        # The registration ends before the status turns terminal, so a client
+        # that sees the job finish can delete the collection at once (#40).
+        collection_writes.end_job("tune", job_id)
+        job.update(fields)
+
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -418,16 +424,17 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
             notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
                          "gold-standard sessions were left alone")
 
-        job.update(status="completed", chunks_written=written, notes=notes)
+        finish(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
-        job.update(status="failed", error_code=exc.code, error=exc.message,
-                   error_detail=exc.detail)
+        finish(status="failed", error_code=exc.code, error=exc.message,
+               error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Tuning %r on %r failed", operation, collection)
-        job.update(status="failed", error_code="TUNE_FAILED",
-                   error=f"{type(exc).__name__}: {exc}")
+        finish(status="failed", error_code="TUNE_FAILED",
+               error=f"{type(exc).__name__}: {exc}")
     finally:
+        collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
 
@@ -453,5 +460,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
+    collection_writes.register_job(collection, "tune", job_id)
+    task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    # _run ends it first; this also covers a task that never ran its worker.
+    task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
     return job_id

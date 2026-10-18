@@ -296,6 +296,52 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await sleep(900);
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
+
+      // A refused delete (409 while a job runs, #40) is shown in the dialog. The
+      // page-level error line sits behind the overlay, where it read as nothing.
+      // The DELETE is answered here, so no collection is touched.
+      const busyMessage = "An ingest job is running for this collection ('Owned', job 0wned40). Delete the collection after the job finishes.";
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (request.method() === 'DELETE' && new URL(request.url()).pathname.startsWith('/api/collections/')) {
+          return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_BUSY', message: busyMessage, detail: { job_kind: 'ingest', job_id: '0wned40' } } }) });
+        }
+        return request.continue();
+      });
+      const target = await s.page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find(i => !i.type || i.type === 'text');
+        const name = el.placeholder;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, name);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return name;
+      });
+      await sleep(200);
+      const deletes = s.api.filter(x => x.method === 'DELETE').length;
+      await s.page.evaluate(() => {
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        if (btn && !btn.disabled) btn.click();
+      });
+      await sleep(900);
+      const refused = await s.page.evaluate(() => {
+        const dialog = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Delete Collection');
+        const box = dialog && dialog.parentElement;
+        const alert = box && box.querySelector('[role=alert]');
+        return { open: !!dialog, alert: alert ? alert.textContent : null };
+      });
+      r.check('a refused delete sends one DELETE', s.api.filter(x => x.method === 'DELETE').length === deletes + 1);
+      r.check('a refused delete keeps the dialog open and shows the message in it',
+              refused.open && refused.alert === busyMessage, JSON.stringify(refused));
+      const listed = await s.page.evaluate(t => [...document.querySelectorAll('tbody td')].some(td => td.textContent.trim() === t), target);
+      r.check('the refused collection is still listed', listed, target);
+      await clickByText(s.page, 'Cancel'); await sleep(200);
+      await s.page.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Delete');
+        if (b) b.click();
+      });
+      await sleep(300);
+      r.check('cancelling clears the message for the next attempt',
+              await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
   }

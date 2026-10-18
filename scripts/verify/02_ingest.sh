@@ -221,6 +221,90 @@ check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
 
+# ── deleting a collection while an ingest job runs (#40) ─────────────────────
+# A DELETE sent during a job used to wait for it and then remove what it stored,
+# and one that ran before a queued job let that job's inserts recreate the
+# collection (Weaviate auto-schema). Controlled cases: every job kind, both
+# request orderings, and the job's report when its collection disappears.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
+check "delete-while-busy: job kinds, request orderings and the job's report" $?
+
+DC="${PREFIX}DeleteBusy"
+drop_collection "$DC"; make_collection "$DC"
+object_count() {   # the collection's object count, or "absent"
+  api_get "/collections" | python3 -c "
+import json,sys
+found=[c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1']
+print(found[0] if found else 'absent')"
+}
+# About 180 chunks at chunk_size 300: some tens of seconds of embedding, so the
+# job is still running when the DELETE follows the upload.
+busy_dir=$(mktemp -d)
+python3 - "$busy_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(40)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+curl -s -m 600 -o /tmp/vfy_busy_start.json -X POST "$API/ingest/upload" -F "collection=$DC" \
+  -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$busy_dir/slow.txt"
+rm -rf "$busy_dir"
+busy_job=$(jfield "['job_id']" < /tmp/vfy_busy_start.json)
+before=$(object_count "$DC")
+code=$(curl -s -m 120 -o /tmp/vfy_busy_delete.json -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+state=$(api_get "/ingest/job/$busy_job" | jfield "['status']")
+after=$(object_count "$DC")
+read -r err_code err_kind err_job <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_busy_delete.json'))['error']
+except Exception: print('not-json - -'); raise SystemExit
+print(e['code'], e['detail']['job_kind'], e['detail']['job_id'])")"
+[ "$code" = 409 ] && [ "$err_code" = COLLECTION_BUSY ] && [ "$err_kind" = ingest ] \
+  && [ "$err_job" = "$busy_job" ] && { [ "$state" = queued ] || [ "$state" = running ]; }
+check "DELETE during a running ingest job is refused with 409 COLLECTION_BUSY naming it" $? \
+  "HTTP=$code code=$err_code kind=$err_kind job=$err_job (job $busy_job was $state)"
+[ "$after" != absent ] && [ "$before" != absent ] && [ "$after" -ge "$before" ]
+check "the refused DELETE leaves the collection and its objects in place" $? \
+  "objects before=$before after=$after"
+final=$(wait_for_job "/ingest/job/$busy_job" 900)
+check_eq "the ingest job still completes" "$final" "completed"
+code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+check_eq "DELETE after the job completes succeeds" "$code" "200"
+sleep 10
+check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC")" "absent"
+
+# With auto-schema off, an insert into a deleted collection fails and creates
+# nothing, instead of recreating it with inferred properties and no vectorizer.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "${PREFIX}NoAutoSchema" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+try:
+    client = wc.get_client()
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    wc._create_collection_sync(name, "hnsw", "cosine", {})
+    wc._delete_collection_sync(name)
+    try:
+        wc._insert_chunks_sync(name, [{"content": "must not recreate", "source_file": "x.txt",
+                                       "chunk_index": 0}])
+    except Exception:
+        pass
+    else:
+        print("the insert into a deleted collection succeeded", file=sys.stderr)
+        sys.exit(1)
+    if client.collections.exists(name):
+        client.collections.delete(name)
+        print("the insert recreated the deleted collection", file=sys.stderr)
+        sys.exit(1)
+finally:
+    wc.close_client()
+ENDPY
+) >/tmp/vfy_autoschema.txt 2>&1
+check "an insert into a deleted collection fails and does not recreate it" $? \
+  "$(tail -1 /tmp/vfy_autoschema.txt)"
+
 drop_collection "$C"
 cleanup_prefixed
 summary

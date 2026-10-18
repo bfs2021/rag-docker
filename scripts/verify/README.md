@@ -205,6 +205,18 @@ fast with bounded memory), and readable errors for invalid JSON in `.json` files
 container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
 back to confirm they hold that text.
 
+`scripts/tests/test_delete_busy.py` (#40) checks that `DELETE /collections/{name}` answers
+`409 COLLECTION_BUSY`, naming the job, while an ingest, export, import, tune or gold-standard
+generation job is active, and that each kind's registration ends before its status turns
+terminal. The request orderings are arranged with events: a job registered before the
+delete, one registered while the delete waits for the writer guard (refused within a
+second, not after the job), one registered once it holds the guard, and a job admitted
+after a completed delete, which fails with "collection '<name>' was deleted while this job
+was running" at its first store. Weaviate is mocked. `02_ingest.sh` runs it in the API
+container, then deletes a collection while a real ingest is still embedding (`409`, data
+in place), again after the job completes (`200`, still gone 10 s later), and checks that an
+insert into a deleted collection fails without recreating it (auto-schema is off).
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
 embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
@@ -300,6 +312,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E30; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
+| `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
