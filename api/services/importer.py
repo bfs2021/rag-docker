@@ -837,21 +837,28 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
             raise RuntimeError(filename)
         _active.add(filename)
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "filename": filename,
-        "on_conflict": on_conflict,
-        "collection": None,
-        "original_collection": None,
-        "chunks_written": 0,
-        "fidelity": None,
-        "renamed": False,
-        "notes": [],
-        "restored_sessions": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guard; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "filename": filename,
+            "on_conflict": on_conflict,
+            "collection": None,
+            "original_collection": None,
+            "chunks_written": 0,
+            "fidelity": None,
+            "renamed": False,
+            "notes": [],
+            "restored_sessions": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        with _lock:
+            _active.discard(filename)
+        raise
     asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
     return job_id

@@ -656,10 +656,12 @@ check "an insert into a deleted collection fails and does not recreate it" $? \
 
 # ── job status survives an API restart (#23; opt-in: restarts the API) ───────
 # Before #23 every job answered 404 after a restart. A job that finished must
-# read back unchanged, and one interrupted after storing a file must read
-# `partial` with the interruption message. `--timeout 0`: with the default 10 s
-# stop timeout the worker could finish the job during shutdown.
+# read back unchanged, one interrupted after storing a file must read `partial`
+# with the interruption message, and one interrupted before storing any file
+# must read `failed` with it (#309). `--timeout 0`: with the default 10 s stop
+# timeout the worker could finish the job during shutdown.
 JR="${PREFIX}JobRestart"
+JN="${PREFIX}JobRestartNone"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
 if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
@@ -668,6 +670,7 @@ elif [ -n "$restart_refusal" ]; then
   check "ingest job status across an API restart" 1 "$restart_refusal"
 else
   drop_collection "$JR"; make_collection "$JR"
+  drop_collection "$JN"; make_collection "$JN"
   ingest "$JR" fixed 300 50 "$FIX/policies.txt"
   done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
   api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
@@ -683,7 +686,6 @@ ENDPY
   curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
     -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
     -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
-  rm -rf "$slow_dir"
   slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
   state=""
   for _ in $(seq 1 600); do
@@ -695,9 +697,16 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     sleep 0.5
   done
   if [ "$state" != running-stored ]; then
+    rm -rf "$slow_dir"
     check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
   else
+    # Only the slow file, so nothing is stored before the restart (#309).
+    curl -s -m 600 -o /tmp/vfy_restart_none_start.json -X POST "$API/ingest/upload" -F "collection=$JN" \
+      -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$slow_dir/slow.txt"
+    rm -rf "$slow_dir"
+    none_job=$(jfield "['job_id']" < /tmp/vfy_restart_none_start.json)
     sleep 2
+    api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -720,8 +729,27 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
       "$(head -c 300 /tmp/vfy_restart_after.json)"
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_none_after.json -w '%{http_code}' "$API/ingest/job/$none_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+try:
+    before = json.load(open('/tmp/vfy_restart_none_before.json'))
+    after = json.load(open('/tmp/vfy_restart_none_after.json'))
+except (OSError, ValueError):
+    sys.exit(1)
+ok = (before.get("status") in ("queued", "running") and before.get("files_completed") == 0
+      and sys.argv[1] == "200" and after.get("status") == "failed"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == 0)
+print(before.get("status"), sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an ingest interrupted before storing a file reads back 200 'failed' with the message" $? \
+      "before: $(head -c 200 /tmp/vfy_restart_none_before.json); after: $(head -c 300 /tmp/vfy_restart_none_after.json)"
   fi
   drop_collection "$JR"
+  drop_collection "$JN"
 fi
 
 drop_collection "$C"

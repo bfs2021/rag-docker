@@ -1107,22 +1107,29 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "files_total": len(file_paths),
-        "files_completed": 0,
-        "files_failed": 0,
-        "chunks_stored": 0,
-        # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
-        # counts only the checked ones (#302).
-        "chunks_submitted": 0,
-        "chunks_accepted": 0,
-        # Earlier chunks of the same names removed by this job (#22).
-        "chunks_replaced": 0,
-        "errors": [],
-        "skipped": skipped,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile removes its uploads here; start_ingest_job ends the
+    # registration, and the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "files_total": len(file_paths),
+            "files_completed": 0,
+            "files_failed": 0,
+            "chunks_stored": 0,
+            # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
+            # counts only the checked ones (#302).
+            "chunks_submitted": 0,
+            "chunks_accepted": 0,
+            # Earlier chunks of the same names removed by this job (#22).
+            "chunks_replaced": 0,
+            "errors": [],
+            "skipped": skipped,
+        })
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
     def _on_done(future: asyncio.Future) -> None:
         # The worker ends its registration itself; this covers a job cancelled
@@ -1134,6 +1141,9 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         if exc is not None:
             _log.error("ingest job %s failed: %s", job_id, exc)
             job = _jobs.get(job_id)
+            # This write stays on the event loop (#309): a done callback is
+            # synchronous and can't await a thread, it runs only when an error
+            # escaped the worker, and it saves one record of about 1 KB.
             if job and job["status"] not in ("completed", "partial", "failed"):
                 # The error first: the status change is the write that saves
                 # the record (#23), and an in-place append is not seen alone.

@@ -4278,22 +4278,29 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "files_total": len(file_paths),
-        "files_completed": 0,
-        "files_failed": 0,
-        "chunks_stored": 0,
-        # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
-        # counts only the checked ones (#302).
-        "chunks_submitted": 0,
-        "chunks_accepted": 0,
-        # Earlier chunks of the same names removed by this job (#22).
-        "chunks_replaced": 0,
-        "errors": [],
-        "skipped": skipped,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile removes its uploads here; start_ingest_job ends the
+    # registration, and the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "files_total": len(file_paths),
+            "files_completed": 0,
+            "files_failed": 0,
+            "chunks_stored": 0,
+            # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
+            # counts only the checked ones (#302).
+            "chunks_submitted": 0,
+            "chunks_accepted": 0,
+            # Earlier chunks of the same names removed by this job (#22).
+            "chunks_replaced": 0,
+            "errors": [],
+            "skipped": skipped,
+        })
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
     def _on_done(future: asyncio.Future) -> None:
         # The worker ends its registration itself; this covers a job cancelled
@@ -4305,6 +4312,9 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         if exc is not None:
             _log.error("ingest job %s failed: %s", job_id, exc)
             job = _jobs.get(job_id)
+            # This write stays on the event loop (#309): a done callback is
+            # synchronous and can't await a thread, it runs only when an error
+            # escaped the worker, and it saves one record of about 1 KB.
             if job and job["status"] not in ("completed", "partial", "failed"):
                 # The error first: the status change is the write that saves
                 # the record (#23), and an in-place append is not seen alone.
@@ -6200,9 +6210,22 @@ after they were made. Changes made in place to a nested list or dict
 carries them. Every job path ends with a status change, so the final record on
 disk is complete.
 
+**Starting a job.** The job starts store their first record with `create()`,
+which writes it from a worker thread: that write is durable (fsync), and it can
+wait on the store lock while a worker thread saves, so it stays off the event
+loop. A start cancelled during that write releases its own guards, and its
+record is removed once the write ends: no client was given that id (#309).
+
 **At startup** `load()` marks every record still `queued` or `running` as
 interrupted: its worker thread died with the old process. Unreadable files are
-left as they are and logged. The newest `RETENTION` files per kind are kept.
+left as they are and logged.
+
+**Retention.** The newest `RETENTION` records per kind are kept, while the API
+runs as well as at startup. At startup `load()` keeps the newest files by
+modification time. While running, storing a new record past `RETENTION` removes
+the finished records saved longest ago, from memory and from disk; a removed
+job reads 404, as it would after a restart. A `queued` or `running` record is
+never removed, so a store can briefly hold more while that many jobs run (#309).
 
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
@@ -6210,6 +6233,7 @@ anything in `jobs/`.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -6231,8 +6255,10 @@ TERMINAL = frozenset({"completed", "failed", "partial", "cancelled"})
 # report progress every few hundred chunks; writing each one would be a disk-I/O
 # regression on a large export.
 THROTTLE_S = 1.0
-# Records kept per kind, newest first by modification time. About 1 KB each, so
-# the volume can't grow without bound. Nothing in jobs/ is ever recovery data.
+# Records kept per kind: by file modification time at startup, and while the API
+# runs by removing the finished records saved longest ago once a new one passes
+# the limit (never a queued or running one). About 1 KB each, so the volume
+# can't grow without bound. Nothing in jobs/ is ever recovery data.
 RETENTION = 200
 # Generated ids are 8 hex characters; anything else could name another path.
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -6249,7 +6275,9 @@ _REMEDY = {
 class _Job(dict):
     """A record bound to its store: changes made through its methods are saved."""
 
-    __slots__ = ("_store", "_id", "_last", "_timer")
+    # _last: monotonic time of the last write attempt (the throttle);
+    # _saved: wall-clock time of the last write attempt (retention order).
+    __slots__ = ("_store", "_id", "_last", "_saved", "_timer")
 
     def __setitem__(self, key, value):
         status_changed = key == "status" and self.get("status") != value
@@ -6318,6 +6346,8 @@ class JobStore(MutableMapping):
                 self._cancel(old)
             self._records[job_id] = record
             self._write(record, durable=True)
+            if old is None:
+                self._prune(job_id)
 
     def __delitem__(self, job_id):
         with self._lock:
@@ -6330,6 +6360,36 @@ class JobStore(MutableMapping):
                 except OSError:
                     _log.exception("Could not remove %s job record %s", self.kind, job_id)
 
+    async def create(self, job_id, doc) -> None:
+        """Store a new record from a worker thread, off the event loop (#309).
+
+        Shielded: cancelling a plain to_thread await loses track of the thread,
+        which still stores the record. If the caller is cancelled, the record is
+        removed once that write ends, off the loop too, and the cancellation
+        propagates; the caller releases its own guards.
+        """
+        loop = asyncio.get_running_loop()
+        write = asyncio.ensure_future(asyncio.to_thread(self.__setitem__, job_id, doc))
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            def _abandoned(task: asyncio.Future) -> None:
+                if not task.cancelled() and task.exception() is not None:
+                    _log.error("Could not store abandoned %s job %s: %s",
+                               self.kind, job_id, task.exception())
+                loop.run_in_executor(None, self._discard, job_id)
+            write.add_done_callback(_abandoned)
+            raise
+
+    def _discard(self, job_id) -> None:
+        """Remove a record if it is there; never raises."""
+        try:
+            with self._lock:
+                if job_id in self._records:
+                    del self[job_id]
+        except Exception:                       # noqa: BLE001 - logged, never raised
+            _log.exception("Could not remove abandoned %s job %s", self.kind, job_id)
+
     # ── persistence ─────────────────────────────────────────────────────────
 
     def _bind(self, job_id: str, doc) -> _Job:
@@ -6337,8 +6397,29 @@ class JobStore(MutableMapping):
         record._store = self
         record._id = job_id
         record._last = 0.0
+        record._saved = 0.0
         record._timer = None
         return record
+
+    def _prune(self, keep: str) -> None:
+        """Remove the finished records saved longest ago past RETENTION; never
+        a queued or running one, nor `keep`. Never raises. Caller holds the lock."""
+        excess = len(self._records) - RETENTION
+        if excess <= 0:
+            return
+        finished = sorted((r for job_id, r in self._records.items()
+                           if job_id != keep and isinstance(r, _Job)
+                           and r.get("status") in TERMINAL),
+                          key=lambda r: r._saved)
+        for record in finished[:excess]:
+            del self._records[record._id]
+            self._cancel(record)
+            try:
+                (self._dir / f"{record._id}.json").unlink(missing_ok=True)
+                _log.info("Removed old %s job record %s (keeping the newest %d)",
+                          self.kind, record._id, RETENTION)
+            except OSError:
+                _log.exception("Could not remove old job record %s", record._id)
 
     @staticmethod
     def _cancel(record: _Job) -> None:
@@ -6405,6 +6486,7 @@ class JobStore(MutableMapping):
                 # Also after a failure, so a lasting fault is retried at the
                 # throttle's pace rather than on every change.
                 record._last = time.monotonic()
+                record._saved = time.time()
 
     # ── startup ─────────────────────────────────────────────────────────────
 
@@ -6450,6 +6532,7 @@ class JobStore(MutableMapping):
                 if path not in readable:
                     continue
                 record = self._bind(path.stem, readable[path])
+                record._saved = _mtime(path)
                 self._records[path.stem] = record
                 if record.get("status") not in TERMINAL:
                     self._mark_interrupted(record)
@@ -6608,22 +6691,31 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
                 del _active[collection]
         raise
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "collection": collection,
-        "chunks_written": 0,
-        "filename": None,
-        "size_bytes": None,
-        "source_document_count": None,
-        "fidelity": None,
-        "models_bundled": None,
-        "retrieve_script": None,
-        "warnings": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guards; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "collection": collection,
+            "chunks_written": 0,
+            "filename": None,
+            "size_bytes": None,
+            "source_document_count": None,
+            "fidelity": None,
+            "models_bundled": None,
+            "retrieve_script": None,
+            "warnings": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        collection_writes.end_job("export", job_id)
+        with _lock:
+            if _active.get(collection) == job_id:
+                del _active[collection]
+        raise
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
@@ -7474,22 +7566,29 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
             raise RuntimeError(filename)
         _active.add(filename)
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "filename": filename,
-        "on_conflict": on_conflict,
-        "collection": None,
-        "original_collection": None,
-        "chunks_written": 0,
-        "fidelity": None,
-        "renamed": False,
-        "notes": [],
-        "restored_sessions": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guard; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "filename": filename,
+            "on_conflict": on_conflict,
+            "collection": None,
+            "original_collection": None,
+            "chunks_written": 0,
+            "fidelity": None,
+            "renamed": False,
+            "notes": [],
+            "restored_sessions": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        with _lock:
+            _active.discard(filename)
+        raise
     asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
     return job_id
 ```
@@ -8220,18 +8319,26 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
             _active.discard(collection)
         raise
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "collection": collection,
-        "operation": operation,
-        "chunks_total": 0,
-        "chunks_written": 0,
-        "notes": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guards; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "collection": collection,
+            "operation": operation,
+            "chunks_total": 0,
+            "chunks_written": 0,
+            "notes": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        collection_writes.end_job("tune", job_id)
+        with _lock:
+            _active.discard(collection)
+        raise
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
@@ -12621,12 +12728,19 @@ that writes nothing; status changes and terminal records are written at once, ow
 failed write raises nothing and keeps the previous file; ids can't name another path; startup
 marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
 `failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
-a real lifespan run marks a stored running export. `02_ingest.sh` runs it in the API
-container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
-(`docker compose restart --timeout 0 api`) while an upload is part-way and checks that a
-completed job reads back unchanged and the interrupted one reads `partial` with the
-interruption message; `05_transfer.sh` does the same for a completed export and one
-interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
+a real lifespan run marks a stored running export. While the API runs (#309), storing a
+record past the limit removes the finished records saved longest ago, from memory and disk,
+never a `queued` or `running` one; and each of the four job starts writes its first record
+from a worker thread, and when cancelled during that write releases its guards and leaves no
+record (or, for ingest, upload folder). `02_ingest.sh` runs it in the API container. With
+`RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
+completed job reads back unchanged, the one that stored a file reads `partial` and the one
+that stored none reads `failed`, both with the interruption message; `05_transfer.sh` does the
+same for a completed export, an export interrupted part-way through a synthetic 30,000-chunk
+collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of that collection
+interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
+operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
@@ -15435,10 +15549,12 @@ check "an insert into a deleted collection fails and does not recreate it" $? \
 
 # ── job status survives an API restart (#23; opt-in: restarts the API) ───────
 # Before #23 every job answered 404 after a restart. A job that finished must
-# read back unchanged, and one interrupted after storing a file must read
-# `partial` with the interruption message. `--timeout 0`: with the default 10 s
-# stop timeout the worker could finish the job during shutdown.
+# read back unchanged, one interrupted after storing a file must read `partial`
+# with the interruption message, and one interrupted before storing any file
+# must read `failed` with it (#309). `--timeout 0`: with the default 10 s stop
+# timeout the worker could finish the job during shutdown.
 JR="${PREFIX}JobRestart"
+JN="${PREFIX}JobRestartNone"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
 if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
@@ -15447,6 +15563,7 @@ elif [ -n "$restart_refusal" ]; then
   check "ingest job status across an API restart" 1 "$restart_refusal"
 else
   drop_collection "$JR"; make_collection "$JR"
+  drop_collection "$JN"; make_collection "$JN"
   ingest "$JR" fixed 300 50 "$FIX/policies.txt"
   done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
   api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
@@ -15462,7 +15579,6 @@ ENDPY
   curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
     -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
     -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
-  rm -rf "$slow_dir"
   slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
   state=""
   for _ in $(seq 1 600); do
@@ -15474,9 +15590,16 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     sleep 0.5
   done
   if [ "$state" != running-stored ]; then
+    rm -rf "$slow_dir"
     check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
   else
+    # Only the slow file, so nothing is stored before the restart (#309).
+    curl -s -m 600 -o /tmp/vfy_restart_none_start.json -X POST "$API/ingest/upload" -F "collection=$JN" \
+      -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$slow_dir/slow.txt"
+    rm -rf "$slow_dir"
+    none_job=$(jfield "['job_id']" < /tmp/vfy_restart_none_start.json)
     sleep 2
+    api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -15499,8 +15622,27 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
       "$(head -c 300 /tmp/vfy_restart_after.json)"
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_none_after.json -w '%{http_code}' "$API/ingest/job/$none_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+try:
+    before = json.load(open('/tmp/vfy_restart_none_before.json'))
+    after = json.load(open('/tmp/vfy_restart_none_after.json'))
+except (OSError, ValueError):
+    sys.exit(1)
+ok = (before.get("status") in ("queued", "running") and before.get("files_completed") == 0
+      and sys.argv[1] == "200" and after.get("status") == "failed"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == 0)
+print(before.get("status"), sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an ingest interrupted before storing a file reads back 200 'failed' with the message" $? \
+      "before: $(head -c 200 /tmp/vfy_restart_none_before.json); after: $(head -c 300 /tmp/vfy_restart_none_after.json)"
   fi
   drop_collection "$JR"
+  drop_collection "$JN"
 fi
 
 drop_collection "$C"
@@ -17104,7 +17246,8 @@ check "the help page has no unsubstituted placeholders" $?
 
 # ── export job status survives an API restart (#23; opt-in: restarts the API) ──
 # The export from the top of this suite must read back unchanged, and an export
-# killed part-way must read `failed` with INTERRUPTED, not 404. A synthetic
+# killed part-way must read `failed` with INTERRUPTED and its progress, not 404;
+# so must an import killed part-way (#309). A synthetic
 # 30,000-chunk collection (supplied vectors, no embedding) exports for about
 # 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
 # stop timeout the worker could finish the export during shutdown.
@@ -17174,10 +17317,11 @@ after = json.load(open('/tmp/vfy_xrestart_after.json'))
 ok = (sys.argv[1] == "200" and after.get("status") == "failed"
       and after.get("error_code") == "INTERRUPTED"
       and after.get("error") == "Interrupted: the API restarted while this job was running. "
-                                "Start the export again.")
+                                "Start the export again."
+      and after.get("chunks_written", 0) > 0)
 sys.exit(0 if ok else 1)
 ENDPY
-    check "an interrupted export reads back 200 'failed' with INTERRUPTED" $? \
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers are the container's (root, mode 0700): remove
     # only the build directories that appeared during this export.
@@ -17185,6 +17329,50 @@ ENDPY
     stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+  fi
+
+  # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
+  # collection, exported whole, dropped and imported back. The startup sweep
+  # removes the half-built collection the killed import leaves.
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
+  xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
+  xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
+  if [ "$xpkg_status" != completed ] || [ -z "$xpkg" ] || [ "$xpkg" = None ]; then
+    check "an import is running before the restart" 1 "the package export ended '$xpkg_status'; nothing restarted"
+  else
+    drop_collection "$XR"
+    api_post "/import" "{\"filename\":\"$xpkg\",\"on_conflict\":\"abort\"}" > /tmp/vfy_irestart_start.json
+    ijob_r=$(jfield "['job_id']" < /tmp/vfy_irestart_start.json)
+    # Import reports chunks_written once, after its insert, so the restart
+    # comes as soon as the job is running: unpacking, checks and the insert
+    # of 30,000 chunks still lie ahead of it.
+    state=""
+    for _ in $(seq 1 600); do
+      state=$(api_get "/import/job/$ijob_r" | jfield "['status']")
+      case "$state" in running|completed|failed) break ;; esac
+      sleep 0.2
+    done
+    if [ "$state" != running ]; then
+      check "an import is running before the restart" 1 "last status '$state'; nothing restarted"
+    else
+      _rag_require_lock_owner
+      (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+      for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+      code=$(curl -s -m 120 -o /tmp/vfy_irestart_after.json -w '%{http_code}' "$API/import/job/$ijob_r")
+      python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_irestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the import again.")
+sys.exit(0 if ok else 1)
+ENDPY
+      check "an interrupted import reads back 200 'failed' with INTERRUPTED" $? \
+        "$(head -c 300 /tmp/vfy_irestart_after.json)"
+    fi
+    rm -f "$EXPORTS/$xpkg"
   fi
   drop_collection "$XR"
 fi
@@ -20948,9 +21136,11 @@ class ReindexTests(unittest.TestCase):
         self.assertTrue(all(name.startswith('OwnedReindex') for name,_,_,_ in self.backend.created))
     def test_alias_jobs_share_the_same_active_identity(self):
         import asyncio
-        from unittest.mock import AsyncMock
+        from services import jobstore
         async def check():
-            with patch.object(tuning,'_active',set()),patch.object(tuning.asyncio,'to_thread',new=AsyncMock(return_value=None)):
+            # The start stores its record through JobStore.create() in a thread
+            # (#309), so asyncio.to_thread stays real; the worker is stubbed.
+            with patch.object(tuning,'_active',set()),patch.object(tuning,'_jobs',jobstore.JobStore('tune')),patch.object(tuning,'_run'):
                 identity=await tuning.start_tune_job('ownedReindex','reindex',{})
                 self.assertEqual(tuning._jobs[identity]['collection'],'OwnedReindex')
                 with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})

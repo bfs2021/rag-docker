@@ -294,12 +294,19 @@ that writes nothing; status changes and terminal records are written at once, ow
 failed write raises nothing and keeps the previous file; ids can't name another path; startup
 marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
 `failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
-a real lifespan run marks a stored running export. `02_ingest.sh` runs it in the API
-container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
-(`docker compose restart --timeout 0 api`) while an upload is part-way and checks that a
-completed job reads back unchanged and the interrupted one reads `partial` with the
-interruption message; `05_transfer.sh` does the same for a completed export and one
-interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
+a real lifespan run marks a stored running export. While the API runs (#309), storing a
+record past the limit removes the finished records saved longest ago, from memory and disk,
+never a `queued` or `running` one; and each of the four job starts writes its first record
+from a worker thread, and when cancelled during that write releases its guards and leaves no
+record (or, for ingest, upload folder). `02_ingest.sh` runs it in the API container. With
+`RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
+completed job reads back unchanged, the one that stored a file reads `partial` and the one
+that stored none reads `failed`, both with the interruption message; `05_transfer.sh` does the
+same for a completed export, an export interrupted part-way through a synthetic 30,000-chunk
+collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of that collection
+interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
+operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,

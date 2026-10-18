@@ -96,22 +96,31 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
                 del _active[collection]
         raise
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "collection": collection,
-        "chunks_written": 0,
-        "filename": None,
-        "size_bytes": None,
-        "source_document_count": None,
-        "fidelity": None,
-        "models_bundled": None,
-        "retrieve_script": None,
-        "warnings": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guards; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "collection": collection,
+            "chunks_written": 0,
+            "filename": None,
+            "size_bytes": None,
+            "source_document_count": None,
+            "fidelity": None,
+            "models_bundled": None,
+            "retrieve_script": None,
+            "warnings": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        collection_writes.end_job("export", job_id)
+        with _lock:
+            if _active.get(collection) == job_id:
+                del _active[collection]
+        raise
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))

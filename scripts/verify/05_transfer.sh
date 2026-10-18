@@ -869,7 +869,8 @@ check "the help page has no unsubstituted placeholders" $?
 
 # ── export job status survives an API restart (#23; opt-in: restarts the API) ──
 # The export from the top of this suite must read back unchanged, and an export
-# killed part-way must read `failed` with INTERRUPTED, not 404. A synthetic
+# killed part-way must read `failed` with INTERRUPTED and its progress, not 404;
+# so must an import killed part-way (#309). A synthetic
 # 30,000-chunk collection (supplied vectors, no embedding) exports for about
 # 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
 # stop timeout the worker could finish the export during shutdown.
@@ -939,10 +940,11 @@ after = json.load(open('/tmp/vfy_xrestart_after.json'))
 ok = (sys.argv[1] == "200" and after.get("status") == "failed"
       and after.get("error_code") == "INTERRUPTED"
       and after.get("error") == "Interrupted: the API restarted while this job was running. "
-                                "Start the export again.")
+                                "Start the export again."
+      and after.get("chunks_written", 0) > 0)
 sys.exit(0 if ok else 1)
 ENDPY
-    check "an interrupted export reads back 200 'failed' with INTERRUPTED" $? \
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers are the container's (root, mode 0700): remove
     # only the build directories that appeared during this export.
@@ -950,6 +952,50 @@ ENDPY
     stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+  fi
+
+  # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
+  # collection, exported whole, dropped and imported back. The startup sweep
+  # removes the half-built collection the killed import leaves.
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
+  xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
+  xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
+  if [ "$xpkg_status" != completed ] || [ -z "$xpkg" ] || [ "$xpkg" = None ]; then
+    check "an import is running before the restart" 1 "the package export ended '$xpkg_status'; nothing restarted"
+  else
+    drop_collection "$XR"
+    api_post "/import" "{\"filename\":\"$xpkg\",\"on_conflict\":\"abort\"}" > /tmp/vfy_irestart_start.json
+    ijob_r=$(jfield "['job_id']" < /tmp/vfy_irestart_start.json)
+    # Import reports chunks_written once, after its insert, so the restart
+    # comes as soon as the job is running: unpacking, checks and the insert
+    # of 30,000 chunks still lie ahead of it.
+    state=""
+    for _ in $(seq 1 600); do
+      state=$(api_get "/import/job/$ijob_r" | jfield "['status']")
+      case "$state" in running|completed|failed) break ;; esac
+      sleep 0.2
+    done
+    if [ "$state" != running ]; then
+      check "an import is running before the restart" 1 "last status '$state'; nothing restarted"
+    else
+      _rag_require_lock_owner
+      (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+      for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+      code=$(curl -s -m 120 -o /tmp/vfy_irestart_after.json -w '%{http_code}' "$API/import/job/$ijob_r")
+      python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_irestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the import again.")
+sys.exit(0 if ok else 1)
+ENDPY
+      check "an interrupted import reads back 200 'failed' with INTERRUPTED" $? \
+        "$(head -c 300 /tmp/vfy_irestart_after.json)"
+    fi
+    rm -f "$EXPORTS/$xpkg"
   fi
   drop_collection "$XR"
 fi
