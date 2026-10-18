@@ -39,8 +39,9 @@ async def ingest_upload(
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
-        _log.exception("Upload to collection %r failed unexpectedly (files: %s)",
-                       collection, ", ".join(f.filename or "?" for f in files))
+        # %r: a filename can hold a newline that would forge a log line (#298).
+        _log.exception("Upload to collection %r failed unexpectedly (files: %r)",
+                       collection, [f.filename for f in files])
         return api_error(500, "INGEST_FAILED",
                          "The upload failed because of an unexpected server error. "
                          "The API log has the details.")

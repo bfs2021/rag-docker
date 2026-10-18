@@ -477,12 +477,32 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | 400 | `NO_SUPPORTED_FILES` | nothing in the upload is a supported type; the message lists what was skipped |
 | 400 | `ARCHIVE_UNREADABLE` | the ZIP is damaged: it can't be opened (truncated, e.g. an incomplete download, or a bad central directory), or a member can't be read (wrong offset, bad local header, bad CRC, truncated data) |
 | 400 | `ARCHIVE_UNSUPPORTED` | no member is damaged, but one is password-protected or uses a compression method the server can't read (e.g. Deflate64) |
+| 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
 | 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
 | 500 | `INGEST_FAILED` | anything unexpected; the message says so and the API log holds the traceback, collection and filenames |
 
 The ZIP messages name the upload, say nothing from it was imported, name the unreadable
 members with a reason each (up to 10, then "and N more") and suggest re-creating the ZIP.
 `detail` is `{"file": ..., "members": [{"member": ..., "reason": ...}, ...]}`.
+
+**Expansion cap (#298).** All the ZIPs of one upload request may expand to at most
+`max_zip_expanded_bytes` (env `MAX_ZIP_EXPANDED_BYTES`, default 2,147,483,648 bytes = 2 GiB) in
+all; files uploaded directly, a `.jsonl.gz` included, don't count. Before a ZIP's members are
+read, the total so far plus the uncompressed sizes the ZIP declares for the members validation
+reads is checked. While validation reads each member, the bytes it decompresses are counted, once
+per member (extraction reads supported members again but doesn't count them); a `.json.gz` or
+`.jsonl.gz` member is also gunzipped, only to count its output, on top of its own bytes. It is
+read with the job's own gzip reader (Python's `gzip` module), so the count is what the job would
+decompress: the same headers accepted, concatenated streams and zero padding followed. Gzip data
+that reader refuses stops that member's count, and the job reports the file as usual. As soon as the total is over the cap the
+whole request is refused, whatever else was found: 400 `ARCHIVE_TOO_LARGE`, `'<zip>' expands to
+more than 2,048 MB when unpacked, the most one upload's ZIPs can expand to, so nothing from it was
+imported. Split it into smaller zips and upload them in separate imports.` (`<zip>` is the ZIP
+being checked or read; the limit is in MB when it is a whole number of MiB, otherwise in bytes),
+`detail` `{"file": "<zip>", "members": []}`. A total equal to the cap is accepted. The ZIP work
+(opening, the size check, validation, counting and extraction) runs in a worker thread, so the
+API keeps answering other requests meanwhile. The member-count and compression-ratio caps are
+#28's.
 
 **`.json.gz` members.** A ZIP member ending in `.json.gz` is extracted and queued like a
 supported file. The job decompresses it (at most 512 MB decompressed) and parses the result
@@ -1465,7 +1485,7 @@ Flat (KNN) index has no tunable parameters.
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n`; a `\r` before it is whitespace; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3).
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 512 MB) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -1915,6 +1935,7 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
 | `maxConnections` | 64 | 16 | 128 | HNSW build param |
 | Gold standard `sample_size` | 20 | 1 | 100 | |
+| `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
 
 ---
 
@@ -2098,6 +2119,31 @@ now lives once, in `api/services/ingest_config.py`.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`
       list naming each file and its unsupported extension, shown by the UI.*
+- [x] A damaged or unreadable ZIP refuses the whole upload with a readable 400 naming its unreadable members (`ARCHIVE_UNREADABLE`, or `ARCHIVE_UNSUPPORTED` when none is damaged), a filesystem error is `UPLOAD_WRITE_FAILED` and anything unexpected a JSON 500 `INGEST_FAILED`; `.json.gz` members ingest as JSON. An upload's ZIPs expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzip output included, or the upload is refused with `ARCHIVE_TOO_LARGE`, and the ZIP work runs off the event loop (#290, #298).
+      *#290 replaced a bare HTTP 500 for a truncated ZIP. `test_ingest_errors.py` (in the API
+      image) covers a truncated archive, wrong member offsets, bad CRCs (also in a member that
+      would be skipped), unsupported compression, an encrypted member, damaged and unsupported
+      members together (`ARCHIVE_UNREADABLE` with the generic remedy), extraction and upload-save
+      filesystem errors, the JSON 500, `.json.gz` parsing and its errors, and rechunk of a
+      retained `.json.gz`. The #297 review found the ZIP work ran on the event loop with no total
+      cap, so a small highly compressible ZIP could stall every request: `test_zip_expansion.py`
+      runs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` and covers declared sizes over
+      the cap (refused before any member is read), a total at the cap accepted and one byte
+      over refused, the total shared by two ZIPs, counting when declared sizes understate,
+      `.json.gz` and `.jsonl.gz` output, concatenated streams with zero padding, a corrupt and a
+      truncated gzip, a direct `.jsonl.gz` not counted, the cap passed after an unreadable
+      member, no member read and gzip counting stopped within one block once the cap is passed,
+      the 2 GiB default and the ZIP work running in a worker thread while the loop serves other
+      work. The PR #318 security review found that counting with zlib's gzip mode let a member
+      whose header zlib refuses (FHCRC with a bogus CRC, a reserved flag bit) count nothing
+      although the job decompresses it all: members are now counted with the job's own gzip
+      reader, and a test checks the count equals what that reader produces for plain,
+      concatenated, padded, truncated, trailing-garbage, non-gzip and both header cases. `02_ingest.sh` runs both in the verify project's API container, then
+      through the proxy refuses a truncated ZIP, ingests a ZIP of `.json`, `.json.gz` and
+      `.jsonl.gz` members, and refuses with the exact message a ZIP declaring 2,049 MiB and one
+      whose gzip member expands to 2,112 MiB, while job polls are still answered;
+      `06_ui.sh` checks the Import page shows the API's message and a failing status poll,
+      which a new ingest and the next successful poll clear.*
 - [x] Each chunking strategy produces non-empty chunks for a test PDF.
       *fixed 3, overlap 1, language 4, context_aware 4, semantic 8 chunks.*
 - [x] Chunks below `min_chunk_size` are merged and not stored as independent objects.

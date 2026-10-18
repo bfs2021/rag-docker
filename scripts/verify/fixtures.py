@@ -182,6 +182,23 @@ def write(target: pathlib.Path) -> None:
     (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
                                       encoding="utf-8")
 
+    # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
+    # files are about 2 MB. zip_over_declared.zip honestly declares a member of
+    # 2,049 MiB of zeros, refused before anything is read (about 3 s to write).
+    # zip_over_gzip.zip declares only its 2 MB gzip member, but that member,
+    # 33 concatenated gzip streams of 64 MiB of zeros, decompresses to
+    # 2,112 MiB: it is refused while its output is counted.
+    zeros = bytes(1024 * 1024)
+    member = zipfile.ZipInfo("zeros.bin", date_time=(2026, 1, 1, 0, 0, 0))
+    member.compress_type = zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(target / "zip_over_declared.zip", "w") as z:
+        with z.open(member, "w", force_zip64=True) as out:
+            for _ in range(2049):
+                out.write(zeros)
+    stream = gzip.compress(bytes(64 * 1024 * 1024), mtime=0)
+    with zipfile.ZipFile(target / "zip_over_gzip.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", stream * 33)
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

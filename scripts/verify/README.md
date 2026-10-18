@@ -192,9 +192,33 @@ wrong member offsets, bad CRC, also in a member that would be skipped, unsupport
 compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
 logged traceback, which inputs are queued (JSON Lines direct and as members, #291; a direct
 `.json.gz` and other gzip types skipped), and that gzipped JSON members are decompressed
-within their limit with clear per-file errors. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+within their limit with clear per-file errors. Since #298 it also checks a ZIP with damaged and
+unsupported members together (`ARCHIVE_UNREADABLE`, generic remedy), `UPLOAD_WRITE_FAILED` when
+saving the upload itself fails, names with a newline logged escaped in every ingest log line that
+carries one, the retained `media_type` of gzipped files (`application/gzip`), and rechunk of a
+retained `.json.gz`. Weaviate and source retention are mocked. `02_ingest.sh` runs it
 in the verify project's API container, then checks a truncated ZIP and a ZIP of
-`.json`, `.json.gz` and `.jsonl.gz` members through the proxy.
+`.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
+(suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
+failing status poll, and that a new ingest and the next successful poll clear that error.
+
+`scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
+upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
+to the container; the test sets it when absent): declared sizes over the cap refused before
+any member is read, a total at the cap accepted and one byte over refused, one total for every
+ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
+counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
+member read and gzip counting stopped within one block once the cap is passed, gzip headers
+that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
+counted, the count equal to what the job's gzip reader produces, the exact message and
+`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
+serves other work. `02_ingest.sh` runs it in the API container, then, at the
+default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
+gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
+`ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
+are answered within a second (a smoke check; the controlled test is the one that tells
+off-loop from on-loop work).
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -361,13 +385,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
