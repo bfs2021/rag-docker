@@ -116,8 +116,8 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
-        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
+        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
 

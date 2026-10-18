@@ -23,12 +23,18 @@ from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
-# Gzipped JSON is accepted inside a ZIP only (issue #290). It is decompressed
-# when the job parses it, never more than this many bytes: the per-request
-# upload limit, so gzip cannot bring in more than a plain upload could.
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
+# Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
+# directly or inside a ZIP (#291). Either is decompressed when the job parses
+# it, never more than this many bytes: the per-request upload limit, so gzip
+# cannot bring in more than a plain upload could.
 GZIP_JSON_SUFFIX = ".json.gz"
+GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+# The most of one JSON Lines line that is read (#291). A line is parsed whole,
+# so this bounds the memory one record can take (a 10 MB line of small numbers
+# parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+MAX_JSONL_LINE_BYTES = 10_000_000
 
 # Job records survive an API restart (#23); see jobstore.py.
 _jobs = jobstore.JobStore("ingest")
@@ -56,25 +62,39 @@ def _is_json_gz(name: str) -> bool:
     return name.lower().endswith(GZIP_JSON_SUFFIX)
 
 
+def _is_jsonl_gz(name: str) -> bool:
+    return name.lower().endswith(GZIP_JSONL_SUFFIX)
+
+
+def _is_jsonl(name: str) -> bool:
+    return name.lower().endswith(".jsonl") or _is_jsonl_gz(name)
+
+
 def _skip_reason(name: str) -> str:
     """Why a file is not ingested, for the job's `skipped` list."""
-    lower = name.lower()
-    if lower.endswith(".jsonl") or lower.endswith(".jsonl.gz"):
-        return "JSON Lines (.jsonl) isn't supported yet, see #291"
-    return f"unsupported type '{Path(lower).suffix or 'none'}'"
+    return f"unsupported type '{Path(name.lower()).suffix or 'none'}'"
 
 
 def source_type_of(path: Path) -> str:
     """The source_type stored with a file's chunks: what was parsed, so a
-    gzipped JSON file is "json", like a plain one."""
+    gzipped JSON file is "json" and gzipped JSON Lines "jsonl", like plain ones."""
     if _is_json_gz(path.name):
         return "json"
+    if _is_jsonl_gz(path.name):
+        return "jsonl"
     return path.suffix.lower().lstrip(".")
 
 
 def _save_upload(src, dest: Path) -> None:
     with dest.open("wb") as fh:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
+
+
+def _gzip_too_large() -> ValueError:
+    return ValueError(
+        f"decompresses to more than "
+        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
+        f"one compressed file; nothing from it was stored")
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
@@ -88,10 +108,7 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
                     break
                 written += len(block)
                 if written > MAX_GZIP_DECOMPRESSED_BYTES:
-                    raise ValueError(
-                        f"decompresses to more than "
-                        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
-                        f"one compressed file; nothing from it was stored")
+                    raise _gzip_too_large()
                 out.write(block)
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
@@ -292,7 +309,134 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         plain.unlink(missing_ok=True)
 
 
+class _JsonlError(ValueError):
+    """A JSON Lines file that can't be ingested; `detail` names the line (#291)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class _JsonlTooLarge(_JsonlError):
+    """A JSON Lines file whose text passes the per-file limit."""
+
+
+class _BoundedLines:
+    """Lines of a decompressing stream, refusing more than the gzip limit."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.read = 0
+
+    def readline(self, size: int) -> bytes:
+        line = self.stream.readline(size)
+        self.read += len(line)
+        if self.read > MAX_GZIP_DECOMPRESSED_BYTES:
+            raise _gzip_too_large()
+        return line
+
+
+_JSONL_BLANK = b" \t\r"
+
+
+def _jsonl_records(stream: Any) -> list[str]:
+    """The records of a JSON Lines file, one per line with text (#291).
+
+    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it, and stopped at
+    the first bad line or when the file's text passes the per-file limit, so
+    memory is bounded by one line and that limit, never by the file's size.
+    """
+    budget = _JsonBudget()
+    records: list[str] = []
+    number = 0
+    blank = None  # the first blank line not yet followed by a record
+    while True:
+        raw = stream.readline(MAX_JSONL_LINE_BYTES + 1)
+        if not raw:
+            break
+        number += 1
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+            too_long = False
+        else:
+            # No newline: either the last line, or a line over the limit.
+            too_long = len(raw) > MAX_JSONL_LINE_BYTES
+        shift = 0
+        if number == 1 and raw.startswith(b"\xef\xbb\xbf"):
+            raw, shift = raw[3:], 3
+        if not too_long and not raw.strip(_JSONL_BLANK):
+            if blank is None:
+                blank = number
+            continue
+        # Trailing blank lines are accepted; one followed by a record is not.
+        if blank is not None:
+            raise _JsonlError(f"line {blank} is blank")
+        if too_long:
+            raise _JsonlError(
+                f"line {number} is longer than {MAX_JSONL_LINE_BYTES:,} bytes, the most one "
+                f"line can hold; split the record across lines or files")
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _JsonlError(f"line {number} is not UTF-8 text "
+                              f"({exc.reason} at byte {exc.start + shift})") from exc
+        try:
+            value = json.loads(line, parse_int=_JsonNumber, parse_float=_JsonNumber,
+                               parse_constant=_reject_constant)
+            lines: list[str] = []
+            left = budget.left
+            _json_lines(value, None, lines, budget)
+            text = "\n".join(lines)
+            if text.strip():
+                if records:
+                    budget.spend(2)  # the blank line before this record
+                records.append(text)
+            else:
+                budget.left = left  # a record with no text is not stored
+        except _JsonTooLarge as exc:
+            raise _JsonlTooLarge(
+                f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text by "
+                f"line {number}, the per-file limit for every chunking strategy; "
+                f"split the file") from exc
+        except _JsonError as exc:
+            raise _JsonlError(f"line {number} is not valid JSON: {exc.detail}") from exc
+        except json.JSONDecodeError as exc:
+            raise _JsonlError(
+                f"line {number} is not valid JSON: {exc.msg} at column {exc.colno}") from exc
+        except RecursionError as exc:
+            raise _JsonlError(
+                f"line {number} is not valid JSON: it is nested too deeply to read") from exc
+    return records
+
+
+def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
+    """JSON Lines, plain or gzipped: each line is one record, converted like
+    ordinary JSON (#295), records separated by a blank line (#291). Lines are
+    never treated as serialized Unstructured elements."""
+    if _is_jsonl_gz(path.name):
+        try:
+            # Decompressed while read; nothing decompressed is written to disk.
+            with gzip.open(path, "rb") as gz:
+                records = _jsonl_records(_BoundedLines(gz))
+        except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+            raise ValueError(
+                f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+        except _JsonlError as exc:
+            subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
+            raise ValueError(f"was decompressed, but {subject}{exc.detail}") from exc
+    else:
+        try:
+            with path.open("rb") as fh:
+                records = _jsonl_records(fh)
+        except _JsonlError as exc:
+            raise ValueError(exc.detail) from exc
+    from unstructured.documents.elements import Text
+    return "\n\n".join(records), [Text(text=record) for record in records]
+
+
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
+    if _is_jsonl(path.name):
+        return _parse_jsonl(path)
     if _is_json_gz(path.name):
         return _parse_json_gz(path)
     ext = path.suffix.lower()
@@ -675,7 +819,7 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue) -> None:
         for member, logical in members:
             basename = PurePosixPath(logical).name
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
-                    or _is_json_gz(basename)):
+                    or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
                     f"{safe_name}:{member.filename} ({_skip_reason(member.filename)})")
                 continue
@@ -757,7 +901,9 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             if safe_name.lower().endswith(".zip"):
                 _extract_zip(dest, safe_name, queue)
                 os.remove(dest)
-            elif Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS:
+            elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
+                  or _is_jsonl_gz(safe_name)):
+                # A directly uploaded .json.gz is still skipped (#291 scope).
                 queue.add(dest, safe_name, safe_name)
             else:
                 skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")

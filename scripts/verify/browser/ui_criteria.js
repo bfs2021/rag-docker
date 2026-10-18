@@ -377,6 +377,28 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── import file types (#291) ───────────────────────────────────────────────
+  // The picker offers JSON Lines, plain and gzipped, and the hint names it.
+  r.section('import file types');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const accept = await s.page.evaluate(() => {
+        const input = document.querySelector('#file-input');
+        return input ? input.getAttribute('accept') : null;
+      });
+      r.check('the file picker accepts .jsonl and .jsonl.gz',
+              accept === '.pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip', String(accept));
+      const hint = await bodyText(s.page);
+      r.check('the drop zone hint names JSONL among the types',
+              hint.includes('PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to 512 MB per upload'),
+              hint.slice(0, 200));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
   // ── import errors (#290) ───────────────────────────────────────────────────
   // A truncated ZIP once ended in a plain-text 500 that the page could only
   // show as "HTTP 500", and a failing status poll was ignored.
