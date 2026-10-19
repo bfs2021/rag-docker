@@ -3208,6 +3208,8 @@ MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 # The most of one JSON Lines line that is read (#291). A line is parsed whole,
 # so this bounds the memory one record can take (a 10 MB line of small numbers
 # parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+# It counts neither the line ending (`\n` or `\r\n`) nor line 1's byte-order
+# mark, so a CRLF file and an LF file behave the same (#314).
 MAX_JSONL_LINE_BYTES = 10_000_000
 
 # Job records survive an API restart (#23); see jobstore.py.
@@ -3326,6 +3328,8 @@ MAX_JSON_INPUT_BYTES = 30_000_000
 # allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
 # blank line between records). A file of more than this many records averages
 # under 8 characters a record; any other passes the text bound first.
+# It also bounds a JSON Lines file's lines (#314): every line counts, blank ones
+# and records with no text included, since those spend none of the text bound.
 MAX_JSON_RECORDS = 1_000_000
 
 
@@ -3530,7 +3534,8 @@ class _JsonlError(ValueError):
 
 
 class _JsonlTooLarge(_JsonlError):
-    """A JSON Lines file whose text passes the per-file limit."""
+    """A JSON Lines file whose text passes the per-file limit, or with more lines
+    than one file may hold (#314)."""
 
 
 class _BoundedLines:
@@ -3549,33 +3554,41 @@ class _BoundedLines:
 
 
 _JSONL_BLANK = b" \t\r"
+_BOM = b"\xef\xbb\xbf"
 
 
 def _jsonl_records(stream: Any) -> list[str]:
     """The records of a JSON Lines file, one per line with text (#291).
 
-    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it, and stopped at
-    the first bad line or when the file's text passes the per-file limit, so
-    memory is bounded by one line and that limit, never by the file's size.
+    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
+    ending and line 1's byte-order mark, and stopped at the first bad line, at
+    the line past MAX_JSON_RECORDS, or when the file's text passes the per-file
+    limit, so memory is bounded by one line and that limit, never by the file's
+    size, and work by the line count.
     """
     budget = _JsonBudget()
     records: list[str] = []
     number = 0
     blank = None  # the first blank line not yet followed by a record
     while True:
-        raw = stream.readline(MAX_JSONL_LINE_BYTES + 1)
+        # Room for line 1's byte-order mark and a CRLF beyond the limit (#314).
+        raw = stream.readline(MAX_JSONL_LINE_BYTES + len(_BOM) + 2)
         if not raw:
             break
         number += 1
-        if raw.endswith(b"\n"):
+        if number > MAX_JSON_RECORDS:
+            # Every line counts, so lines with no text can't run on to the gzip bound.
+            raise _JsonlTooLarge(f"has more than {MAX_JSON_RECORDS:,} records, the most one "
+                                 f"file can hold; split the file")
+        if raw.endswith(b"\r\n"):
+            raw = raw[:-2]
+        elif raw.endswith(b"\n"):
             raw = raw[:-1]
-            too_long = False
-        else:
-            # No newline: either the last line, or a line over the limit.
-            too_long = len(raw) > MAX_JSONL_LINE_BYTES
         shift = 0
-        if number == 1 and raw.startswith(b"\xef\xbb\xbf"):
-            raw, shift = raw[3:], 3
+        if number == 1 and raw.startswith(_BOM):
+            raw, shift = raw[len(_BOM):], len(_BOM)
+        # A read cut short has no newline and is at least 2 bytes over the limit.
+        too_long = len(raw) > MAX_JSONL_LINE_BYTES
         if not too_long and not raw.strip(_JSONL_BLANK):
             if blank is None:
                 blank = number
@@ -12713,12 +12726,21 @@ no final newline, trailing blank lines accepted and U+2028 kept inside its line.
 error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
 non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
 text limit are checked at and one past their edges, and a file far over the limit stops
-being read at the line that passes it, with a small traced peak. Gzip: the same text as plain,
-the `was decompressed, but` prefix, corrupt, truncated and over-size data. It also checks
-`source_type` `jsonl`, a job that stores nothing for a bad file beside a good one, and
-rechunk of a retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a
-direct `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back,
-and checks that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing.
+being read at the line that passes it, with a small traced peak. The line limit counts neither
+the line ending nor line 1's byte-order mark (#314): it is checked at and one past its edge
+with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
+errors as an LF one. The 1,000,000-line cap (#314) is checked at and one past its edge, with
+blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
+same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
+errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job
+that stores nothing for a bad file beside a good one, job-level outcomes (#314: empty files
+complete with 0 chunks under every strategy, a file over the 10,000-chunk limit or the cap
+fails and stores nothing, `context_aware` keeps one chunk per record), and rechunk of a
+retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a direct
+`records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back, checks
+that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing, and that
+`jsonl_many_records.jsonl.gz` (1,000,001 `{}` lines, a few KB gzipped) fails with the
+record-cap message and stores nothing.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -14396,6 +14418,10 @@ def write(target: pathlib.Path) -> None:
     (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
     (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
                                       encoding="utf-8")
+    # Issue #314. A JSON Lines file holds at most 1,000,000 lines, every line
+    # counting: jsonl_many_records.jsonl.gz is 1,000,001 records with no text
+    # (about 3 MB decompressed, a few KB gzipped), which fails the file.
+    (target / "jsonl_many_records.jsonl.gz").write_bytes(gzip.compress(b"{}\n" * 1_000_001, mtime=0))
 
     # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
     # files are about 2 MB. zip_over_declared.zip honestly declares a member of
@@ -14933,7 +14959,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/json_over_size_gz.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/jsonl_many_records.jsonl.gz" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -15190,6 +15216,22 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 [ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
 check "a malformed line fails the file with its line number and stores nothing" $? \
   "status=$status error=$first_error stored=$stored"
+
+# A JSON Lines file holds at most 1,000,000 lines, records with no text
+# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
+read -r status cap_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+        'the most one file can hold; split the file']
+print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
+check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+  "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with

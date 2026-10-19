@@ -248,12 +248,21 @@ no final newline, trailing blank lines accepted and U+2028 kept inside its line.
 error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
 non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
 text limit are checked at and one past their edges, and a file far over the limit stops
-being read at the line that passes it, with a small traced peak. Gzip: the same text as plain,
-the `was decompressed, but` prefix, corrupt, truncated and over-size data. It also checks
-`source_type` `jsonl`, a job that stores nothing for a bad file beside a good one, and
-rechunk of a retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a
-direct `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back,
-and checks that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing.
+being read at the line that passes it, with a small traced peak. The line limit counts neither
+the line ending nor line 1's byte-order mark (#314): it is checked at and one past its edge
+with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
+errors as an LF one. The 1,000,000-line cap (#314) is checked at and one past its edge, with
+blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
+same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
+errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job
+that stores nothing for a bad file beside a good one, job-level outcomes (#314: empty files
+complete with 0 chunks under every strategy, a file over the 10,000-chunk limit or the cap
+fails and stores nothing, `context_aware` keeps one chunk per record), and rechunk of a
+retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a direct
+`records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back, checks
+that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing, and that
+`jsonl_many_records.jsonl.gz` (1,000,001 `{}` lines, a few KB gzipped) fails with the
+record-cap message and stores nothing.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
