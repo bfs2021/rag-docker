@@ -110,6 +110,12 @@ check "only the other gzip member is skipped, as unsupported" $?
   api python - < scripts/tests/test_zip_expansion.py)
 check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
 
+# docker-compose.yml sets the cap (#319), and the API reads that value.
+cap_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings; print(os.environ.get("MAX_ZIP_EXPANDED_BYTES"), settings.max_zip_expanded_bytes)' | tr -d '\r')
+[ "$cap_env" = "2147483648 2147483648" ]
+check "docker-compose.yml sets MAX_ZIP_EXPANDED_BYTES to 2 GiB and the API uses it" $? "env and setting: $cap_env"
+
 # The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
 too_large() {
   local name="$1" code

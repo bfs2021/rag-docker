@@ -2239,7 +2239,13 @@ now lives once, in `api/services/ingest_config.py`.
       whose header zlib refuses (FHCRC with a bogus CRC, a reserved flag bit) count nothing
       although the job decompresses it all: members are now counted with the job's own gzip
       reader, and a test checks the count equals what that reader produces for plain,
-      concatenated, padded, truncated, trailing-garbage, non-gzip and both header cases. `02_ingest.sh` runs both in the verify project's API container, then
+      concatenated, padded, truncated, trailing-garbage, non-gzip and both header cases.
+      Since #319 the count reads the member through a buffer: tests check that zero padding and a
+      long gzip file name are read in blocks, that bytes read ahead past a stream's end count
+      once and that the cap still stops a buffered read, and that ZIP damage found during the
+      gzip count is refused as `ARCHIVE_UNREADABLE`. `02_ingest.sh` runs both in the verify
+      project's API container, checks that the API takes the 2 GiB cap from
+      `docker-compose.yml`'s `MAX_ZIP_EXPANDED_BYTES`, then
       through the proxy refuses a truncated ZIP, ingests a ZIP of `.json`, `.json.gz` and
       `.jsonl.gz` members, and refuses with the exact message a ZIP declaring 2,049 MiB and one
       whose gzip member expands to 2,112 MiB, while job polls are still answered;

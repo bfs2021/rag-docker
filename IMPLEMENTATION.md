@@ -12824,14 +12824,17 @@ counted (concatenated streams and zero padding too), a corrupt gzip accepted and
 one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
 member read and gzip counting stopped within one block once the cap is passed, gzip headers
 that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
-counted, the count equal to what the job's gzip reader produces, the exact message and
-`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
-serves other work. `02_ingest.sh` runs it in the API container, then, at the
-default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
-gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
-`ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
-are answered within a second (a smoke check; the controlled test is the one that tells
-off-loop from on-loop work).
+counted, the count equal to what the job's gzip reader produces, zero padding and a long gzip
+file name read in blocks, bytes read ahead past a stream's end counted once, the cap still
+stopping a read through that buffer, ZIP damage found during the gzip count refused as
+`ARCHIVE_UNREADABLE`, the exact message and `detail`, the 2 GiB default, and that ZIP work runs
+in a worker thread while the event loop serves other work. `02_ingest.sh` runs it in the API
+container, checks that the API takes the 2 GiB cap from `docker-compose.yml`'s
+`MAX_ZIP_EXPANDED_BYTES`, then, at the default cap, sends `zip_over_declared.zip` (declares
+2,049 MiB) and `zip_over_gzip.zip` (a gzip member expanding to 2,112 MiB) through the proxy,
+checks each is refused with `ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent
+while the second is counted are answered within a second (a smoke check; the controlled test is
+the one that tells off-loop from on-loop work).
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -15215,6 +15218,12 @@ check "only the other gzip member is skipped, as unsupported" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_EXPANDED_BYTES=1048576 \
   api python - < scripts/tests/test_zip_expansion.py)
 check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
+
+# docker-compose.yml sets the cap (#319), and the API reads that value.
+cap_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings; print(os.environ.get("MAX_ZIP_EXPANDED_BYTES"), settings.max_zip_expanded_bytes)' | tr -d '\r')
+[ "$cap_env" = "2147483648 2147483648" ]
+check "docker-compose.yml sets MAX_ZIP_EXPANDED_BYTES to 2 GiB and the API uses it" $? "env and setting: $cap_env"
 
 # The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
 too_large() {
