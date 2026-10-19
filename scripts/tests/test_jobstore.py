@@ -368,6 +368,18 @@ class PruneTests(StoreTestCase):
         self.assertEqual(set(store), {"e2", "e3", "e4"})
         self.assertTrue(self.path("export", "e1").exists())   # startup retention removes it
 
+    def test_the_order_follows_each_record_s_own_last_write(self):
+        # No stamps set by hand: the order comes from the writes themselves.
+        store = self.bound()
+        for job_id in ("w1", "w2", "w3"):
+            self.add(store, job_id, "running")
+        for job_id in ("w2", "w1", "w3"):
+            time.sleep(0.02)
+            store[job_id]["status"] = "completed"     # a status change is written at once
+        self.add(store, "w4", "queued")
+        self.assertEqual(set(store), {"w1", "w3", "w4"})
+        self.assertFalse(self.path("export", "w2").exists())
+
     def test_replacing_a_record_prunes_nothing(self):
         store = self.bound()
         for job_id in ("p1", "p2", "p3", "p4"):
@@ -398,9 +410,20 @@ class Recording(jobstore.JobStore):
         self.stored.set()
 
 
+class Failing(Recording):
+    """A Recording whose held write raises instead of storing."""
+
+    def __setitem__(self, job_id, doc):
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        raise OSError("disk gone")
+
+
 class StartTests(StoreTestCase):
     """The four job starts store their first record off the event loop, and a
-    start cancelled during that write leaves nothing behind (#309)."""
+    start cancelled during that write leaves nothing behind (#309). A second
+    export of a collection waits for that write before it names the first (#326)."""
 
     KINDS = {"export": (exporter, "_run"), "import": (importer, "_run"),
              "tune": (tuning, "_run"), "ingest": (ingest_pipeline, "_process_job_sync")}
@@ -499,6 +522,97 @@ class StartTests(StoreTestCase):
                 self.assertEqual(calls, [])
                 if kind == "ingest":
                     self.assertEqual([p.name for p in self.root.iterdir()], ["jobs"])
+
+
+    def release_export(self, name, job_id):
+        # the stub worker never ran, so release what it would have
+        collection_writes.end_job("export", job_id)
+        exporter._active.pop(name, None)
+
+    @staticmethod
+    async def second_start(name):
+        """The second start's job id, or the id its RuntimeError (the 409) names
+        and whether that job could be read when it was raised."""
+        try:
+            return await exporter.start_export_job(name), None
+        except RuntimeError as exc:
+            return str(exc), exporter.get_job(str(exc)) is not None
+
+    def test_a_second_export_waits_until_the_first_has_stored_its_record(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Wait"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            pending = not second.done()
+            store.release.set()
+            return pending, await first, await second
+
+        pending, job_id, (named, readable) = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertTrue(pending)                      # it waited for the write
+        self.assertEqual(named, job_id)               # then answered the 409
+        self.assertTrue(readable)                     # naming a job that reads 200
+        self.assertEqual(store.ids, [job_id])
+
+    def test_an_export_waiting_on_a_cancelled_start_starts_its_own(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Cancel"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            store.release.set()
+            outcome = await second
+            for _ in range(500):      # the abandoned record goes; the second's worker runs
+                if store.ids[0] not in store and calls:
+                    break
+                await asyncio.sleep(0.01)
+            return outcome
+
+        second_id, refused = asyncio.run(run())
+        first_id = store.ids[0]
+        self.assertIsNone(refused)                    # no 409 naming the cancelled job
+        self.assertNotEqual(second_id, first_id)
+        self.assertEqual(exporter._active.get(name), second_id)
+        self.assertEqual(store[second_id]["status"], "queued")
+        self.assertNotIn(first_id, store)
+        self.assertEqual(len(calls), 1)
+        self.release_export(name, second_id)
+
+    def test_an_abandoned_write_that_raises_is_logged_and_leaves_nothing(self):
+        store = Failing("export", hold=True)
+        self.assertEqual(store.load(), [])
+
+        async def run(logs):
+            loop = asyncio.get_running_loop()
+            task = asyncio.ensure_future(store.create("abcd0326", {"status": "queued"}))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            store.release.set()
+            for _ in range(500):
+                if any("abandoned" in line for line in logs.output):
+                    break
+                await asyncio.sleep(0.01)
+
+        with self.assertLogs("services.jobstore", "ERROR") as logs:
+            asyncio.run(run(logs))
+        self.assertIn("Could not store abandoned export job abcd0326: disk gone",
+                      "\n".join(logs.output))
+        self.assertNotIn("abcd0326", store)
+        self.assertFalse(self.path_exists("export", "abcd0326"))
 
 
 class IngestFallbackTests(StoreTestCase):

@@ -348,7 +348,10 @@ completion, the written filename.
   `COLLECTION_NOT_FOUND`, before any job is created.
 - Only one export per collection may run at a time; a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
-  concurrent exports would race on the temporary file described below.
+  concurrent exports would race on the temporary file described below. A request
+  that arrives while that export is still storing its first record waits for it,
+  so the named `job_id` can always be read; if that start is cancelled instead,
+  the request starts its own export (#326).
 - The package is written to `/app/exports` (host `./exports`), never streamed.
 - Chunks are read with `include_vector=True`, paged, so memory does not scale
   with collection size.
