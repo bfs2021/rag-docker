@@ -8129,6 +8129,10 @@ def _listed_names(documents: dict) -> set[str]:
     return {filename for entry in documents.values() for filename in entry["filenames"]}
 
 
+class ServiceUnavailableError(Exception):
+    """Weaviate couldn't be read for the up-front re-chunk check (#340)."""
+
+
 # A collection whose retained originals all lack stored chunks (every file
 # produced none at ingest) has nothing to rebuild, since a rebuild emits only
 # stored names (#311). It isn't offered re-chunking, and a request is refused
@@ -8154,12 +8158,21 @@ def _refuse_nothing_to_rebuild(collection: str) -> None:
     """The one re-chunk refusal made before a job is created (#328).
 
     The other refusals, and an invalid index, are still reported by the job.
+    A Weaviate failure during the walk raises ServiceUnavailableError, which
+    the router answers with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
     except ValueError:
         return
-    if documents and not _has_stored_listed_name(collection, documents):
+    if not documents:
+        return
+    try:
+        stored = _has_stored_listed_name(collection, documents)
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Could not read %r for the re-chunk check", collection)
+        raise ServiceUnavailableError(collection) from exc
+    if not stored:
         raise _nothing_to_rebuild(collection)
 
 
@@ -9191,6 +9204,13 @@ async def _start(collection: str, operation: str, params: dict):
     except tuning.PackageError as exc:
         # Nothing to rebuild: refused before a job is created (#328).
         return api_error(409, exc.code, exc.message, detail=exc.detail)
+    except tuning.ServiceUnavailableError:
+        # Weaviate couldn't be read for that check; the cause is logged (#340).
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         f"Cannot check whether '{collection}' can be re-chunked: Weaviate "
+                         "could not be read. No job was started; try again when Weaviate "
+                         "is available.",
+                         detail={"collection": collection})
     except RuntimeError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
                          f"'{exc}' is already being tuned.",
@@ -12988,7 +13008,11 @@ while a missing blob is still refused (#311), also for one blob under 50 names w
 stored and a digest with none (only the stored name is parsed). A collection whose retained
 names have no stored chunks is refused as having nothing to rebuild, before staging and, for
 a rechunk or a re-embed with chunking parameters, before any job is created, with the route
-answering 409 (#328). Weaviate and sessions are mocked.
+answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
+`COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
+listed name still start a job. A Weaviate error during the check answers 503
+`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340).
+Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
@@ -13002,7 +13026,10 @@ page shows "Replaced N chunk(s) from a previous version" only when `chunks_repla
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
 and checks that only the new text comes back, under both names. It also adds a name with no
 stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
-the index still lists it (E17, #311).
+the index still lists it (E17, #311). It then ingests a whitespace-only file, which is retained with no
+chunks, and checks that `GET /tune` doesn't offer re-chunking and gives the nothing-to-rebuild
+note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields answer 409
+`SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -13093,8 +13120,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
-| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
@@ -14311,6 +14339,10 @@ fi
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
 require_stack
+section "Overlap window and tuning-budget regressions"
+# With the repository mounted, so its IMPLEMENTATION.md mirror check runs too.
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_overlap_chunks.py)
+check "test_overlap_chunks.py registered regression checks" $?
 section "Bounded overlap text storage"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" -e RAG_OVERLAP_REAL_EMBEDDING="${RAG_OVERLAP_REAL_EMBEDDING:-0}" api python - < scripts/verify/overlap_chunks.py)
 check "overlap coverage, bounds, budget rejection and owned-fixture cleanup" $?
@@ -17503,6 +17535,50 @@ wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
+
+# ── #328 (reviewer): retained originals with no stored chunks ────────────────
+# A file that produces no chunks is still retained at ingest. With nothing to
+# rebuild, re-chunking isn't offered and is refused up front: no job is made.
+NOCH="${PREFIX}Nochunks"
+NOCHFIX=$(mktemp -d)
+printf '   \n\n   \n' > "$NOCHFIX/blank.txt"
+drop_collection "$NOCH"; make_collection "$NOCH"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$NOCH" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$NOCHFIX/blank.txt" > /tmp/vfy_nc.json
+njob=$(jfield "['job_id']" < /tmp/vfy_nc.json)
+[ -n "$njob" ] && wait_for_job "/ingest/job/$njob" 900 >/dev/null
+nc_state=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$NOCH") <<'ENDPY'
+import sys
+from services import sources
+from services import weaviate_client as wc
+c = sys.argv[1]
+try:
+    stored = sum(1 for _ in wc.get_client().collections.get(c).iterator())
+finally:
+    wc.close_client()
+names = sorted(n for e in sources.load_index(c)["documents"].values() for n in e["filenames"])
+print(f"{stored} {names}")
+ENDPY
+)
+check_eq "#328: a file that produced no chunks is retained, and the collection holds none" \
+  "$nc_state" "0 ['blank.txt']"
+api_get "/tune/$NOCH" > /tmp/vfy_nc_tune.json
+check_eq "#328: GET /tune doesn't offer re-chunking with nothing to rebuild" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_nc_tune.json)" "False"
+check_eq "#328: GET /tune gives the nothing-to-rebuild reason" \
+  "$(jfield "['note']" < /tmp/vfy_nc_tune.json | cut -c1-48)" "No retained original file has stored chunks, so "
+for op in rechunk reembed; do
+  code=$(curl -s -o /tmp/vfy_nc_start.json -m 120 -w '%{http_code}' -X POST "$API/tune/$op" \
+    -H 'Content-Type: application/json' \
+    -d "{\"collection\":\"$NOCH\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}")
+  check_eq "#328: POST /tune/$op with chunking answers 409" "$code" "409"
+  check_eq "#328: POST /tune/$op with chunking is SOURCES_REQUIRED" \
+    "$(jfield "['error']['code']" < /tmp/vfy_nc_start.json)" "SOURCES_REQUIRED"
+  check_eq "#328: POST /tune/$op with chunking returns no job" \
+    "$(jfield ".get('job_id')" < /tmp/vfy_nc_start.json)" "None"
+done
+drop_collection "$NOCH"
+rm -rf "$NOCHFIX"
 
 # ── the help page and the package README share a source ──────────────────────
 api_get "/help/transfer" > /tmp/vfy_help.json

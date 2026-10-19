@@ -860,6 +860,50 @@ check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
 
+# ── #328 (reviewer): retained originals with no stored chunks ────────────────
+# A file that produces no chunks is still retained at ingest. With nothing to
+# rebuild, re-chunking isn't offered and is refused up front: no job is made.
+NOCH="${PREFIX}Nochunks"
+NOCHFIX=$(mktemp -d)
+printf '   \n\n   \n' > "$NOCHFIX/blank.txt"
+drop_collection "$NOCH"; make_collection "$NOCH"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$NOCH" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$NOCHFIX/blank.txt" > /tmp/vfy_nc.json
+njob=$(jfield "['job_id']" < /tmp/vfy_nc.json)
+[ -n "$njob" ] && wait_for_job "/ingest/job/$njob" 900 >/dev/null
+nc_state=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$NOCH") <<'ENDPY'
+import sys
+from services import sources
+from services import weaviate_client as wc
+c = sys.argv[1]
+try:
+    stored = sum(1 for _ in wc.get_client().collections.get(c).iterator())
+finally:
+    wc.close_client()
+names = sorted(n for e in sources.load_index(c)["documents"].values() for n in e["filenames"])
+print(f"{stored} {names}")
+ENDPY
+)
+check_eq "#328: a file that produced no chunks is retained, and the collection holds none" \
+  "$nc_state" "0 ['blank.txt']"
+api_get "/tune/$NOCH" > /tmp/vfy_nc_tune.json
+check_eq "#328: GET /tune doesn't offer re-chunking with nothing to rebuild" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_nc_tune.json)" "False"
+check_eq "#328: GET /tune gives the nothing-to-rebuild reason" \
+  "$(jfield "['note']" < /tmp/vfy_nc_tune.json | cut -c1-48)" "No retained original file has stored chunks, so "
+for op in rechunk reembed; do
+  code=$(curl -s -o /tmp/vfy_nc_start.json -m 120 -w '%{http_code}' -X POST "$API/tune/$op" \
+    -H 'Content-Type: application/json' \
+    -d "{\"collection\":\"$NOCH\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}")
+  check_eq "#328: POST /tune/$op with chunking answers 409" "$code" "409"
+  check_eq "#328: POST /tune/$op with chunking is SOURCES_REQUIRED" \
+    "$(jfield "['error']['code']" < /tmp/vfy_nc_start.json)" "SOURCES_REQUIRED"
+  check_eq "#328: POST /tune/$op with chunking returns no job" \
+    "$(jfield ".get('job_id')" < /tmp/vfy_nc_start.json)" "None"
+done
+drop_collection "$NOCH"
+rm -rf "$NOCHFIX"
+
 # ── the help page and the package README share a source ──────────────────────
 api_get "/help/transfer" > /tmp/vfy_help.json
 python3 - "$EXPORTS/$PKG" <<'ENDPY'

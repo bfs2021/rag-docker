@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
@@ -89,7 +90,10 @@ class OverlapTests(unittest.TestCase):
                  patch.object(tuning, '_parse_file', return_value=('x' * 100000, [])), \
                  patch.object(tuning, '_rebuild') as rebuild, \
                  patch.object(tuning.wc, 'get_client') as get_client:
-                get_client.return_value.collections.get.return_value.iterator.return_value = []
+                # big.txt has stored chunks, so the rebuild has something to
+                # rebuild (#311, #328) and reaches the per-file limit.
+                get_client.return_value.collections.get.return_value.iterator.return_value = [
+                    SimpleNamespace(properties={'source_file': 'big.txt', 'chunk_index': 0})]
                 tuning._run(job_id, 'ReviewTuneBudget', 'rechunk', params)
             job = tuning._jobs.pop(job_id)
             self.assertEqual(job['status'], 'failed', job)

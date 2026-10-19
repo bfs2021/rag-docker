@@ -355,7 +355,11 @@ while a missing blob is still refused (#311), also for one blob under 50 names w
 stored and a digest with none (only the stored name is parsed). A collection whose retained
 names have no stored chunks is refused as having nothing to rebuild, before staging and, for
 a rechunk or a re-embed with chunking parameters, before any job is created, with the route
-answering 409 (#328). Weaviate and sessions are mocked.
+answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
+`COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
+listed name still start a job. A Weaviate error during the check answers 503
+`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340).
+Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
@@ -369,7 +373,10 @@ page shows "Replaced N chunk(s) from a previous version" only when `chunks_repla
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
 and checks that only the new text comes back, under both names. It also adds a name with no
 stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
-the index still lists it (E17, #311).
+the index still lists it (E17, #311). It then ingests a whitespace-only file, which is retained with no
+chunks, and checks that `GET /tune` doesn't offer re-chunking and gives the nothing-to-rebuild
+note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields answer 409
+`SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -460,8 +467,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
-| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
