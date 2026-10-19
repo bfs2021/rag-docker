@@ -365,6 +365,26 @@ class GzipBufferTests(unittest.TestCase):
         self.assertEqual(job_output(data), 1000)
         self.assertLess(self.count_reads(data), 100)
 
+    def test_data_read_ahead_past_the_stream_counts_once(self):
+        # The stream ends early and more than a block follows: the buffer
+        # reads part of it ahead, the caller reads the rest; each byte counts once.
+        # (The gzip reader refuses the junk after the stream, so the job gets
+        # nothing from it; the count matches that.)
+        data = gzip.compress(b"x" * 1000) + b"junk" + os.urandom(3 * 1024 * 1024)
+        self.assertLess(self.count_reads(data), 100)
+
+    def test_the_cap_still_stops_a_buffered_read(self):
+        # The member's own bytes pass the cap while the buffer fills for the
+        # gzip reader: _OverCap comes through the buffer and the gzip reader,
+        # not swallowed as invalid gzip data.
+        data = with_long_name(gzip.compress(b"x" * 1000), 2 * 1024 * 1024)
+        buf = io.BytesIO(zip_bytes([("a.json.gz", data)]))
+        with zipfile.ZipFile(buf) as z:
+            budget = ingest_pipeline._ExpansionBudget(CAP)
+            with self.assertRaises(ingest_pipeline._OverCap):
+                ingest_pipeline._member_problem(z, z.infolist()[0], budget, True)
+        self.assertLessEqual(budget.used, CAP + ingest_pipeline._BLOCK, budget.used)
+
 
 class EventLoopTests(unittest.TestCase):
     def test_zip_work_runs_off_the_event_loop(self):
