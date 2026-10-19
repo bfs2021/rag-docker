@@ -153,7 +153,7 @@ read -r code err_code text_ok < /tmp/vfy_cap_result.txt
 [ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
 check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
   "HTTP=$code code=$err_code exact-message=$text_ok"
-[ "$slow" = 0 ]
+[ "$slow" = 0 ] && [ "$probes" -gt 0 ]
 check "job polls are answered while a ZIP is being counted" $? \
   "$probes probes, $slow slow or failed, slowest ${worst}s"
 

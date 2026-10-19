@@ -138,6 +138,9 @@ services:
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
+      # The most one upload's ZIPs may expand to in all, gzipped members'
+      # output included (2 GiB); over it the upload is refused (#298).
+      MAX_ZIP_EXPANDED_BYTES: 2147483648
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -3173,6 +3176,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import gzip
+import io
 import json
 import logging
 import mimetypes
@@ -4012,6 +4016,28 @@ class _CountedMember:
         return block
 
 
+class _RawMember(io.RawIOBase):
+    """A _CountedMember as raw I/O, for io.BufferedReader to read (#319).
+
+    The gzip reader reads header fields such as FNAME, and the zero padding
+    after a stream, one byte per call. Unbuffered, each byte was one read of
+    the ZIP member, so a few KB of zip could hold a thread for minutes. Every
+    byte still goes through the _CountedMember, so it counts once and an error
+    reading the member is still recorded there.
+    """
+
+    def __init__(self, member: _CountedMember) -> None:
+        self.member = member
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        block = self.member.read(len(buffer))
+        buffer[:len(block)] = block
+        return len(block)
+
+
 def _count_gzip_output(member: _CountedMember, budget: _ExpansionBudget) -> None:
     """Count what a gzipped member decompresses to, keeping none of it.
 
@@ -4022,9 +4048,14 @@ def _count_gzip_output(member: _CountedMember, budget: _ExpansionBudget) -> None
     some the job reads in full, which let them count nothing), concatenated
     streams and zero padding followed. Gzip data the reader refuses stops the
     count, and the job reports that file as it always has.
+
+    The member is read through a buffer, a block at a time (#319). Bytes the
+    buffer reads ahead are counted as they are read from the member, and the
+    caller reads the rest of the member after the count.
     """
     try:
-        with gzip.GzipFile(fileobj=member, mode="rb") as gz:
+        source = io.BufferedReader(_RawMember(member), _BLOCK)
+        with gzip.GzipFile(fileobj=source, mode="rb") as gz:
             while True:
                 block = gz.read(_BLOCK)
                 if not block:
@@ -15107,7 +15138,7 @@ read -r code err_code text_ok < /tmp/vfy_cap_result.txt
 [ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
 check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
   "HTTP=$code code=$err_code exact-message=$text_ok"
-[ "$slow" = 0 ]
+[ "$slow" = 0 ] && [ "$probes" -gt 0 ]
 check "job polls are answered while a ZIP is being counted" $? \
   "$probes probes, $slow slow or failed, slowest ${worst}s"
 
