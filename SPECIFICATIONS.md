@@ -431,7 +431,9 @@ target only after opening the package, so an import whose target is being delete
 `failed` with `error_code` `COLLECTION_DELETING`, that message and `error_detail`
 `{"collection": "<target>"}`. With `on_conflict` `abort` this is checked before the name
 collision, so a target the delete has not removed yet ends this way too, not with
-`COLLECTION_EXISTS` (#324). After the delete, admission behaves as before (usually
+`COLLECTION_EXISTS` (#324). With `on_conflict` `rename`, a target the delete has not removed
+yet is a name collision as usual: the import goes ahead under its new name and doesn't touch
+the collection being deleted (#336). After the delete, admission behaves as before (usually
 `404 COLLECTION_NOT_FOUND`). Deletions an import-replace or a tune makes of its own target are
 not subject to these checks.
 
