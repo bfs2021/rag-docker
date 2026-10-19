@@ -1165,6 +1165,7 @@ Standard error codes:
 | `COLLECTION_EXISTS` | 409 | Collection already exists |
 | `COLLECTION_BUSY` | 409 | Delete refused while an ingest, export, import, tune or gold-standard generation job is active for the collection; generation could not get the collection's writer guard within one second |
 | `COLLECTION_DELETING` | 409 | A new ingest, export, tune or generation job refused while a delete of its collection is in progress (an import job fails with it) |
+| `EXPORT_STARTING` | 409 | An export of the collection is still storing its first record after 30 s; no `job_id`; retry shortly |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
@@ -1269,9 +1270,12 @@ The job reports `models_bundled` — what the package actually carries, which is
   running; `detail.job_id` names it. Two concurrent exports of one collection
   would race on the staging directory and the temporary archive. Exports of
   *different* collections run concurrently. A request that arrives while that
-  export is still storing its first record waits for it, so the named `job_id`
-  can always be read; if that start is cancelled instead, the request starts
-  its own export (#326).
+  export is still storing its first record waits for it, at most 30 s, so the
+  named `job_id` can always be read; if that start is cancelled instead, the
+  request starts its own export (#326).
+- **409 `EXPORT_STARTING`** if that export is still storing its first record
+  after the 30 s wait. `detail` is null: no `job_id`, since that job can't be
+  read yet. Retry shortly (#338).
 - **409 `COLLECTION_DELETING`** while a delete of the collection is in progress
   (§3.1.2; #302). No job is created.
 
@@ -2497,7 +2501,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: suite 01 creates 140 schema changes, waits for a snapshot, writes a tail, restarts, and checks the restored snapshot index and data.*
 
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
-  *Evidence: `test_jobstore.py` (28 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, and a second export start waiting for the first one's record (#326); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
+  *Evidence: `test_jobstore.py` (34 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.

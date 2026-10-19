@@ -350,8 +350,10 @@ completion, the written filename.
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
   concurrent exports would race on the temporary file described below. A request
   that arrives while that export is still storing its first record waits for it,
-  so the named `job_id` can always be read; if that start is cancelled instead,
-  the request starts its own export (#326).
+  at most 30 s, so the named `job_id` can always be read; if that start is
+  cancelled instead, the request starts its own export (#326). If it is still
+  storing that record after 30 s, the request fails with `EXPORT_STARTING`, with
+  no `job_id`, and can be retried shortly (#338).
 - The package is written to `/app/exports` (host `./exports`), never streamed.
 - Chunks are read with `include_vector=True`, paged, so memory does not scale
   with collection size.
@@ -747,6 +749,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
+| `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
 | `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
