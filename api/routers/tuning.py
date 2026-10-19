@@ -32,6 +32,9 @@ async def _start(collection: str, operation: str, params: dict):
         job_id = await tuning.start_tune_job(collection, operation, params)
     except CollectionDeletingError:
         return collection_deleting_error(collection)
+    except tuning.PackageError as exc:
+        # Nothing to rebuild: refused before a job is created (#328).
+        return api_error(409, exc.code, exc.message, detail=exc.detail)
     except RuntimeError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
                          f"'{exc}' is already being tuned.",
@@ -82,13 +85,20 @@ async def tune_options(collection: str):
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
         stats = await asyncio.to_thread(sources.stats, collection)
-        can_rechunk = has_sources and await asyncio.to_thread(tuning.can_rechunk, collection)
+        refusal = (await asyncio.to_thread(tuning.rechunk_refusal, collection)
+                   if has_sources else None)
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
+    can_rechunk = has_sources and refusal is None
     if not has_sources:
         note = ("No original documents were retained, so this collection cannot be "
                 "re-chunked. Re-embedding works from the stored chunk text, which "
                 "leaves chunk boundaries unchanged.")
+    elif refusal == tuning.RECHUNK_NOTHING_TO_REBUILD:
+        note = ("No retained original file has stored chunks, so this collection "
+                "cannot be re-chunked: there is nothing to rebuild. Re-embedding works "
+                "from the stored chunk text, which leaves chunk boundaries unchanged, "
+                "and re-indexing is available.")
     elif can_rechunk:
         note = "Every tuning operation is available."
     else:

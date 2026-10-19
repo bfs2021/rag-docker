@@ -745,7 +745,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging |
+| `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
@@ -789,7 +789,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
 | E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
-| E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a name retained under more than one digest, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard. A second name for the same retained content is covered: re-chunking emits one chunk set per (digest, name) pair, under the full logical name (#22). Only pairs whose name has stored chunks are rebuilt: a name the index lists without stored chunks is skipped, and the index keeps it (#311) |
+| E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a name retained under more than one digest, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard. A second name for the same retained content is covered: re-chunking emits one chunk set per (digest, name) pair, under the full logical name (#22). Only pairs whose name has stored chunks are rebuilt: a name the index lists without stored chunks is skipped, and the index keeps it (#311). When no listed name has stored chunks there is nothing to rebuild: the tuning options don't offer re-chunking and say why, and the request is refused up front, HTTP 409 `SOURCES_REQUIRED`, with no job (#328) |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |

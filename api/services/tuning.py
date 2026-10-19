@@ -150,19 +150,66 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
     return _source_coverage(collection, documents)[0]
 
 
-def can_rechunk(collection: str) -> bool:
-    """Whether re-chunking would pass the checks made before parsing.
+def _listed_names(documents: dict) -> set[str]:
+    return {filename for entry in documents.values() for filename in entry["filenames"]}
+
+
+# A collection whose retained originals all lack stored chunks (every file
+# produced none at ingest) has nothing to rebuild, since a rebuild emits only
+# stored names (#311). It isn't offered re-chunking, and a request is refused
+# before any job runs (#328).
+def _nothing_to_rebuild(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCES_REQUIRED",
+        f"Cannot re-chunk '{collection}': no retained original file has stored "
+        "chunks, so there is nothing to rebuild.",
+        {"collection": collection})
+
+
+def _has_stored_listed_name(collection: str, documents: dict) -> bool:
+    """Whether any name the index lists has stored chunks; stops at the first."""
+    names = _listed_names(documents)
+    for obj in wc.get_client().collections.get(collection).iterator():
+        if (obj.properties or {}).get("source_file") in names:
+            return True
+    return False
+
+
+def _refuse_nothing_to_rebuild(collection: str) -> None:
+    """The one re-chunk refusal made before a job is created (#328).
+
+    The other refusals, and an invalid index, are still reported by the job.
+    """
+    try:
+        documents = sources.load_index(collection)["documents"]
+    except ValueError:
+        return
+    if documents and not _has_stored_listed_name(collection, documents):
+        raise _nothing_to_rebuild(collection)
+
+
+# Why the tuning options don't offer re-chunking; see rechunk_refusal.
+RECHUNK_NOTHING_TO_REBUILD = "nothing-to-rebuild"
+RECHUNK_NOT_COVERED = "not-covered"
+
+
+def rechunk_refusal(collection: str) -> str | None:
+    """Why re-chunking would fail the checks made before parsing, or None.
 
     Used by the tuning options, so they offer re-chunking only when the job
-    would accept it. An invalid index or blob path raises ValueError.
+    would accept it. Nothing to rebuild is reported first, as the start refuses
+    it before the others (#328). An invalid index or blob path raises ValueError.
     """
     documents = sources.load_index(collection)["documents"]
     if not documents:
-        return False
+        return RECHUNK_NOT_COVERED
+    uncovered, stored = _source_coverage(collection, documents)
+    if not stored & _listed_names(documents):
+        return RECHUNK_NOTHING_TO_REBUILD
     for digest in documents:
         if not sources.blob_path(collection, digest).is_file():
-            return False
-    return not _uncovered_source_files(collection, documents)
+            return RECHUNK_NOT_COVERED
+    return RECHUNK_NOT_COVERED if uncovered else None
 
 
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
@@ -196,8 +243,11 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     # rebuilt (#311): an index can list a name the collection never showed (a
     # file that produced no chunks, or an imported package listing one blob
     # under many names), and rebuilding it would cost a parse and an embedding
-    # each time.
+    # each time. With no listed name stored there is nothing to rebuild, which
+    # is refused as such rather than as a chunking problem (#328).
     uncovered, stored = _source_coverage(collection, documents)
+    if not stored & _listed_names(documents):
+        raise _nothing_to_rebuild(collection)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
@@ -478,6 +528,10 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guards; the store removes the record.
     try:
+        # A re-chunk with nothing to rebuild is refused here, before any job
+        # exists (#328); the walk runs off the event loop too.
+        if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
+            await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
         await _jobs.create(job_id, {
             "job_id": job_id,
             "status": "queued",

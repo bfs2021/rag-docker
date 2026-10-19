@@ -339,7 +339,11 @@ version; a removal failure keeps the new chunks and reports `partial`; a deleted
 reported at the first lookup (#40). Also the delete rounds, precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
-while a missing blob is still refused (#311). Weaviate and sessions are mocked.
+while a missing blob is still refused (#311), also for one blob under 50 names with one
+stored and a digest with none (only the stored name is parsed). A collection whose retained
+names have no stored chunks is refused as having nothing to rebuild, before staging and, for
+a rechunk or a re-embed with chunking parameters, before any job is created, with the route
+answering 409 (#328). Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts

@@ -514,6 +514,89 @@ class RechunkTests(unittest.TestCase):
         self.assertEqual((caught.exception.code, caught.exception.detail.get("digest")),
                          ("SOURCES_REQUIRED", digest))
 
+    def test_one_blob_under_many_names_is_parsed_once_per_stored_name(self):
+        # #311 (reviewer): the crafted-package case. One blob listed under many
+        # names, and a second digest none of whose names has chunks: only the
+        # stored name is parsed, and the chunk-less digest is never staged.
+        for i in range(50):
+            sources.store("Coll", f"n{i:02}.txt", b"one blob", replace=True)
+        sources.store("Coll", "orphan.txt", b"other blob", replace=True)
+        real_parse = tuning._parse_file
+        parsed = []
+
+        def parse(path):
+            parsed.append(Path(path).name)
+            return real_parse(path)
+
+        with self.stored(("n07.txt", 0)), patch.object(tuning, "_parse_file", parse):
+            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual(parsed, ["n07.txt"])
+        self.assertEqual([(c["source_file"], c["content"]) for c in chunks],
+                         [("n07.txt", "one blob")])
+        filenames = [n for e in sources.load_index("Coll")["documents"].values() for n in e["filenames"]]
+        self.assertEqual(len(filenames), 51)
+
+    NOTHING_TO_REBUILD = ("Cannot re-chunk 'Coll': no retained original file has stored "
+                          "chunks, so there is nothing to rebuild.")
+
+    def test_nothing_to_rebuild_is_refused_before_staging(self):
+        # #328: every retained file produced no chunks at ingest. That is
+        # refused as such, not blamed on the chunking parameters.
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+        sources.store("Coll", "blank.txt", b"two", replace=True)
+        copies = []
+        with self.stored(), patch.object(tuning.shutil, "copyfile", lambda s, d, *a, **k: copies.append(d)), \
+                self.assertRaises(tuning.PackageError) as caught:
+            tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual((caught.exception.code, caught.exception.message, caught.exception.detail),
+                         ("SOURCES_REQUIRED", self.NOTHING_TO_REBUILD, {"collection": "Coll"}))
+        self.assertEqual(copies, [])
+
+    def test_a_start_with_nothing_to_rebuild_is_refused_without_a_job(self):
+        # #328: the re-chunk start, and a re-embed with chunking parameters,
+        # refuse before any job record exists and release their guards.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0,
+                    "similarity_threshold": 0.85, "min_chunk_size": 0}
+        before = set(tuning._jobs)
+        with self.stored(("other.txt", 0)):
+            for operation in ("rechunk", "reembed"):
+                with self.subTest(operation=operation), self.assertRaises(tuning.PackageError) as caught:
+                    asyncio.run(tuning.start_tune_job("Coll", operation, {"chunking": chunking}))
+                self.assertEqual((caught.exception.code, caught.exception.message),
+                                 ("SOURCES_REQUIRED", self.NOTHING_TO_REBUILD))
+                self.assertEqual(set(tuning._jobs), before)
+                self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+            with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)):
+                response = asyncio.run(tuning_router.rechunk(RechunkRequest(collection="Coll")))
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCES_REQUIRED")
+            self.assertEqual(set(tuning._jobs), before)
+
+            # Re-embedding the stored chunk text has nothing to rebuild from
+            # the originals, so it still starts.
+            def run(job_id, collection, *args, **kwargs):
+                collection_writes.end_job("tune", job_id)
+                with tuning._lock:
+                    tuning._active.discard(collection)
+
+            async def start():
+                job_id = await tuning.start_tune_job("Coll", "reembed", {"chunking": None})
+                for _ in range(200):
+                    if not tuning._active:
+                        break
+                    await asyncio.sleep(0.01)
+                return job_id
+
+            with patch.object(tuning, "_run", run):
+                job_id = asyncio.run(start())
+        self.assertIn(job_id, set(tuning._jobs) - before)
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
 
 class SchemaTests(unittest.TestCase):
     def test_a_record_written_before_the_field_reads_as_zero(self):
