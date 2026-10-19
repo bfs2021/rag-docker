@@ -429,7 +429,9 @@ or session behind. Generation checks before its one-second guard wait (§3.1.5);
 starts during that wait and outlasts it still gives `409 COLLECTION_BUSY`. An import learns its
 target only after opening the package, so an import whose target is being deleted ends
 `failed` with `error_code` `COLLECTION_DELETING`, that message and `error_detail`
-`{"collection": "<target>"}`. After the delete, admission behaves as before (usually
+`{"collection": "<target>"}`. With `on_conflict` `abort` this is checked before the name
+collision, so a target the delete has not removed yet ends this way too, not with
+`COLLECTION_EXISTS` (#324). After the delete, admission behaves as before (usually
 `404 COLLECTION_NOT_FOUND`). Deletions an import-replace or a tune makes of its own target are
 not subject to these checks.
 
@@ -615,7 +617,8 @@ not ready" retry sends them again; `chunks_accepted` counts those Weaviate ackno
 a per-chunk error, including ones removed again because the check failed. Both come from a
 file's final attempt; a file that fails before its insert (parsing, chunking) adds to none, and
 one whose batch could not be sent adds what was handed to the batch to `chunks_submitted` and
-nothing to `chunks_accepted`. A clean job has all three equal. Job records written before
+nothing to `chunks_accepted`. A clean job has all three equal, while it runs too: a file's
+three counts change in one update (#324). Job records written before
 these two fields existed read back with both `null`, not `0`, which would be untrue (#302).
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
@@ -2274,11 +2277,11 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] `DELETE /collections/{name}` without `?confirm=true` (case-insensitive) answers `400 CONFIRMATION_REQUIRED` before the collection is looked up and deletes nothing; the UI, the MCP tool and the verify scripts send it (#302).
       *`test_delete_busy.py` sends no value, `false`, `1`, `yes`, an empty value and `truee` (400, no lookup, nothing deleted), a missing collection without it (400, not 404) and `TRUE`/`True` (200). `02_ingest.sh` repeats the 400 cases and a `confirm=TRUE` delete on the live verify stack, and `test_mcp_delete.py` checks the MCP tool sends `confirm=true` with `name` still its only input.*
 - [x] While a delete of a collection is in progress, a new ingest, export, tune or generation job for it answers `409 COLLECTION_DELETING` and leaves nothing behind, and an import of it ends `failed` with that code; a delete still waiting for the writer guard keeps #40's ordering (#302).
-      *`test_delete_busy.py` holds a real `DELETE` inside its backend delete and drives each route and the import worker against it, under both spellings, and checks generation answers without its one-second wait. `ui_criteria.js` checks the Import page shows the message for an upload refused this way.*
+      *`test_delete_busy.py` holds a real `DELETE` inside its backend delete and drives each route and the import worker against it, under both spellings, and checks generation answers without its one-second wait. `ui_criteria.js` checks the Import page shows the message for an upload refused this way. An `abort` import whose target is still present also ends `COLLECTION_DELETING` (#324).*
 - [x] A gold-standard start cancelled while its session is being prepared ends its registration and leaves the session `cancelled`, so the collection can be deleted (#302).
-      *`test_delete_busy.py` cancels a start while sampling is held, then checks the registration, the session's status, a `200` delete, and that a settle that fails is reported as a failed generation.*
+      *`test_delete_busy.py` cancels a start while sampling is held, then checks the registration, the session's status, a `200` delete, and that a settle that fails is reported as a failed generation. A cancelled start whose preparation fails settles nothing (#324).*
 - [x] Ingest jobs report `chunks_submitted` and `chunks_accepted` beside `chunks_stored`, counted once per file from its final attempt; older records read them back as `null`; the Import page shows the three only when they differ (#302).
-      *`test_write_counts.py` covers the writer's counts for a clean insert, rejected objects, a failed check, a send failure and a cleanup failure, a retried file, job totals over stored, rejected, unparsed and deleted-collection files, and an older record through the route. `02_ingest.sh` checks a clean live job's three counts agree; `ui_criteria.js` checks the panel line for differing, equal and missing counts.*
+      *`test_write_counts.py` covers the writer's counts for a clean insert, rejected objects, a failed check, a send failure and a cleanup failure, a retried file, job totals over stored, rejected, unparsed and deleted-collection files, and an older record through the route. `02_ingest.sh` checks a clean live job's three counts agree; `ui_criteria.js` checks the panel line for differing, equal and missing counts. `test_write_counts.py` also checks a clean job's counts agree after each file's insert, and `test_mcp_delete.py` that `rag_ingest_status` passes the counts through, `null` included (#324).*
 - [x] An insert never creates a collection: an insert into a deleted collection fails and the collection stays absent (#40).
       *Weaviate's auto-schema recreated the class with inferred properties, no
       vectorizer and no vector index, which the app listed with `index_type: unknown`

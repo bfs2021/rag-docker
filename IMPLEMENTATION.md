@@ -3728,11 +3728,15 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
-def _count_writes(job: dict, submitted: int, accepted: int) -> None:
-    """Add a file's insert to the job's sent and acknowledged counts (#302).
-    Records made before the counters existed start them at 0."""
-    job["chunks_submitted"] = (job.get("chunks_submitted") or 0) + submitted
-    job["chunks_accepted"] = (job.get("chunks_accepted") or 0) + accepted
+def _count_writes(job: dict, submitted: int, accepted: int, stored: int = 0) -> None:
+    """Add a file's insert to the job's sent, acknowledged and stored counts (#302).
+    Records made before the first two existed start them at 0. The counts change
+    in one update, so a status read never sees part of a file's counts (#324)."""
+    job.update({
+        "chunks_submitted": (job.get("chunks_submitted") or 0) + submitted,
+        "chunks_accepted": (job.get("chunks_accepted") or 0) + accepted,
+        "chunks_stored": job["chunks_stored"] + stored,
+    })
 
 
 def _has_chunks(collection: str, name: str) -> bool:
@@ -3878,7 +3882,9 @@ def _process_job_sync(
                 except Exception as exc:
                     _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
                     raise
-                _count_writes(job, len(chunks), len(chunks))
+                # Stored counts here too, with the other two: counted later, a clean
+                # job would show its counts apart until then (#324).
+                _count_writes(job, len(chunks), len(chunks), len(chunks))
                 removed, problem = 0, None
                 if replacing:
                     removed, problem = _remove_earlier(collection, name, created, len(chunks))
@@ -3905,7 +3911,6 @@ def _process_job_sync(
                     # Names are logged with %r: one can hold a newline (#298).
                     _log.error("Could not retain source %r for %r: %s", name, collection, exc)
 
-                job["chunks_stored"] += len(chunks)
                 if problem is None:
                     job["files_completed"] += 1
                 else:
@@ -7521,6 +7526,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            # Before the existence check: a target the delete hasn't removed yet
+            # would otherwise answer COLLECTION_EXISTS (#324).
+            if on_conflict == "abort" and collection_writes.delete_in_progress(target):
+                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
+                                   {"collection": target})
             exists = wc._collection_exists_sync(target)                 # check 5
             if exists and on_conflict == "abort":
                 raise PackageError(
@@ -12799,16 +12809,19 @@ insert into a deleted collection fails without recreating it (auto-schema is off
 answers `400 CONFIRMATION_REQUIRED` before the collection is looked up. A `DELETE` held inside
 its backend delete refuses new jobs: the ingest, export, tune and generate routes answer
 `409 COLLECTION_DELETING` and leave nothing behind, generation without its one-second guard
-wait, and an import of the collection ends `failed` with that code; a delete still waiting
-for another writer is not in progress, and one that waits behind a writer with no job deletes
-once it lets go. A gold-standard start cancelled mid-preparation ends its registration and
-leaves its session `cancelled`. Import-replace's own delete runs through `importer._run`.
-`scripts/tests/test_write_counts.py` (#302, API container) checks `chunks_submitted` and
-`chunks_accepted`: the writer's counts on each kind of failure, a retried file counted once,
-job totals, and `null` on an older record. `scripts/tests/test_mcp_delete.py` runs on the host
-with the MCP SDK stubbed and checks `rag_delete_collection` sends `confirm=true` with `name`
-still its only input. `02_ingest.sh` runs all three, then checks on the live verify stack the
-`400` cases, a `confirm=TRUE` delete, and that a clean job's three counts agree.
+wait, and an import of the collection ends `failed` with that code, with `abort` even before the
+backend collection is gone; a delete still waiting for another writer is not in progress, and
+one that waits behind a writer with no job deletes once it lets go. A gold-standard start
+cancelled mid-preparation ends its registration and leaves its session `cancelled`, and one
+whose preparation fails settles nothing. Import-replace's own delete runs through
+`importer._run`. `scripts/tests/test_write_counts.py` (#302, API container) checks
+`chunks_submitted` and `chunks_accepted`: the writer's counts on each kind of failure, a
+retried file counted once, job totals, a clean job's counts equal after each file's insert, and
+`null` on an older record. `scripts/tests/test_mcp_delete.py` runs on the host with the MCP SDK
+stubbed and checks `rag_delete_collection` sends `confirm=true` with `name` still its only
+input, and that `rag_ingest_status` passes the write counts through unchanged. `02_ingest.sh`
+runs all three, then checks on the live verify stack the `400` cases, a `confirm=TRUE` delete,
+and that a clean job's three counts agree.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's
 "Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
 answered `409 COLLECTION_DELETING` to check its message is shown.

@@ -726,6 +726,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            # Before the existence check: a target the delete hasn't removed yet
+            # would otherwise answer COLLECTION_EXISTS (#324).
+            if on_conflict == "abort" and collection_writes.delete_in_progress(target):
+                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
+                                   {"collection": target})
             exists = wc._collection_exists_sync(target)                 # check 5
             if exists and on_conflict == "abort":
                 raise PackageError(
