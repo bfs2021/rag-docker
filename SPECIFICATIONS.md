@@ -1409,6 +1409,9 @@ ingest default.
   they list has stored chunks (every file produced no chunks at ingest), so there
   is nothing to rebuild (#328). No job is created. The other `SOURCES_REQUIRED`
   refusals below still come through the job.
+- **503 `SERVICE_UNAVAILABLE`** from those same requests when Weaviate can't be
+  read for that check (#340). No job is created; try again when Weaviate is
+  available. The cause is logged, not returned.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured. Re-chunking is also

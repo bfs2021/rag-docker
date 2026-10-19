@@ -35,6 +35,13 @@ async def _start(collection: str, operation: str, params: dict):
     except tuning.PackageError as exc:
         # Nothing to rebuild: refused before a job is created (#328).
         return api_error(409, exc.code, exc.message, detail=exc.detail)
+    except tuning.ServiceUnavailableError:
+        # Weaviate couldn't be read for that check; the cause is logged (#340).
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         f"Cannot check whether '{collection}' can be re-chunked: Weaviate "
+                         "could not be read. No job was started; try again when Weaviate "
+                         "is available.",
+                         detail={"collection": collection})
     except RuntimeError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
                          f"'{exc}' is already being tuned.",

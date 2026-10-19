@@ -154,6 +154,10 @@ def _listed_names(documents: dict) -> set[str]:
     return {filename for entry in documents.values() for filename in entry["filenames"]}
 
 
+class ServiceUnavailableError(Exception):
+    """Weaviate couldn't be read for the up-front re-chunk check (#340)."""
+
+
 # A collection whose retained originals all lack stored chunks (every file
 # produced none at ingest) has nothing to rebuild, since a rebuild emits only
 # stored names (#311). It isn't offered re-chunking, and a request is refused
@@ -179,12 +183,21 @@ def _refuse_nothing_to_rebuild(collection: str) -> None:
     """The one re-chunk refusal made before a job is created (#328).
 
     The other refusals, and an invalid index, are still reported by the job.
+    A Weaviate failure during the walk raises ServiceUnavailableError, which
+    the router answers with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
     except ValueError:
         return
-    if documents and not _has_stored_listed_name(collection, documents):
+    if not documents:
+        return
+    try:
+        stored = _has_stored_listed_name(collection, documents)
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Could not read %r for the re-chunk check", collection)
+        raise ServiceUnavailableError(collection) from exc
+    if not stored:
         raise _nothing_to_rebuild(collection)
 
 
