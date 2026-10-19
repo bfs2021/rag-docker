@@ -160,6 +160,8 @@ MAX_JSON_INPUT_BYTES = 30_000_000
 # under 8 characters a record; any other passes the text bound first.
 # It also bounds a JSON Lines file's lines (#314): every line counts, blank ones
 # and records with no text included, since those spend none of the text bound.
+# An element-schema file's items count too (#321): partition_json builds each
+# into an element, whatever its text.
 MAX_JSON_RECORDS = 1_000_000
 
 
@@ -321,6 +323,10 @@ def _parse_json(path: Path) -> tuple[str, list[Any]]:
         return "", []
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
+        # Each item becomes one element, so the record cap applies to the items,
+        # counted before any element is built (#321).
+        if len(value) > MAX_JSON_RECORDS:
+            raise _JsonTooManyRecords()
         from unstructured.partition.json import partition_json
         # partition_json parses the text again: drop the first parse first, so
         # the two are not held together (#300).
