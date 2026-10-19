@@ -300,6 +300,29 @@ class JsonFileTests(unittest.TestCase):
                                                 "the most one file can hold; split the file")
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["doc.json.gz"])
 
+    def test_element_schema_record_cap_at_and_past_the_edge(self):
+        # #321: an element file's items count, before partition_json builds any.
+        from unstructured.partition import json as partition_json_module
+        items = [{"type": "NarrativeText", "text": f"t{i}"} for i in range(4)]
+        with patch.object(ingest_pipeline, "MAX_JSON_RECORDS", 3), \
+                patch.object(partition_json_module, "partition_json",
+                             wraps=partition_json_module.partition_json) as partition:
+            text, elements = self.parse(json.dumps(items[:3]))
+            self.assertEqual((len(elements), text), (3, "t0\nt1\nt2"))
+            self.assertEqual(partition.call_count, 1)
+            with self.assertRaises(ValueError) as caught:
+                self.parse(json.dumps(items))
+            self.assertEqual(str(caught.exception),
+                             "has more than 3 records, the most one file can hold; split the file")
+            for path in self.dir.iterdir():
+                path.unlink()
+            with self.assertRaises(ValueError) as caught:
+                self.parse(gzip.compress(json.dumps(items).encode()), "doc.json.gz")
+            self.assertEqual(str(caught.exception), "was decompressed, but it has more than 3 records, "
+                                                    "the most one file can hold; split the file")
+            self.assertEqual(partition.call_count, 1)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["doc.json.gz"])
+
     def test_input_size_limit(self):
         self.assertEqual(ingest_pipeline.MAX_JSON_INPUT_BYTES, LIMIT_BYTES)
         self.assertEqual(self.parse(padded('{"k": "v"}', LIMIT_BYTES))[0], "k: v")
@@ -438,6 +461,16 @@ class JsonJobTests(unittest.TestCase):
             "big.json: is larger than 100 bytes, the most one JSON file can hold; "
             "split the file or convert it to JSON Lines",
             "many.json: has more than 2 records, the most one file can hold; split the file"])
+        self.assertEqual([c["content"] for c in stored], ["a: 1"])
+
+    def test_over_cap_element_schema_file_stores_nothing(self):
+        items = [{"type": "NarrativeText", "text": t} for t in ("x", "y", "z")]
+        with patch.object(ingest_pipeline, "MAX_JSON_RECORDS", 2):
+            job, stored = self.run_job([("elements.json", json.dumps(items).encode()),
+                                        ("good.json", b'{"a": 1}')], "fixed")
+        self.assertEqual(job["status"], "partial")
+        self.assertEqual(job["errors"], [
+            "elements.json: has more than 2 records, the most one file can hold; split the file"])
         self.assertEqual([c["content"] for c in stored], ["a: 1"])
 
     def test_invalid_json_fails_only_that_file(self):

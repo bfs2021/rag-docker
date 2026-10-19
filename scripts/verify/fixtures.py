@@ -215,6 +215,9 @@ def write(target: pathlib.Path) -> None:
     (target / "json_many_records.json").write_text("[" + ",".join(["[1]"] * 1_000_001) + "]")
     with zipfile.ZipFile(target / "json_over_size_gz.zip", "w", zipfile.ZIP_STORED) as z:
         z.writestr("big.json.gz", gzip.compress(over, mtime=0))
+    # Reviewer test (#300): the input limit applies to a plain .json ZIP member.
+    with zipfile.ZipFile(target / "json_over_size_member.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("big.json", over)
 
 
 if __name__ == "__main__":

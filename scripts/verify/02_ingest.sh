@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/jsonl_many_records.jsonl.gz" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/json_over_size_member.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -193,7 +193,7 @@ check "its chunks hold key: value text with non-ASCII kept" $?
 # alone with its own reason, and the good file beside them is stored.
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 1000 0 "$FIX/json_over_size.json" "$FIX/json_many_records.json" \
-  "$FIX/json_over_size_gz.zip" "$FIX/plain.json"
+  "$FIX/json_over_size_gz.zip" "$FIX/json_over_size_member.zip" "$FIX/plain.json"
 read -r status chunks errors_ok <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_job.json'))
 want = {
@@ -203,13 +203,15 @@ want = {
     'split the file',
     'json_over_size_gz.zip:big.json.gz: decompresses to more than 30,000,000 bytes, the most '
     'one JSON file can hold; split the file or convert it to JSON Lines',
+    'json_over_size_member.zip:big.json: is larger than 30,000,000 bytes, the most one JSON '
+    'file can hold; split the file or convert it to JSON Lines',
 }
-ok = len(d['errors']) == 3 and set(d['errors']) == want
+ok = len(d['errors']) == 4 and set(d['errors']) == want
 if not ok:
     import sys; print(repr(d['errors']), file=sys.stderr)
 print(d['status'], d['chunks_stored'], 'yes' if ok else 'no')")"
 [ "$status" = partial ] && [ "$chunks" -gt 0 ] && [ "$errors_ok" = yes ]
-check "over-size, over-cap and over-size .json.gz JSON fail alone with their reasons" $? \
+check "over-size, over-cap, over-size .json.gz and over-size ZIP-member JSON fail alone with their reasons" $? \
   "status=$status chunks=$chunks exact-errors=$errors_ok"
 
 # ── JSON Lines (#291) ────────────────────────────────────────────────────────
