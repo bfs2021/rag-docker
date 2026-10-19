@@ -253,7 +253,9 @@ text limit are checked at and one past their edges, and a file far over the limi
 being read at the line that passes it, with a small traced peak. The line limit counts neither
 the line ending nor line 1's byte-order mark (#314): it is checked at and one past its edge
 with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
-errors as an LF one. The 1,000,000-line cap (#314) is checked at and one past its edge, with
+errors as an LF one. Lines 1 to 5 bytes over the limit, at the edge of the read window, fail
+on their own line with `\n`, `\r\n` or no ending, with and without the mark. The
+1,000,000-line cap (#314) is checked at and one past its edge, with
 blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
 same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
 errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job

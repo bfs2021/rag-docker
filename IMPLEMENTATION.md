@@ -3344,12 +3344,17 @@ def _json_input_too_large(verb: str) -> str:
             f"split the file or convert it to JSON Lines")
 
 
+def _too_many_records() -> str:
+    # One message for the JSON record cap and the JSON Lines line cap (#330).
+    return (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+            f"split the file")
+
+
 class _JsonTooManyRecords(_JsonError):
     """Valid JSON with more kept records than one file may hold (#300)."""
 
     def __init__(self) -> None:
-        detail = (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
-                  f"split the file")
+        detail = _too_many_records()
         ValueError.__init__(self, detail)
         self.detail = detail
 
@@ -3588,8 +3593,7 @@ def _jsonl_records(stream: Any) -> list[str]:
         number += 1
         if number > MAX_JSON_RECORDS:
             # Every line counts, so lines with no text can't run on to the gzip bound.
-            raise _JsonlTooLarge(f"has more than {MAX_JSON_RECORDS:,} records, the most one "
-                                 f"file can hold; split the file")
+            raise _JsonlTooLarge(_too_many_records())
         if raw.endswith(b"\r\n"):
             raw = raw[:-2]
         elif raw.endswith(b"\n"):
@@ -12862,7 +12866,9 @@ text limit are checked at and one past their edges, and a file far over the limi
 being read at the line that passes it, with a small traced peak. The line limit counts neither
 the line ending nor line 1's byte-order mark (#314): it is checked at and one past its edge
 with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
-errors as an LF one. The 1,000,000-line cap (#314) is checked at and one past its edge, with
+errors as an LF one. Lines 1 to 5 bytes over the limit, at the edge of the read window, fail
+on their own line with `\n`, `\r\n` or no ending, with and without the mark. The
+1,000,000-line cap (#314) is checked at and one past its edge, with
 blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
 same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
 errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job

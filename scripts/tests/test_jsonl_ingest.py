@@ -208,6 +208,18 @@ class LineErrorTests(JsonlTestCase):
         self.assert_fails(self.exact_line() + "\r", f"line 1 {LINE_LIMIT}")
         self.assert_fails('{"a": 1}\n' + self.exact_line() + "\r", f"line 2 {LINE_LIMIT}")
 
+    def test_lines_at_the_edge_of_the_read_window_fail(self):
+        # Added by the PR #329 testing review. The read takes the limit plus 5
+        # bytes (BOM and CRLF room): lines 1 to 5 bytes over the limit, whose
+        # CRLF is read whole, split or cut off, all fail on their own line.
+        for over in range(1, 6):
+            for ending in ("\n", "\r\n", ""):
+                with self.subTest(over=over, ending=repr(ending)):
+                    self.assert_fails('{"a": 1}\r\n' + self.exact_line(over) + ending,
+                                      f"line 2 {LINE_LIMIT}")
+                    self.assert_fails("﻿" + self.exact_line(over) + ending,
+                                      f"line 1 {LINE_LIMIT}")
+
     def test_crlf_and_lf_give_the_same_error(self):
         for ending in ("\n", "\r\n"):
             with self.subTest(ending=ending):

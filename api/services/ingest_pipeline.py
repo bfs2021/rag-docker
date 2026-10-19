@@ -170,12 +170,17 @@ def _json_input_too_large(verb: str) -> str:
             f"split the file or convert it to JSON Lines")
 
 
+def _too_many_records() -> str:
+    # One message for the JSON record cap and the JSON Lines line cap (#330).
+    return (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+            f"split the file")
+
+
 class _JsonTooManyRecords(_JsonError):
     """Valid JSON with more kept records than one file may hold (#300)."""
 
     def __init__(self) -> None:
-        detail = (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
-                  f"split the file")
+        detail = _too_many_records()
         ValueError.__init__(self, detail)
         self.detail = detail
 
@@ -414,8 +419,7 @@ def _jsonl_records(stream: Any) -> list[str]:
         number += 1
         if number > MAX_JSON_RECORDS:
             # Every line counts, so lines with no text can't run on to the gzip bound.
-            raise _JsonlTooLarge(f"has more than {MAX_JSON_RECORDS:,} records, the most one "
-                                 f"file can hold; split the file")
+            raise _JsonlTooLarge(_too_many_records())
         if raw.endswith(b"\r\n"):
             raw = raw[:-2]
         elif raw.endswith(b"\n"):
