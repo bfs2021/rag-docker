@@ -233,18 +233,19 @@ fast with bounded memory), and readable errors for invalid JSON in `.json` files
 blank lines between records charged to the text limit (exactly at the limit, and one dropped
 record refunded), the 1,000,000-record cap (records with no text not counted; a file of
 1,000,001 tiny records fails fast with a bounded peak and builds no elements; an
-element-schema file's items counted too, before `partition_json` runs, #321), the
-30,000,000-byte input limit at and one past the edge (element-schema files and a byte-order
-mark included), a `.json.gz` member that stops decompressing at that limit, the exact messages,
-a job where over-limit files fail alone, the traced peak of deep long keys and of an over-long
-scalar array, and that an element-schema file's first parse is freed before `partition_json`
-runs. `02_ingest.sh` runs it in the API
-container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
-back to confirm they hold that text. It then uploads `json_over_size.json` (30,000,001 bytes),
-`json_many_records.json` (1,000,001 records), `json_over_size_gz.zip` (a `.json.gz` member one
-byte over the limit when decompressed), `json_over_size_member.zip` (a `.json` member one byte
-over the limit) and `plain.json` together, and checks that the job is
-`partial`, each over-limit file fails with its exact message, and `plain.json` is stored.
+element-schema file's items counted too, items with no text included, before `partition_json`
+runs, and the cap applied at and one past the edge when a retained element file is rechunked,
+#321), the 30,000,000-byte input limit at and one past the edge (element-schema files and a
+byte-order mark included), a `.json.gz` member that stops decompressing at that limit, the
+exact messages, a job where over-limit files fail alone, the traced peak of deep long keys and
+of an over-long scalar array, and that an element-schema file's first parse is freed before
+`partition_json` runs. `02_ingest.sh` runs it in the API container, then ingests a nested
+`plain.json` through the proxy and reads its stored chunks back to confirm they hold that text.
+It then uploads `json_over_size.json` (30,000,001 bytes), `json_many_records.json` (1,000,001
+records), `json_over_size_gz.zip` (a `.json.gz` member one byte over the limit when
+decompressed), `json_over_size_member.zip` (a `.json` member one byte over the limit) and
+`plain.json` together, and checks that the job is `partial`, each over-limit file fails with
+its exact message, and `plain.json` is stored.
 
 `scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
 becomes one `key: value` record per line, separated by blank lines, with one element per
