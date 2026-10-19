@@ -638,7 +638,8 @@ class DeletingTests(BusyTestCase):
         store.assert_not_called(); sample.assert_not_called()
         self.assertEqual(writes.active_jobs("OwnedBusy"), [])
 
-    def test_import_whose_target_is_being_deleted_fails_with_the_code(self):
+    def run_import_during_delete(self, gone_first):
+        """An `abort` import run while a DELETE is held; returns the job and the build mock."""
         pkg = self.root / "pkg"; pkg.mkdir(); (pkg / "manifest.json").write_text("{}")
         manifest = {"collection": {"name": "OwnedBusy", "chunk_count": 1}, "fidelity": "chunks-only"}
         with patch.object(importer.packager, "exports_dir", return_value=self.root), \
@@ -652,14 +653,24 @@ class DeletingTests(BusyTestCase):
                 await asyncio.to_thread(wait_until, lambda: importer.get_job(job_id)["status"]
                                         in ("completed", "failed"))
                 return job_id
-            with self.deleting(gone_first=True):
+            with self.deleting(gone_first=gone_first):
                 job_id = asyncio.run(run())
-        job = importer.get_job(job_id)
+        return importer.get_job(job_id), build
+
+    def assert_import_refused(self, job, build):
         self.assertEqual((job["status"], job["error_code"], job["error"], job["error_detail"]),
                          ("failed", "COLLECTION_DELETING", DELETING.format("OwnedBusy"),
                           {"collection": "OwnedBusy"}), job)
         build.assert_not_called()
         self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+    def test_import_whose_target_is_being_deleted_fails_with_the_code(self):
+        self.assert_import_refused(*self.run_import_during_delete(gone_first=True))
+
+    def test_an_abort_import_whose_target_is_still_present_fails_with_the_code(self):
+        # The delete hasn't removed the backend collection yet: still DELETING,
+        # not COLLECTION_EXISTS (#324).
+        self.assert_import_refused(*self.run_import_during_delete(gone_first=False))
 
 
 class GenerationCancelTests(BusyTestCase):
@@ -704,6 +715,30 @@ class GenerationCancelTests(BusyTestCase):
         session, report = self.run_cancelled_start()
         self.assertEqual(session["status"], "cancelled")
         report.assert_not_awaited()
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+        self.assertEqual(self.delete().status_code, 200)
+
+    def test_a_cancelled_start_whose_preparation_fails_settles_nothing(self):
+        # Reviewer's case: the preparation raises after the caller is cancelled,
+        # so no session was published or registered and nothing is settled.
+        sampling = threading.Event(); gate = threading.Event()
+        def sample(collection, limit, seed):
+            sampling.set(); assert gate.wait(5)
+            raise wc.CollectionNotFoundError(collection)
+        async def run():
+            task = asyncio.create_task(goldstandard.start_generation("OwnedBusy", 1, None))
+            await asyncio.to_thread(sampling.wait, 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            gate.set()
+            await asyncio.sleep(0.3)               # the thread ends and its callback runs
+        with patch.object(wc, "_sample_chunks_sync", side_effect=sample), \
+             patch.object(goldstandard, "_store_generated_session") as store, \
+             patch.object(goldstandard, "_settle_generation") as settle:
+            asyncio.run(run())
+        store.assert_not_called(); settle.assert_not_called()
+        self.assertEqual(goldstandard._tasks, set())
         self.assertEqual(writes.active_jobs("OwnedBusy"), [])
         self.assertEqual(self.delete().status_code, 200)
 

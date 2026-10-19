@@ -165,8 +165,9 @@ class RetryCountTests(TempUploadDir):
 
 
 class JobCountTests(TempUploadDir):
-    def run_job(self, outcomes):
-        """outcomes: per file, None (stored), an exception to raise, or "parse"."""
+    def run_job(self, outcomes, seen=None):
+        """outcomes: per file, None (stored), an exception to raise, or "parse".
+        seen, when given, gets the job's counts as each file's source is retained."""
         paths = []
         for i in range(len(outcomes)):
             path = self.root / f"f{i}.txt"; path.write_text(f"file {i}"); paths.append(path)
@@ -185,12 +186,15 @@ class JobCountTests(TempUploadDir):
             outcome = by_name[stored[0]["source_file"]]
             if isinstance(outcome, BaseException):
                 raise outcome
+        def retain(*args, **kwargs):
+            if seen is not None:
+                seen.append(self.counts(ingest_pipeline._jobs[job_id]))
         with patch.object(ingest_pipeline, "_parse_file", side_effect=parse), \
              patch.object(ingest_pipeline, "do_chunk", side_effect=lambda text, **_: [text, text + "!"]), \
              patch.object(wc, "_insert_chunks_sync", side_effect=insert), \
              patch.object(wc, "_source_has_chunks_sync", return_value=False), \
              patch.object(wc, "_collection_exists_sync", return_value=True), \
-             patch.object(ingest_pipeline.sources, "store"):
+             patch.object(ingest_pipeline.sources, "store", side_effect=retain):
             ingest_pipeline._process_job_sync(job_id, paths, self.root, "Owned",
                                               "fixed", 300, 0, 0.85, 0)
         return ingest_pipeline._jobs[job_id]
@@ -200,6 +204,13 @@ class JobCountTests(TempUploadDir):
 
     def test_a_clean_job_has_three_equal_counts(self):
         self.assertEqual(self.counts(self.run_job([None, None])), (4, 4, 4))
+
+    def test_a_clean_job_never_shows_its_counts_apart(self):
+        # Observed between each file's insert and the end of its processing,
+        # where a poll could see stored lag the other two (#324).
+        seen = []
+        self.run_job([None, None], seen)
+        self.assertEqual(seen, [(2, 2, 2), (4, 4, 4)])
 
     def test_failed_and_unparsed_files_count_what_was_sent(self):
         rejected = RuntimeError("Weaviate rejected 1 batch object(s)"); rejected.write_counts = (2, 1)

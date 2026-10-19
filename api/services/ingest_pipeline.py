@@ -554,11 +554,15 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
-def _count_writes(job: dict, submitted: int, accepted: int) -> None:
-    """Add a file's insert to the job's sent and acknowledged counts (#302).
-    Records made before the counters existed start them at 0."""
-    job["chunks_submitted"] = (job.get("chunks_submitted") or 0) + submitted
-    job["chunks_accepted"] = (job.get("chunks_accepted") or 0) + accepted
+def _count_writes(job: dict, submitted: int, accepted: int, stored: int = 0) -> None:
+    """Add a file's insert to the job's sent, acknowledged and stored counts (#302).
+    Records made before the first two existed start them at 0. The counts change
+    in one update, so a status read never sees part of a file's counts (#324)."""
+    job.update({
+        "chunks_submitted": (job.get("chunks_submitted") or 0) + submitted,
+        "chunks_accepted": (job.get("chunks_accepted") or 0) + accepted,
+        "chunks_stored": job["chunks_stored"] + stored,
+    })
 
 
 def _has_chunks(collection: str, name: str) -> bool:
@@ -704,7 +708,9 @@ def _process_job_sync(
                 except Exception as exc:
                     _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
                     raise
-                _count_writes(job, len(chunks), len(chunks))
+                # Stored counts here too, with the other two: counted later, a clean
+                # job would show its counts apart until then (#324).
+                _count_writes(job, len(chunks), len(chunks), len(chunks))
                 removed, problem = 0, None
                 if replacing:
                     removed, problem = _remove_earlier(collection, name, created, len(chunks))
@@ -731,7 +737,6 @@ def _process_job_sync(
                     # Names are logged with %r: one can hold a newline (#298).
                     _log.error("Could not retain source %r for %r: %s", name, collection, exc)
 
-                job["chunks_stored"] += len(chunks)
                 if problem is None:
                     job["files_completed"] += 1
                 else:

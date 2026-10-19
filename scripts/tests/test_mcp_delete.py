@@ -34,8 +34,8 @@ class _Annotations:
         self.hints = hints
 
 
-def _load_tools(calls):
-    """Import mcp/tools/collections.py with everything it imports stubbed."""
+def _load_tools(calls, tool_file="collections.py", reply=None):
+    """Import a module of mcp/tools with everything it imports stubbed."""
     server = _Server()
     modules = {
         "mcp": types.ModuleType("mcp"),
@@ -45,6 +45,8 @@ def _load_tools(calls):
         "mcp.types": types.ModuleType("mcp.types"),
         "mcpapp": types.ModuleType("mcpapp"),
         "ragclient": types.ModuleType("ragclient"),
+        "config": types.ModuleType("config"),
+        "paths": types.ModuleType("paths"),
     }
     modules["mcp.server.mcpserver.exceptions"].ToolError = type("ToolError", (Exception,), {})
     modules["mcp.types"].ToolAnnotations = _Annotations
@@ -52,7 +54,7 @@ def _load_tools(calls):
 
     async def request(method, path, **kwargs):
         calls.append((method, path, kwargs))
-        return {"name": "Docs", "objects_deleted": 3}
+        return reply if reply is not None else {"name": "Docs", "objects_deleted": 3}
     for method in ("get", "post", "patch", "delete"):
         setattr(modules["ragclient"], method,
                 lambda path, _m=method.upper(), **kw: request(_m, path, **kw))
@@ -61,7 +63,7 @@ def _load_tools(calls):
     sys.path.insert(0, str(MCP_DIR))
     try:
         spec = importlib.util.spec_from_file_location(
-            "rag_mcp_tools_collections", MCP_DIR / "tools" / "collections.py")
+            "rag_mcp_tools_" + tool_file[:-3], MCP_DIR / "tools" / tool_file)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     finally:
@@ -89,6 +91,26 @@ class DeleteToolTests(unittest.TestCase):
         self.assertEqual(list(inspect.signature(self.tool["function"]).parameters), ["name"])
         self.assertTrue(self.tool["annotations"].hints["destructive_hint"])
         self.assertIn("cannot be undone", self.tool["description"])
+
+
+class IngestStatusTests(unittest.TestCase):
+    """MCP passes the ingest job's write counts through unchanged (#302)."""
+
+    def test_the_status_tool_returns_the_counts_as_the_api_sent_them(self):
+        calls = []
+        job = {"job_id": "j1", "status": "failed", "chunks_submitted": 10,
+               "chunks_accepted": 10, "chunks_stored": 0}
+        server, _ = _load_tools(calls, "ingest.py", reply=job)
+        result = asyncio.run(server.tools["rag_ingest_status"]["function"]("j1"))
+        self.assertEqual(calls, [("GET", "/ingest/job/j1", {})])
+        self.assertEqual(result, job)
+
+    def test_an_older_record_keeps_its_null_counts(self):
+        calls = []
+        job = {"job_id": "j0", "status": "completed", "chunks_submitted": None,
+               "chunks_accepted": None, "chunks_stored": 5}
+        server, _ = _load_tools(calls, "ingest.py", reply=job)
+        self.assertEqual(asyncio.run(server.tools["rag_ingest_status"]["function"]("j0")), job)
 
 
 if __name__ == "__main__":
