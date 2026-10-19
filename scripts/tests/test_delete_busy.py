@@ -672,6 +672,41 @@ class DeletingTests(BusyTestCase):
         # not COLLECTION_EXISTS (#324).
         self.assert_import_refused(*self.run_import_during_delete(gone_first=False))
 
+    def test_an_abort_import_whose_delete_starts_after_the_check_is_refused_at_registration(self):
+        # Reviewer's case: the delete begins between the new check and the
+        # registration, so the registration's own refusal must still answer (#324).
+        with patch.object(writes, "delete_in_progress", return_value=False) as check:
+            job, build = self.run_import_during_delete(gone_first=True)
+        check.assert_called_with("OwnedBusy")
+        self.assert_import_refused(job, build)
+
+    def test_a_rename_import_whose_target_is_being_deleted_imports_under_the_new_name(self):
+        # Reviewer's case: rename is unchanged by #324; the new name is not being deleted.
+        pkg = self.root / "pkg"; pkg.mkdir(); (pkg / "manifest.json").write_text("{}")
+        manifest = {"collection": {"name": "OwnedBusy", "chunk_count": 1}, "fidelity": "chunks-only"}
+        with patch.object(importer.packager, "exports_dir", return_value=self.root), \
+             patch.object(importer.packager, "open_package", return_value=(pkg, manifest)), \
+             patch.object(importer.packager, "verify_digests"), \
+             patch.object(importer, "_check_embedding"), \
+             patch.object(importer, "_ensure_models", return_value=[]), \
+             patch.object(importer, "_mark_started", return_value="instance"), \
+             patch.object(importer, "_mark_finished"), \
+             patch.object(importer, "_restore_sidecars", return_value=[]), \
+             patch.object(importer, "_build", return_value=1) as build:
+            async def run():
+                job_id = await importer.start_import_job("owned.tar.gz", "rename")
+                await asyncio.to_thread(wait_until, lambda: importer.get_job(job_id)["status"]
+                                        in ("completed", "failed"))
+                return job_id
+            with self.deleting(gone_first=False):
+                job_id = asyncio.run(run())
+        job = importer.get_job(job_id)
+        self.assertEqual(job["status"], "completed", job)
+        self.assertTrue(job["renamed"], job)
+        self.assertTrue(job["collection"].startswith("OwnedBusy_imported_"), job)
+        self.assertEqual(build.call_args.args[0], job["collection"])
+        self.assertEqual(writes.active_jobs(job["collection"]), [])
+
 
 class GenerationCancelTests(BusyTestCase):
     """A start cancelled while it is prepared releases the collection (#302)."""
