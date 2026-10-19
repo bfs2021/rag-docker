@@ -1194,6 +1194,10 @@ class SourceCoverageTests(unittest.TestCase):
                    "retained original is missing, so this collection cannot be "
                    "re-chunked. Re-embedding works from the stored chunk text, which "
                    "leaves chunk boundaries unchanged, and re-indexing is available.")
+        nothing_to_rebuild = ("No retained original file has stored chunks, so this collection "
+                              "cannot be re-chunked: there is nothing to rebuild. Re-embedding works "
+                              "from the stored chunk text, which leaves chunk boundaries unchanged, "
+                              "and re-indexing is available.")
         two_versions = self.DROP_CASES["a name with two retained versions"]
         repeated_set = self.DROP_CASES["re-upload whose retention failed"]
         cases = {
@@ -1206,6 +1210,12 @@ class SourceCoverageTests(unittest.TestCase):
             "a name with two retained versions": (two_versions[0], two_versions[1], False, refused, False),
             "repeated chunk set": (repeated_set[0], repeated_set[1], False, refused, False),
             "retained original missing from disk": ([("a.txt", b"v1")], [("a.txt", 0)], False, refused, True),
+            # #328: every retained file produced no chunks; the reason comes
+            # first, as the start refuses it before the others.
+            "retained originals with no stored chunks": ([("a.txt", b"v1")], [], False,
+                                                         nothing_to_rebuild, False),
+            "nothing to rebuild and a blob missing": ([("a.txt", b"v1")], [("b.txt", 0)], False,
+                                                      nothing_to_rebuild, True),
         }
         for case, (retained, chunks, can_rechunk, note, drop_blob) in cases.items():
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:

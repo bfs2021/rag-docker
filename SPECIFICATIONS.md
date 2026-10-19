@@ -1398,6 +1398,11 @@ ingest default.
 - **409 `TUNE_IN_PROGRESS`** if the collection is already being tuned.
 - **409 `COLLECTION_DELETING`** while a delete of the collection is in progress
   (§3.1.2; #302). No job is created.
+- **409 `SOURCES_REQUIRED`** from `/tune/rechunk`, and from `/tune/reembed` with
+  chunking fields, when the collection retains originals but none of the names
+  they list has stored chunks (every file produced no chunks at ingest), so there
+  is nothing to rebuild (#328). No job is created. The other `SOURCES_REQUIRED`
+  refusals below still come through the job.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured. Re-chunking is also
@@ -1426,9 +1431,11 @@ GET /tune/{collection}
 ```
 
 What this collection can be tuned with, given its fidelity. `can_rechunk` is
-`false` when re-chunking would be refused: the collection is `chunks-only`, a
-stored source file has no single retained original, or a retained original is
-missing from disk.
+`false` when re-chunking would be refused: the collection is `chunks-only`, no
+retained original has stored chunks (#328), a stored source file has no single
+retained original, or a retained original is missing from disk. `note` says
+which; when no retained original has stored chunks it says so, whatever else
+holds.
 
 **Response 200:**
 ```json
