@@ -6686,6 +6686,10 @@ _log = logging.getLogger(__name__)
 _jobs = jobstore.JobStore("export")
 # collection name -> job_id of the export currently running for it
 _active: dict[str, str] = {}
+# job_id -> a future done once that start has stored its record or released its
+# slot. A start that finds the slot taken by one of these waits for it, so a 409
+# never names a job that reads 404, or one that never comes to exist (#326).
+_starting: dict[str, asyncio.Future] = {}
 _lock = threading.Lock()
 
 
@@ -6744,49 +6748,65 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
     """Register the job and run the build off the event loop.
 
     Raises RuntimeError carrying the running job id if one is already in flight
-    for this collection.
+    for this collection; that job's record is always stored by then (#326).
     """
     job_id = str(uuid.uuid4())[:8]
-    with _lock:
-        running = _active.get(collection)
-        if running is not None:
+    while True:
+        with _lock:
+            running = _active.get(collection)
+            if running is None:
+                _active[collection] = job_id
+                started = _starting[job_id] = asyncio.get_running_loop().create_future()
+                break
+            starting = _starting.get(running)
+        if starting is None:
             raise RuntimeError(running)
-        _active[collection] = job_id
-    # Lets DELETE /collections refuse while this export reads the collection
-    # (#40). Before the job record, so a refusal during a delete leaves none (#302).
-    try:
-        collection_writes.register_job(collection, "export", job_id)
-    except collection_writes.CollectionDeletingError:
-        with _lock:
-            if _active.get(collection) == job_id:
-                del _active[collection]
-        raise
+        # That start hasn't stored its record yet: wait until it has, or has
+        # released the slot, then look again (#326). Holds nothing meanwhile.
+        await asyncio.wait({starting})
 
-    # The first write is durable, so it runs off the event loop (#309). A start
-    # cancelled meanwhile releases its guards; the store removes the record.
     try:
-        await _jobs.create(job_id, {
-            "job_id": job_id,
-            "status": "queued",
-            "collection": collection,
-            "chunks_written": 0,
-            "filename": None,
-            "size_bytes": None,
-            "source_document_count": None,
-            "fidelity": None,
-            "models_bundled": None,
-            "retrieve_script": None,
-            "warnings": [],
-            "error": None,
-            "error_code": None,
-            "error_detail": None,
-        })
-    except BaseException:
-        collection_writes.end_job("export", job_id)
+        # Lets DELETE /collections refuse while this export reads the collection
+        # (#40). Before the job record, so a refusal during a delete leaves none (#302).
+        try:
+            collection_writes.register_job(collection, "export", job_id)
+        except collection_writes.CollectionDeletingError:
+            with _lock:
+                if _active.get(collection) == job_id:
+                    del _active[collection]
+            raise
+
+        # The first write is durable, so it runs off the event loop (#309). A start
+        # cancelled meanwhile releases its guards; the store removes the record. A
+        # second start of this collection waits for this one (#326).
+        try:
+            await _jobs.create(job_id, {
+                "job_id": job_id,
+                "status": "queued",
+                "collection": collection,
+                "chunks_written": 0,
+                "filename": None,
+                "size_bytes": None,
+                "source_document_count": None,
+                "fidelity": None,
+                "models_bundled": None,
+                "retrieve_script": None,
+                "warnings": [],
+                "error": None,
+                "error_code": None,
+                "error_detail": None,
+            })
+        except BaseException:
+            collection_writes.end_job("export", job_id)
+            with _lock:
+                if _active.get(collection) == job_id:
+                    del _active[collection]
+            raise
+    finally:
         with _lock:
-            if _active.get(collection) == job_id:
-                del _active[collection]
-        raise
+            del _starting[job_id]
+        started.set_result(None)
+
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
     task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
@@ -12835,9 +12855,12 @@ marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the 
 `failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
 a real lifespan run marks a stored running export. While the API runs (#309), storing a
 record past the limit removes the finished records saved longest ago, from memory and disk,
-never a `queued` or `running` one; and each of the four job starts writes its first record
-from a worker thread, and when cancelled during that write releases its guards and leaves no
-record (or, for ingest, upload folder). `02_ingest.sh` runs it in the API container. With
+never a `queued` or `running` one, in the order of each record's own last write; and each of
+the four job starts writes its first record from a worker thread, and when cancelled during
+that write releases its guards and leaves no record (or, for ingest, upload folder), also when
+that abandoned write fails (logged). A second export of a collection started during the
+first one's write waits for it, then answers with the first job's id, which can be read, or,
+if the first start was cancelled, starts its own (#326). `02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
 completed job reads back unchanged, the one that stored a file reads `partial` and the one

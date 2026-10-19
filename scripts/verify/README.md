@@ -310,9 +310,12 @@ marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the 
 `failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
 a real lifespan run marks a stored running export. While the API runs (#309), storing a
 record past the limit removes the finished records saved longest ago, from memory and disk,
-never a `queued` or `running` one; and each of the four job starts writes its first record
-from a worker thread, and when cancelled during that write releases its guards and leaves no
-record (or, for ingest, upload folder). `02_ingest.sh` runs it in the API container. With
+never a `queued` or `running` one, in the order of each record's own last write; and each of
+the four job starts writes its first record from a worker thread, and when cancelled during
+that write releases its guards and leaves no record (or, for ingest, upload folder), also when
+that abandoned write fails (logged). A second export of a collection started during the
+first one's write waits for it, then answers with the first job's id, which can be read, or,
+if the first start was cancelled, starts its own (#326). `02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
 completed job reads back unchanged, the one that stored a file reads `partial` and the one
