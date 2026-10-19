@@ -6694,7 +6694,15 @@ _active: dict[str, str] = {}
 # slot. A start that finds the slot taken by one of these waits for it, so a 409
 # never names a job that reads 404, or one that never comes to exist (#326).
 _starting: dict[str, asyncio.Future] = {}
+# The longest a start waits for another start's record, in seconds. A stalled
+# write then gets EXPORT_STARTING instead of holding every later request (#338).
+START_WAIT = 30.0
 _lock = threading.Lock()
+
+
+class ExportStartingError(Exception):
+    """Another start of this collection hadn't stored its record within
+    START_WAIT, so there is no job to name yet (#338)."""
 
 
 def get_job(job_id: str) -> dict | None:
@@ -6753,8 +6761,10 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
 
     Raises RuntimeError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
+    Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
     job_id = str(uuid.uuid4())[:8]
+    deadline = None
     while True:
         with _lock:
             running = _active.get(collection)
@@ -6766,8 +6776,14 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         if starting is None:
             raise RuntimeError(running)
         # That start hasn't stored its record yet: wait until it has, or has
-        # released the slot, then look again (#326). Holds nothing meanwhile.
-        await asyncio.wait({starting})
+        # released the slot, then look again (#326). Holds nothing meanwhile, and
+        # gives up once START_WAIT has passed since the first wait (#338).
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + START_WAIT
+        done, _ = await asyncio.wait({starting}, timeout=max(0.0, deadline - loop.time()))
+        if not done:
+            raise ExportStartingError(collection)
 
     try:
         # Lets DELETE /collections refuse while this export reads the collection
@@ -9060,6 +9076,10 @@ async def start_export(body: ExportRequest):
         job_id = await exporter.start_export_job(body.collection, body.include_models)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
+    except exporter.ExportStartingError:
+        # The running start hasn't stored its record yet, so no job_id to name (#338).
+        return api_error(409, "EXPORT_STARTING",
+                         f"An export of '{body.collection}' is starting; retry shortly.")
     except RuntimeError as exc:
         # start_export_job puts the already-running job id in the exception.
         return api_error(
@@ -12936,7 +12956,11 @@ the four job starts writes its first record from a worker thread, and when cance
 that write releases its guards and leaves no record (or, for ingest, upload folder), also when
 that abandoned write fails (logged). A second export of a collection started during the
 first one's write waits for it, then answers with the first job's id, which can be read, or,
-if the first start was cancelled, starts its own (#326). `02_ingest.sh` runs it in the API container. With
+if the first start was cancelled or its write failed, starts its own (#326); it answers at
+once when the record is already stored, holds nothing if cancelled while it waits, and
+exports of other collections never wait. The wait is bounded (#338): past it, the second
+start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
+`02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
 completed job reads back unchanged, the one that stored a file reads `partial` and the one

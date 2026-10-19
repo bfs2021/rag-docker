@@ -24,7 +24,15 @@ _active: dict[str, str] = {}
 # slot. A start that finds the slot taken by one of these waits for it, so a 409
 # never names a job that reads 404, or one that never comes to exist (#326).
 _starting: dict[str, asyncio.Future] = {}
+# The longest a start waits for another start's record, in seconds. A stalled
+# write then gets EXPORT_STARTING instead of holding every later request (#338).
+START_WAIT = 30.0
 _lock = threading.Lock()
+
+
+class ExportStartingError(Exception):
+    """Another start of this collection hadn't stored its record within
+    START_WAIT, so there is no job to name yet (#338)."""
 
 
 def get_job(job_id: str) -> dict | None:
@@ -83,8 +91,10 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
 
     Raises RuntimeError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
+    Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
     job_id = str(uuid.uuid4())[:8]
+    deadline = None
     while True:
         with _lock:
             running = _active.get(collection)
@@ -96,8 +106,14 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         if starting is None:
             raise RuntimeError(running)
         # That start hasn't stored its record yet: wait until it has, or has
-        # released the slot, then look again (#326). Holds nothing meanwhile.
-        await asyncio.wait({starting})
+        # released the slot, then look again (#326). Holds nothing meanwhile, and
+        # gives up once START_WAIT has passed since the first wait (#338).
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + START_WAIT
+        done, _ = await asyncio.wait({starting}, timeout=max(0.0, deadline - loop.time()))
+        if not done:
+            raise ExportStartingError(collection)
 
     try:
         # Lets DELETE /collections refuse while this export reads the collection

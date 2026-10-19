@@ -323,7 +323,11 @@ the four job starts writes its first record from a worker thread, and when cance
 that write releases its guards and leaves no record (or, for ingest, upload folder), also when
 that abandoned write fails (logged). A second export of a collection started during the
 first one's write waits for it, then answers with the first job's id, which can be read, or,
-if the first start was cancelled, starts its own (#326). `02_ingest.sh` runs it in the API container. With
+if the first start was cancelled or its write failed, starts its own (#326); it answers at
+once when the record is already stored, holds nothing if cancelled while it waits, and
+exports of other collections never wait. The wait is bounded (#338): past it, the second
+start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
+`02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
 completed job reads back unchanged, the one that stored a file reads `partial` and the one

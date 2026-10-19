@@ -39,6 +39,10 @@ async def start_export(body: ExportRequest):
         job_id = await exporter.start_export_job(body.collection, body.include_models)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
+    except exporter.ExportStartingError:
+        # The running start hasn't stored its record yet, so no job_id to name (#338).
+        return api_error(409, "EXPORT_STARTING",
+                         f"An export of '{body.collection}' is starting; retry shortly.")
     except RuntimeError as exc:
         # start_export_job puts the already-running job id in the exception.
         return api_error(

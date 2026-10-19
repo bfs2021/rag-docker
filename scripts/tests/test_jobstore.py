@@ -420,10 +420,33 @@ class Failing(Recording):
         raise OSError("disk gone")
 
 
+class FirstHeld(Recording):
+    """A Recording that holds only its first write, which then stores, or raises
+    if fail is set; later writes go straight through."""
+
+    def __init__(self, kind, fail=False):
+        super().__init__(kind, hold=True)
+        self.fail = fail
+
+    def __setitem__(self, job_id, doc):
+        if self.ids:
+            self.ids.append(job_id)
+            jobstore.JobStore.__setitem__(self, job_id, doc)
+            return
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        if self.fail:
+            raise OSError("disk gone")
+        jobstore.JobStore.__setitem__(self, job_id, doc)
+        self.stored.set()
+
+
 class StartTests(StoreTestCase):
     """The four job starts store their first record off the event loop, and a
     start cancelled during that write leaves nothing behind (#309). A second
-    export of a collection waits for that write before it names the first (#326)."""
+    export of a collection waits for that write before it names the first (#326),
+    for at most START_WAIT (#338)."""
 
     KINDS = {"export": (exporter, "_run"), "import": (importer, "_run"),
              "tune": (tuning, "_run"), "ingest": (ingest_pipeline, "_process_job_sync")}
@@ -613,6 +636,163 @@ class StartTests(StoreTestCase):
                       "\n".join(logs.output))
         self.assertNotIn("abcd0326", store)
         self.assertFalse(self.path_exists("export", "abcd0326"))
+
+    # Added by the testing reviewer (#326): the 409 at once, a failed first
+    # write, a cancelled waiter and other collections.
+    def first_held(self, fail=False):
+        store = FirstHeld("export", fail)
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(exporter, "_jobs", store),
+                       patch.object(exporter, "_run", side_effect=lambda *a, **k: calls.append(a))):
+            change.start()
+            self.addCleanup(change.stop)
+        return store, calls
+
+    def test_a_second_export_answers_409_at_once_once_the_record_is_stored(self):
+        module, store, calls = self.harness("export")
+        name = "Vfy326Stored"
+
+        async def run():
+            first = await exporter.start_export_job(name)
+            self.assertNotIn(first, exporter._starting)
+            return first, await asyncio.wait_for(self.second_start(name), 1)
+
+        job_id, (named, readable) = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertEqual((named, readable), (job_id, True))
+        self.assertEqual(store.ids, [job_id])
+        self.assertEqual(exporter._starting, {})
+
+    def test_an_export_waiting_on_a_start_whose_write_fails_starts_its_own(self):
+        store, calls = self.first_held(fail=True)
+        name = "Vfy326Failed"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            pending = not second.done()
+            store.release.set()
+            with self.assertRaises(OSError):
+                await first
+            outcome = await second
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return pending, outcome
+
+        pending, (second_id, refused) = asyncio.run(run())
+        first_id = store.ids[0]
+        self.assertTrue(pending)                      # it waited for the write
+        self.assertIsNone(refused)                    # no 409 naming the failed job
+        self.assertNotEqual(second_id, first_id)
+        self.assertEqual(exporter._active.get(name), second_id)
+        self.assertNotIn(first_id, store)
+        self.assertEqual(store[second_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, second_id)
+
+    def test_a_waiting_export_cancelled_holds_nothing_and_the_first_goes_on(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Waiter"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(exporter.start_export_job(name))
+            await asyncio.sleep(0.2)
+            second.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+            starting = list(exporter._starting)
+            store.release.set()
+            job_id = await first
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return starting, job_id
+
+        starting, job_id = asyncio.run(run())
+        self.assertEqual(starting, [job_id])          # the waiter added nothing
+        self.assertEqual(store.ids, [job_id])         # and never wrote
+        self.assertEqual(exporter._active.get(name), job_id)
+        self.assertEqual(store[job_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, job_id)
+
+    def test_exports_of_different_collections_never_wait_on_each_other(self):
+        store, calls = self.first_held()
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job("Vfy326A"))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            other = await asyncio.wait_for(exporter.start_export_job("Vfy326B"), 5)
+            first_done = first.done()
+            store.release.set()
+            return first_done, await first, other
+
+        first_done, first_id, other_id = asyncio.run(run())
+        self.release_export("Vfy326A", first_id)
+        self.release_export("Vfy326B", other_id)
+        self.assertFalse(first_done)                  # B finished while A was held
+        self.assertNotEqual(first_id, other_id)
+        self.assertEqual(store[other_id]["status"], "queued")
+        self.assertEqual(exporter._starting, {})
+
+    def test_a_second_export_gives_up_after_the_bound_and_holds_nothing(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy338Bound"
+        change = patch.object(exporter, "START_WAIT", 0.2)
+        change.start()
+        self.addCleanup(change.stop)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            with self.assertRaises(exporter.ExportStartingError):
+                await asyncio.wait_for(exporter.start_export_job(name), 5)
+            first_done, starting = first.done(), list(exporter._starting)
+            store.release.set()
+            job_id = await first
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return first_done, starting, job_id
+
+        first_done, starting, job_id = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertFalse(first_done)                  # it gave up while the write was held
+        self.assertEqual(starting, [job_id])          # and added nothing
+        self.assertEqual(store.ids, [job_id])         # nor wrote
+        self.assertEqual(store[job_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+
+    def test_the_route_answers_export_starting_with_no_job_id(self):
+        from unittest.mock import AsyncMock
+        from models.schemas import ExportRequest
+        from routers import transfer as route
+        with patch.object(route.wc, "collection_exists", new=AsyncMock(return_value=True)), \
+             patch.object(exporter, "start_export_job",
+                          new=AsyncMock(side_effect=exporter.ExportStartingError("Vfy338"))):
+            response = asyncio.run(route.start_export(ExportRequest(collection="Vfy338")))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"], {
+            "code": "EXPORT_STARTING",
+            "message": "An export of 'Vfy338' is starting; retry shortly.",
+            "detail": None,
+        })
 
 
 class IngestFallbackTests(StoreTestCase):
