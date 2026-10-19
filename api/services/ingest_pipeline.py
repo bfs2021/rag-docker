@@ -559,6 +559,11 @@ class _StaleMarkFailed(Exception):
     """Gold-standard sessions could not be marked stale before a replacement."""
 
 
+class _StaleLookupFailed(Exception):
+    """Which later files in the job also replace earlier chunks could not be
+    looked up, so the stale reason could not be written (#311)."""
+
+
 # How many replaced names a stale reason lists before "and N more".
 _MAX_NAMED_FILES = 10
 
@@ -571,13 +576,18 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
     file fails and the collection is left as it was.
 
     The reason names this file and the job's later files that also have earlier
-    chunks, because a job marks at most once.
+    chunks, because a job marks at most once. A failed lookup of those raises
+    _StaleLookupFailed and only a failed marking _StaleMarkFailed, so the error
+    names the step that failed (#311); either way nothing has been marked.
     """
     try:
         names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
-        listed = ", ".join(names[:_MAX_NAMED_FILES])
-        if len(names) > _MAX_NAMED_FILES:
-            listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+    except Exception as exc:
+        raise _StaleLookupFailed(str(exc) or type(exc).__name__) from exc
+    listed = ", ".join(names[:_MAX_NAMED_FILES])
+    if len(names) > _MAX_NAMED_FILES:
+        listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+    try:
         # Imported here: goldstandard imports weaviate_client, as tuning notes.
         from services import goldstandard
         goldstandard.mark_stale(
@@ -719,6 +729,12 @@ def _process_job_sync(
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
                     f"its chunks, so nothing was changed: {exc}")
+                _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
+            except _StaleLookupFailed as exc:
+                job["files_failed"] += 1
+                job["errors"].append(
+                    f"{label}: could not check which later files in this upload replace "
+                    f"earlier chunks, so nothing was changed: {exc}")
                 _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its

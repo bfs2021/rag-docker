@@ -371,7 +371,7 @@ class RechunkJsonGzTests(unittest.TestCase):
         with patch.object(settings, "upload_dir", str(root)), \
                 patch.object(tuning.sources, "load_index", lambda _c: index), \
                 patch.object(tuning.sources, "blob_path", lambda _c, _d: blob), \
-                patch.object(tuning, "_uncovered_source_files", lambda _c, _d: []):
+                patch.object(tuning, "_source_coverage", lambda _c, _d: ([], {"policies.json.gz"})):
             out = tuning._chunks_from_sources("Coll", "fixed", 200, 0, 0.85, 0)
         self.assertTrue(out)
         self.assertEqual({c["source_type"] for c in out}, {"json"})

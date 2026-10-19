@@ -3730,6 +3730,11 @@ class _StaleMarkFailed(Exception):
     """Gold-standard sessions could not be marked stale before a replacement."""
 
 
+class _StaleLookupFailed(Exception):
+    """Which later files in the job also replace earlier chunks could not be
+    looked up, so the stale reason could not be written (#311)."""
+
+
 # How many replaced names a stale reason lists before "and N more".
 _MAX_NAMED_FILES = 10
 
@@ -3742,13 +3747,18 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
     file fails and the collection is left as it was.
 
     The reason names this file and the job's later files that also have earlier
-    chunks, because a job marks at most once.
+    chunks, because a job marks at most once. A failed lookup of those raises
+    _StaleLookupFailed and only a failed marking _StaleMarkFailed, so the error
+    names the step that failed (#311); either way nothing has been marked.
     """
     try:
         names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
-        listed = ", ".join(names[:_MAX_NAMED_FILES])
-        if len(names) > _MAX_NAMED_FILES:
-            listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+    except Exception as exc:
+        raise _StaleLookupFailed(str(exc) or type(exc).__name__) from exc
+    listed = ", ".join(names[:_MAX_NAMED_FILES])
+    if len(names) > _MAX_NAMED_FILES:
+        listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+    try:
         # Imported here: goldstandard imports weaviate_client, as tuning notes.
         from services import goldstandard
         goldstandard.mark_stale(
@@ -3890,6 +3900,12 @@ def _process_job_sync(
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
                     f"its chunks, so nothing was changed: {exc}")
+                _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
+            except _StaleLookupFailed as exc:
+                job["files_failed"] += 1
+                job["errors"].append(
+                    f"{label}: could not check which later files in this upload replace "
+                    f"earlier chunks, so nothing was changed: {exc}")
                 _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 # Name the file the way the user knows it (a ZIP member by its
@@ -7971,20 +7987,24 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
-    """Stored source files a rebuild from the retained originals would not reproduce."""
+def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
+    """The stored source files a rebuild from the retained originals would not
+    reproduce, and every name that has stored chunks, from one walk of the
+    collection. A rebuild emits only the stored names (#311)."""
     by_filename: dict[str, list[str]] = {}
     for digest, entry in documents.items():
         for filename in entry["filenames"]:
             by_filename.setdefault(filename, []).append(digest)
     seen: dict[str, set] = {}
     uncovered = set()
+    stored = set()
     for obj in wc.get_client().collections.get(collection).iterator():
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
+        stored.add(filename)
         # A rebuild emits one chunk set per (digest, name) (#22), so a name is
         # covered when exactly one digest lists it, whichever of its names it is.
         if len(by_filename.get(filename, [])) != 1:
@@ -7997,7 +8017,12 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if index in indices:
             uncovered.add(filename)
         indices.add(index)
-    return sorted(uncovered)
+    return sorted(uncovered), stored
+
+
+def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
+    """Stored source files a rebuild from the retained originals would not reproduce."""
+    return _source_coverage(collection, documents)[0]
 
 
 def can_rechunk(collection: str) -> bool:
@@ -8042,8 +8067,12 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
     # sets and a name with no retained original are refused before staging:
     # replacing from the retained subset would lose chunks, and a successful
-    # cutover discards their recovery copy.
-    uncovered = _uncovered_source_files(collection, documents)
+    # cutover discards their recovery copy. Only names with stored chunks are
+    # rebuilt (#311): an index can list a name the collection never showed (a
+    # file that produced no chunks, or an imported package listing one blob
+    # under many names), and rebuilding it would cost a parse and an embedding
+    # each time.
+    uncovered, stored = _source_coverage(collection, documents)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
@@ -8066,6 +8095,8 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
             for filename in entry["filenames"]:
+                if filename not in stored:
+                    continue
                 # Parsers dispatch on the file extension, so the original name
                 # has to be restored before parsing; each pair is staged in a
                 # directory of its own, so a/report.txt and b/report.txt can't
@@ -12750,11 +12781,13 @@ separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under thei
 names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
-marking failure fails only that file and changes nothing; a failed insert keeps the earlier
+marking failure fails only that file and changes nothing; a failed lookup of the later files
+is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
 reported at the first lookup (#40). Also the delete rounds, precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
-rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mocked.
+rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
+while a missing blob is still refused (#311). Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
@@ -12766,7 +12799,9 @@ chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks th
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
-and checks that only the new text comes back, under both names.
+and checks that only the new text comes back, under both names. It also adds a name with no
+stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
+the index still lists it (E17, #311).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -17162,6 +17197,18 @@ for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
   rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
   wait_for_job "/ingest/job/$rjob" 900 >/dev/null
 done
+# #311: the retained index can list a name the collection has no chunks for
+# (a file that produced none, or a crafted package); rechunk must skip it.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+docs = sources.load_index(c)["documents"]
+digest = next(d for d, e in docs.items() if "copy.txt" in e["filenames"])
+sources.store(c, "ghost.txt", sources.blob_path(c, digest).read_bytes(), replace=True)
+sys.exit(0 if "ghost.txt" in sources.load_index(c)["documents"][digest]["filenames"] else 1)
+ENDPY
+check "E17: a name with no stored chunks is added to the retained index" $?
 check_eq "E32: re-chunking is offered after a replacement and a second name" \
   "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
 api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
@@ -17186,6 +17233,19 @@ sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in 
          and "Parking Permits" in texts else 1)
 ENDPY
 check "E32: the rebuild holds only the new version, under both of its names" $?
+rc_index=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+print(sorted(n for e in sources.load_index(sys.argv[1])["documents"].values() for n in e["filenames"]))
+ENDPY
+)
+python3 - "$rc_index" <<'ENDPY'
+import json, sys
+names = {n for n, _ in json.load(open('/tmp/vfy_rc_chunks.json'))}
+sys.exit(0 if "ghost.txt" not in names and "'ghost.txt'" in sys.argv[1] else 1)
+ENDPY
+check "E17: a listed name with no stored chunks is not rebuilt, and the index still lists it" $? \
+  "index: $rc_index"
 drop_collection "$RC"
 rm -rf "$RCFIX"
 

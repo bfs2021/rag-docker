@@ -112,20 +112,24 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
-    """Stored source files a rebuild from the retained originals would not reproduce."""
+def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
+    """The stored source files a rebuild from the retained originals would not
+    reproduce, and every name that has stored chunks, from one walk of the
+    collection. A rebuild emits only the stored names (#311)."""
     by_filename: dict[str, list[str]] = {}
     for digest, entry in documents.items():
         for filename in entry["filenames"]:
             by_filename.setdefault(filename, []).append(digest)
     seen: dict[str, set] = {}
     uncovered = set()
+    stored = set()
     for obj in wc.get_client().collections.get(collection).iterator():
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
+        stored.add(filename)
         # A rebuild emits one chunk set per (digest, name) (#22), so a name is
         # covered when exactly one digest lists it, whichever of its names it is.
         if len(by_filename.get(filename, [])) != 1:
@@ -138,7 +142,12 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if index in indices:
             uncovered.add(filename)
         indices.add(index)
-    return sorted(uncovered)
+    return sorted(uncovered), stored
+
+
+def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
+    """Stored source files a rebuild from the retained originals would not reproduce."""
+    return _source_coverage(collection, documents)[0]
 
 
 def can_rechunk(collection: str) -> bool:
@@ -183,8 +192,12 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
     # sets and a name with no retained original are refused before staging:
     # replacing from the retained subset would lose chunks, and a successful
-    # cutover discards their recovery copy.
-    uncovered = _uncovered_source_files(collection, documents)
+    # cutover discards their recovery copy. Only names with stored chunks are
+    # rebuilt (#311): an index can list a name the collection never showed (a
+    # file that produced no chunks, or an imported package listing one blob
+    # under many names), and rebuilding it would cost a parse and an embedding
+    # each time.
+    uncovered, stored = _source_coverage(collection, documents)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
@@ -207,6 +220,8 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
             for filename in entry["filenames"]:
+                if filename not in stored:
+                    continue
                 # Parsers dispatch on the file extension, so the original name
                 # has to be restored before parsing; each pair is staged in a
                 # directory of its own, so a/report.txt and b/report.txt can't

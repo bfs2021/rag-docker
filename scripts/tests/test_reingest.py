@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -305,6 +306,34 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((job["status"], job["files_failed"]), ("failed", 2))
         self.assertEqual(job["errors"], ["collection 'Coll' was deleted while this job was running"])
 
+    def test_a_failed_lookup_is_reported_as_the_lookup(self):
+        # #311: the lookup of the job's later files is not the marking, so its
+        # failure is named as the lookup; the file still changes nothing.
+        backend = FakeCollection(**{"p.txt": ["v1"], "q.txt": ["old"]})
+        lookups = []
+        has = backend.has
+
+        def flaky_has(collection, name):
+            lookups.append(name)
+            if name == "q.txt" and lookups.count("q.txt") == 1:
+                raise RuntimeError("weaviate read timed out")
+            return has(collection, name)
+
+        backend.has = flaky_has
+        with self.assertLogs("services.ingest_pipeline", "WARNING"):
+            job = self.run_job(backend, [("p.txt", "v2"), ("q.txt", "q2")])
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
+                         ("partial", 1, 1))
+        self.assertEqual(job["errors"], [
+            "up.zip:p.txt: could not check which later files in this upload replace earlier "
+            "chunks, so nothing was changed: weaviate read timed out"])
+        self.assertEqual([c["content"] for c in backend.chunks["p.txt"]], ["v1"])
+        # p.txt marked nothing and retained nothing; q.txt then marks and replaces.
+        self.assertEqual([r for _, r, _ in self.marks],
+                         ["documents were re-ingested, replacing their earlier chunks: q.txt"])
+        self.assertEqual([c["content"] for c in backend.chunks["q.txt"]], ["q2"])
+        self.assertEqual([n for n, _, _ in self.stored], ["q.txt"])
+
     def test_reason_lists_ten_names_then_a_count(self):
         names = {f"f{i:02}.txt": ["old"] for i in range(12)}
         backend = FakeCollection(**names)
@@ -454,6 +483,36 @@ class RechunkTests(unittest.TestCase):
         sources.store("Coll", "b.txt", b"same", replace=True)
         with self.stored(("a.txt", 0), ("b.txt", 0)):
             self.assertEqual(tuning._uncovered_source_files("Coll", sources.load_index("Coll")["documents"]), [])
+
+
+    def test_a_name_without_stored_chunks_is_not_rebuilt(self):
+        # #311: an index can list names the collection never showed; only the
+        # stored ones are rebuilt, and the index keeps the others.
+        sources.store("Coll", "kept.txt", b"shared text", replace=True)
+        sources.store("Coll", "ghost.txt", b"shared text", replace=True)
+        copies = []
+
+        def copyfile(src, dst, *args, **kwargs):
+            copies.append(Path(dst).name)
+            return real_copyfile(src, dst, *args, **kwargs)
+
+        real_copyfile = shutil.copyfile
+        with self.stored(("kept.txt", 0)), patch.object(tuning.shutil, "copyfile", copyfile):
+            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual([(c["source_file"], c["content"]) for c in chunks],
+                         [("kept.txt", "shared text")])
+        self.assertEqual(copies, ["kept.txt"])
+        filenames = [n for e in sources.load_index("Coll")["documents"].values() for n in e["filenames"]]
+        self.assertEqual(sorted(filenames), ["ghost.txt", "kept.txt"])
+
+    def test_a_missing_blob_is_refused_even_for_names_without_chunks(self):
+        sources.store("Coll", "kept.txt", b"kept", replace=True)
+        digest = sources.store("Coll", "ghost.txt", b"ghost", replace=True)
+        sources.blob_path("Coll", digest).unlink()
+        with self.stored(("kept.txt", 0)), self.assertRaises(tuning.PackageError) as caught:
+            tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual((caught.exception.code, caught.exception.detail.get("digest")),
+                         ("SOURCES_REQUIRED", digest))
 
 
 class SchemaTests(unittest.TestCase):

@@ -785,6 +785,18 @@ for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
   rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
   wait_for_job "/ingest/job/$rjob" 900 >/dev/null
 done
+# #311: the retained index can list a name the collection has no chunks for
+# (a file that produced none, or a crafted package); rechunk must skip it.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+docs = sources.load_index(c)["documents"]
+digest = next(d for d, e in docs.items() if "copy.txt" in e["filenames"])
+sources.store(c, "ghost.txt", sources.blob_path(c, digest).read_bytes(), replace=True)
+sys.exit(0 if "ghost.txt" in sources.load_index(c)["documents"][digest]["filenames"] else 1)
+ENDPY
+check "E17: a name with no stored chunks is added to the retained index" $?
 check_eq "E32: re-chunking is offered after a replacement and a second name" \
   "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
 api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
@@ -809,6 +821,19 @@ sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in 
          and "Parking Permits" in texts else 1)
 ENDPY
 check "E32: the rebuild holds only the new version, under both of its names" $?
+rc_index=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+print(sorted(n for e in sources.load_index(sys.argv[1])["documents"].values() for n in e["filenames"]))
+ENDPY
+)
+python3 - "$rc_index" <<'ENDPY'
+import json, sys
+names = {n for n, _ in json.load(open('/tmp/vfy_rc_chunks.json'))}
+sys.exit(0 if "ghost.txt" not in names and "'ghost.txt'" in sys.argv[1] else 1)
+ENDPY
+check "E17: a listed name with no stored chunks is not rebuilt, and the index still lists it" $? \
+  "index: $rc_index"
 drop_collection "$RC"
 rm -rf "$RCFIX"
 

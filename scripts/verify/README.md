@@ -316,11 +316,13 @@ separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under thei
 names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
-marking failure fails only that file and changes nothing; a failed insert keeps the earlier
+marking failure fails only that file and changes nothing; a failed lookup of the later files
+is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
 reported at the first lookup (#40). Also the delete rounds, precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
-rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mocked.
+rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
+while a missing blob is still refused (#311). Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
@@ -332,7 +334,9 @@ chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks th
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
-and checks that only the new text comes back, under both names.
+and checks that only the new text comes back, under both names. It also adds a name with no
+stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
+the index still lists it (E17, #311).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
