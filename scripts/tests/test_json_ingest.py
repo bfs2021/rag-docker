@@ -323,6 +323,16 @@ class JsonFileTests(unittest.TestCase):
             self.assertEqual(partition.call_count, 1)
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["doc.json.gz"])
 
+    def test_element_schema_items_with_no_text_count_toward_the_cap(self):
+        # Reviewer test (#321): every element item counts, empty text included,
+        # unlike ordinary records with no text.
+        items = [{"type": "NarrativeText", "text": ""} for _ in range(3)]
+        with patch.object(ingest_pipeline, "MAX_JSON_RECORDS", 2):
+            with self.assertRaises(ValueError) as caught:
+                self.parse(json.dumps(items))
+        self.assertEqual(str(caught.exception),
+                         "has more than 2 records, the most one file can hold; split the file")
+
     def test_input_size_limit(self):
         self.assertEqual(ingest_pipeline.MAX_JSON_INPUT_BYTES, LIMIT_BYTES)
         self.assertEqual(self.parse(padded('{"k": "v"}', LIMIT_BYTES))[0], "k: v")
@@ -478,6 +488,35 @@ class JsonJobTests(unittest.TestCase):
         self.assertEqual(job["status"], "partial")
         self.assertEqual(job["errors"], ["bad.json: is not valid JSON: Expecting value at line 1, column 7"])
         self.assertEqual([c["content"] for c in stored], ["a: 1"])
+
+
+class RechunkElementSchemaTests(unittest.TestCase):
+    """Reviewer test (#321): rechunk parses an element file the same way, cap included."""
+
+    def test_retained_element_file_at_and_past_the_cap(self):
+        from config import settings
+        from services import tuning
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        digest = "e" * 64
+        blob = root / digest
+        index = {"documents": {digest: {"filenames": ["elements.json"]}}}
+        items = [{"type": "NarrativeText", "text": f"t{i}"} for i in range(4)]
+        with patch.object(settings, "upload_dir", str(root)), \
+                patch.object(ingest_pipeline, "MAX_JSON_RECORDS", 3), \
+                patch.object(tuning.sources, "load_index", lambda _c: index), \
+                patch.object(tuning.sources, "blob_path", lambda _c, _d: blob), \
+                patch.object(tuning, "_source_coverage", lambda _c, _d: ([], {"elements.json"})):
+            blob.write_text(json.dumps(items[:3]))
+            out = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            self.assertEqual([c["content"] for c in out], ["t0\nt1\nt2"])
+            blob.write_text(json.dumps(items))
+            with self.assertRaises(ValueError) as caught:
+                tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual(str(caught.exception),
+                         "has more than 3 records, the most one file can hold; split the file")
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [digest])
 
 
 if __name__ == "__main__":
