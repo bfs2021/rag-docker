@@ -571,7 +571,10 @@ as uploaded.
   later files that also have earlier chunks (10 names, then `and N more`). The marking is
   saved before anything is stored; if it can't be, that file fails with `<file>: could not
   mark gold-standard sessions stale before replacing its chunks, so nothing was changed:
-  <reason>`, and the next replacing file tries again. Files with new names mark nothing.
+  <reason>`, and the next replacing file tries again. If the lookup of which later files
+  have earlier chunks fails, nothing is marked and that file fails the same way with
+  `<file>: could not check which later files in this upload replace earlier chunks, so
+  nothing was changed: <reason>` (#311). Files with new names mark nothing.
 - The retained original follows the replacement: the name is removed from any other
   retained digest, and a digest left with no names is deleted with its blob (see
   `RAG_EXPORT_SPECIFICATIONS.md` §2.2).
@@ -1390,6 +1393,9 @@ ingest default.
   refused when a stored source file has no single retained original (a name
   uploaded more than once, or a second name for the same content) or a
   retained original is missing from disk.
+- Re-chunking rebuilds only the names that have stored chunks (#311). A name the
+  retained index lists without stored chunks (for example a file that produced no
+  chunks at ingest) is skipped, not brought back; the index keeps it.
 
 Each rebuild is staged into a temporary collection and verified before the
 original is deleted, so a failure before replacement leaves the original
@@ -2287,7 +2293,12 @@ now lives once, in `api/services/ingest_config.py`.
       count, and retention releasing the name even when the blob write fails.
       `02_ingest.sh` ingests `policies.txt` twice (one chunk set, `chunks_replaced` equal to
       the first count), then a changed version (only its text remains, one digest names it,
-      the first blob is gone).*
+      the first blob is gone). With a real gold-standard session planted, it checks that a
+      new name leaves the session current and a replacing re-ingest marks it stale, naming
+      the file. `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
+      chunks from a previous version" line, hidden at 0, and the plain "N files skipped:"
+      heading. `test_reingest.py` also checks that a failed lookup of the later files is
+      reported as the lookup, not as the marking (#311).*
 - [x] ZIP members are named by their normalised path inside the archive, so same-named members in different folders stay separate documents; within one upload the last input with a logical name wins and each earlier one is listed in `skipped` with its reason (#22).
       *`a/report.pdf` and `b/report.pdf` both became `report.pdf`, and a name sent twice in
       one request was overwritten on disk but queued twice. `ZipFile.extract` also wrote
@@ -2296,6 +2307,12 @@ now lives once, in `api/services/ingest_config.py`.
       against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
       archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
       `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
+- [x] Two ingest jobs that replace one logical name in one collection run one at a time: afterwards exactly one job's version is stored, whole (its full chunk set, its `chunks_replaced` equal to the other job's `chunks_stored`, one retained digest naming the name, the winner's); which job runs last is not promised (#22).
+      *`02_ingest.sh` sends two uploads of one name, with different content, at once
+      through the proxy and checks that both jobs complete, exactly one version's text is
+      stored, its chunk count is the winner's `chunks_stored`, the winner's
+      `chunks_replaced` is the other job's `chunks_stored`, and one digest, the winner's,
+      names it.*
 
 ### 10.2 Query
 
