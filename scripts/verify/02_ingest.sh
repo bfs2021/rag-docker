@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/json_over_size_gz.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/jsonl_many_records.jsonl.gz" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -262,6 +262,22 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 [ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
 check "a malformed line fails the file with its line number and stores nothing" $? \
   "status=$status error=$first_error stored=$stored"
+
+# A JSON Lines file holds at most 1,000,000 lines, records with no text
+# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
+read -r status cap_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+        'the most one file can hold; split the file']
+print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
+check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+  "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with

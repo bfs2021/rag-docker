@@ -181,6 +181,10 @@ def write(target: pathlib.Path) -> None:
     (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
     (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
                                       encoding="utf-8")
+    # Issue #314. A JSON Lines file holds at most 1,000,000 lines, every line
+    # counting: jsonl_many_records.jsonl.gz is 1,000,001 records with no text
+    # (about 3 MB decompressed, a few KB gzipped), which fails the file.
+    (target / "jsonl_many_records.jsonl.gz").write_bytes(gzip.compress(b"{}\n" * 1_000_001, mtime=0))
 
     # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
     # files are about 2 MB. zip_over_declared.zip honestly declares a member of

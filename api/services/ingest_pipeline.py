@@ -37,6 +37,8 @@ MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 # The most of one JSON Lines line that is read (#291). A line is parsed whole,
 # so this bounds the memory one record can take (a 10 MB line of small numbers
 # parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+# It counts neither the line ending (`\n` or `\r\n`) nor line 1's byte-order
+# mark, so a CRLF file and an LF file behave the same (#314).
 MAX_JSONL_LINE_BYTES = 10_000_000
 
 # Job records survive an API restart (#23); see jobstore.py.
@@ -155,6 +157,8 @@ MAX_JSON_INPUT_BYTES = 30_000_000
 # allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
 # blank line between records). A file of more than this many records averages
 # under 8 characters a record; any other passes the text bound first.
+# It also bounds a JSON Lines file's lines (#314): every line counts, blank ones
+# and records with no text included, since those spend none of the text bound.
 MAX_JSON_RECORDS = 1_000_000
 
 
@@ -359,7 +363,8 @@ class _JsonlError(ValueError):
 
 
 class _JsonlTooLarge(_JsonlError):
-    """A JSON Lines file whose text passes the per-file limit."""
+    """A JSON Lines file whose text passes the per-file limit, or with more lines
+    than one file may hold (#314)."""
 
 
 class _BoundedLines:
@@ -378,33 +383,41 @@ class _BoundedLines:
 
 
 _JSONL_BLANK = b" \t\r"
+_BOM = b"\xef\xbb\xbf"
 
 
 def _jsonl_records(stream: Any) -> list[str]:
     """The records of a JSON Lines file, one per line with text (#291).
 
-    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it, and stopped at
-    the first bad line or when the file's text passes the per-file limit, so
-    memory is bounded by one line and that limit, never by the file's size.
+    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
+    ending and line 1's byte-order mark, and stopped at the first bad line, at
+    the line past MAX_JSON_RECORDS, or when the file's text passes the per-file
+    limit, so memory is bounded by one line and that limit, never by the file's
+    size, and work by the line count.
     """
     budget = _JsonBudget()
     records: list[str] = []
     number = 0
     blank = None  # the first blank line not yet followed by a record
     while True:
-        raw = stream.readline(MAX_JSONL_LINE_BYTES + 1)
+        # Room for line 1's byte-order mark and a CRLF beyond the limit (#314).
+        raw = stream.readline(MAX_JSONL_LINE_BYTES + len(_BOM) + 2)
         if not raw:
             break
         number += 1
-        if raw.endswith(b"\n"):
+        if number > MAX_JSON_RECORDS:
+            # Every line counts, so lines with no text can't run on to the gzip bound.
+            raise _JsonlTooLarge(f"has more than {MAX_JSON_RECORDS:,} records, the most one "
+                                 f"file can hold; split the file")
+        if raw.endswith(b"\r\n"):
+            raw = raw[:-2]
+        elif raw.endswith(b"\n"):
             raw = raw[:-1]
-            too_long = False
-        else:
-            # No newline: either the last line, or a line over the limit.
-            too_long = len(raw) > MAX_JSONL_LINE_BYTES
         shift = 0
-        if number == 1 and raw.startswith(b"\xef\xbb\xbf"):
-            raw, shift = raw[3:], 3
+        if number == 1 and raw.startswith(_BOM):
+            raw, shift = raw[len(_BOM):], len(_BOM)
+        # A read cut short has no newline and is at least 2 bytes over the limit.
+        too_long = len(raw) > MAX_JSONL_LINE_BYTES
         if not too_long and not raw.strip(_JSONL_BLANK):
             if blank is None:
                 blank = number
