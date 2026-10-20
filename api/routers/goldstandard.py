@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -19,14 +20,22 @@ from models.schemas import (
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/goldstandard")
+_log = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
 async def generate(body: GenerateRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for a gold-standard generation",
+                       body.collection)
+        return collection_check_unavailable(body.collection, "No generation was started")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
     try:
