@@ -23,6 +23,28 @@ class TelemetryConfigError(ValueError):
     """Messages contain field names only, never configuration values."""
 
 
+def _read_regular_file(path, limit):
+    """Return at most limit + 1 bytes of a regular file, never blocking.
+
+    The path is checked before it is opened, so a FIFO, device or directory is
+    never opened, and the open descriptor is checked again before any read, so
+    a path swapped after the first check is refused too. O_NONBLOCK keeps that
+    open from waiting for a FIFO writer.
+    """
+    if not stat.S_ISREG(Path(path).stat().st_mode):
+        raise ValueError
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with source:
+        return source.read(limit + 1)
+
+
 @dataclass(frozen=True)
 class Config:
     enabled: bool = False
@@ -90,10 +112,7 @@ class Config:
         secret_file = value("HEADERS_FILE", "")
         if secret_file:
             try:
-                if not stat.S_ISREG(Path(secret_file).stat().st_mode):
-                    raise ValueError
-                with Path(secret_file).open("rb") as source:
-                    raw = source.read(8193)
+                raw = _read_regular_file(secret_file, 8192)
                 if len(raw) > 8192:
                     raise ValueError
                 def header_pairs(pairs):
@@ -121,11 +140,8 @@ class Config:
         ca_file = value("CA_FILE", "")
         if ca_file:
             try:
-                if not stat.S_ISREG(Path(ca_file).stat().st_mode):
+                if len(_read_regular_file(ca_file, 1048576)) > 1048576:
                     raise ValueError
-                with Path(ca_file).open("rb") as source:
-                    if len(source.read(1048577)) > 1048576:
-                        raise ValueError
                 ssl.create_default_context(cafile=ca_file)
             except (OSError, ValueError, TypeError):
                 raise TelemetryConfigError("Invalid RAG_OTEL_CA_FILE") from None
