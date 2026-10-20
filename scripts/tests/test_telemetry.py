@@ -1090,7 +1090,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertEqual(str(raised.exception), 'Invalid '+key)
                 self.assertNotIn(path, str(raised.exception))
 
-    def test_reviewer_descriptor_closed_on_every_path(self):
+    def test_header_and_ca_file_descriptors_are_closed_on_failure_and_success(self):
         base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
         real_open = os.open
         def closed(descriptor):
@@ -1146,7 +1146,7 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(len(opened), 1)
             self.assertTrue(closed(opened[0]), 'RAG_OTEL_HEADERS_FILE leaked its descriptor after a successful read')
 
-    def test_reviewer_header_file_size_edge(self):
+    def test_header_file_accepts_8192_bytes_and_rejects_8193(self):
         base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
         body = '{"Authorization":"a"}'
         for size, accepted in ((8192, True), (8193, False)):
