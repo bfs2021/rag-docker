@@ -360,7 +360,11 @@ a rechunk or a re-embed with chunking parameters, before any job is created, wit
 answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
 `COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
 listed name still start a job. A Weaviate error during the check answers 503
-`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340).
+`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340),
+also when the connection itself fails and for a re-embed with chunking parameters through its
+route, while a re-embed without them still starts. A Weaviate error checking that the
+collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
+answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest

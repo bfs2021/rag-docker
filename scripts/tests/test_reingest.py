@@ -684,6 +684,108 @@ class RechunkTests(unittest.TestCase):
         self.assertEqual(set(tuning._jobs), before)
         self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
 
+    def test_a_connect_failure_and_the_reembed_route_are_503_too(self):
+        # #340 (reviewer): a failure in get_client itself (no connection), not
+        # only in the walk, is SERVICE_UNAVAILABLE; so is a re-embed with
+        # chunking fields through its route. A re-embed without them never
+        # reads the collection, so it still starts.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import ReembedRequest
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+
+        def run(job_id, collection, *args, **kwargs):
+            collection_writes.end_job("tune", job_id)
+            with tuning._lock:
+                tuning._active.discard(collection)
+
+        before = set(tuning._jobs)
+        with patch.object(wc, "get_client", side_effect=ConnectionError("no route to weaviate")), \
+                patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)):
+            with self.assertLogs(tuning._log, "ERROR"):
+                response = asyncio.run(tuning_router.reembed(ReembedRequest(
+                    collection="Coll", chunking_strategy="fixed", chunk_size=80)))
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(json.loads(response.body)["error"]["code"], "SERVICE_UNAVAILABLE")
+            self.assertNotIn(b"no route", response.body)
+            self.assertEqual(set(tuning._jobs), before)
+            self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+            async def start():
+                response = await tuning_router.reembed(ReembedRequest(collection="Coll"))
+                for _ in range(200):
+                    if not tuning._active:
+                        break
+                    await asyncio.sleep(0.01)
+                return response
+
+            with patch.object(tuning, "_run", run):
+                response = asyncio.run(start())
+        self.assertEqual(response.status, "queued")
+        self.assertIn(response.job_id, set(tuning._jobs) - before)
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_a_weaviate_error_checking_the_collection_at_a_tune_start_is_a_503(self):
+        # #349: the existence check every tune start makes was a bare 500 when
+        # Weaviate failed. It is SERVICE_UNAVAILABLE, with no job, nothing
+        # registered and the cause logged but not sent.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest, ReembedRequest, ReindexRequest
+        requests = {
+            "rechunk": (tuning_router.rechunk, RechunkRequest(collection="Coll")),
+            "reembed": (tuning_router.reembed, ReembedRequest(collection="Coll")),
+            "reindex": (tuning_router.reindex, ReindexRequest(collection="Coll")),
+        }
+        before = set(tuning._jobs)
+        with patch.object(tuning_router.wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))):
+            for operation, (route, body) in requests.items():
+                with self.subTest(operation=operation):
+                    with self.assertLogs(tuning_router._log, "ERROR"):
+                        response = asyncio.run(route(body))
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(json.loads(response.body)["error"], {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": "Cannot check whether 'Coll' exists: Weaviate could not be "
+                                   "read. No job was started; try again when Weaviate is "
+                                   "available.",
+                        "detail": {"collection": "Coll"}})
+                    self.assertNotIn(b"weaviate down", response.body)
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                     (set(), []))
+
+    def test_a_weaviate_error_reading_the_tuning_options_is_a_503(self):
+        # #349: GET /tune/{collection} reads Weaviate for the existence check
+        # and, with retained originals, for the re-chunk check. Either failing
+        # was a bare 500; it is SERVICE_UNAVAILABLE, the cause logged but not sent.
+        from routers import tuning as tuning_router
+        sources.store("Coll", "a.txt", b"one", replace=True)
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        responses = {}
+        with patch.object(tuning_router.wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))), \
+                self.assertLogs(tuning_router._log, "ERROR"):
+            responses["existence check"] = asyncio.run(tuning_router.tune_options("Coll"))
+        with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(wc, "get_client", return_value=SimpleNamespace(
+                    collections=SimpleNamespace(get=lambda name: coll))), \
+                self.assertLogs(tuning._log, "ERROR"):
+            responses["re-chunk check"] = asyncio.run(tuning_router.tune_options("Coll"))
+        for case, response in responses.items():
+            with self.subTest(case=case):
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(json.loads(response.body)["error"], {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": "Cannot read the tuning options for 'Coll': Weaviate could not "
+                               "be read. Try again when Weaviate is available.",
+                    "detail": {"collection": "Coll"}})
+                self.assertNotIn(b"weaviate down", response.body)
 
 class SchemaTests(unittest.TestCase):
     def test_a_record_written_before_the_field_reads_as_zero(self):

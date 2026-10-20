@@ -155,7 +155,8 @@ def _listed_names(documents: dict) -> set[str]:
 
 
 class ServiceUnavailableError(Exception):
-    """Weaviate couldn't be read for the up-front re-chunk check (#340)."""
+    """Weaviate couldn't be read for the up-front re-chunk check (#340) or for
+    the tuning options (#349)."""
 
 
 # A collection whose retained originals all lack stored chunks (every file
@@ -212,11 +213,17 @@ def rechunk_refusal(collection: str) -> str | None:
     Used by the tuning options, so they offer re-chunking only when the job
     would accept it. Nothing to rebuild is reported first, as the start refuses
     it before the others (#328). An invalid index or blob path raises ValueError.
+    A Weaviate failure during the walk raises ServiceUnavailableError, which
+    the router answers with 503 rather than a bare 500 (#349).
     """
     documents = sources.load_index(collection)["documents"]
     if not documents:
         return RECHUNK_NOT_COVERED
-    uncovered, stored = _source_coverage(collection, documents)
+    try:
+        uncovered, stored = _source_coverage(collection, documents)
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Could not read %r for the tuning options", collection)
+        raise ServiceUnavailableError(collection) from exc
     if not stored & _listed_names(documents):
         return RECHUNK_NOTHING_TO_REBUILD
     for digest in documents:
