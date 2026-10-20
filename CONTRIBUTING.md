@@ -48,7 +48,7 @@ the maintainer approves them.
 By contributing, you agree that your contributions are licensed under the
 [MIT License](LICENSE).
 
-First-party UI and MCP versions track the repository release. When preparing a release, update `ui/package.json`, the root package versions in `ui/package-lock.json`, and `mcp/mcpapp.py` together with their embedded documentation.
+First-party UI and MCP versions track the repository release. When preparing a release, update `ui/package.json`, the root package versions in `ui/package-lock.json`, `mcp/mcpapp.py`, and the `service.version` default in `api/services/telemetry.py` together with their embedded documentation.
 
 ## Release checklist
 
