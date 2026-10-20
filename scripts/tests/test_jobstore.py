@@ -835,6 +835,10 @@ class StartTests(StoreTestCase):
             gave_up = [w.result() for w in done]
             store.second_release.set()
             results = [await w for w in waiters]
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
             return gave_up, results
 
         gave_up, results = asyncio.run(run())
@@ -845,6 +849,13 @@ class StartTests(StoreTestCase):
         # 2.0 s from its first wait, not 1.5 + 2.0 s from its second
         self.assertGreaterEqual(refused[0], 1.9)
         self.assertLess(refused[0], 3.0)
+        # the waiter done while the winner's write was held is the one that gave up
+        self.assertEqual(gave_up, [(value, elapsed) for value, elapsed in results
+                                   if elapsed is not None])
+        self.assertIsInstance(gave_up[0][0], exporter.ExportStartingError)
+        self.assertEqual(len(store.ids), 2)           # the first start's failed write, the winner's
+        self.assertEqual(store.ids[1], started[0])    # the waiter that gave up never wrote
+        self.assertEqual(len(calls), 1)               # only the winner's worker ran
         self.assertEqual(exporter._active.get(name), started[0])
         self.assertEqual(store[started[0]]["status"], "queued")
         self.assertEqual(exporter._starting, {})
