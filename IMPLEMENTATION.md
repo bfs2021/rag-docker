@@ -12980,6 +12980,8 @@ if the first start was cancelled or its write failed, starts its own (#326); it 
 once when the record is already stored, holds nothing if cancelled while it waits, and
 exports of other collections never wait. The wait is bounded (#338): past it, the second
 start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
+The bound counts once, from the second start's first wait: when the first start's write fails
+and another start takes the slot, waiting again on that one doesn't restart it (#347).
 `02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a

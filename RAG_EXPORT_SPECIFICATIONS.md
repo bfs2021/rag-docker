@@ -351,9 +351,10 @@ completion, the written filename.
   concurrent exports would race on the temporary file described below. A request
   that arrives while that export is still storing its first record waits for it,
   at most 30 s, so the named `job_id` can always be read; if that start is
-  cancelled instead, the request starts its own export (#326). If it is still
-  storing that record after 30 s, the request fails with `EXPORT_STARTING`, with
-  no `job_id`, and can be retried shortly (#338).
+  cancelled instead, or its record write fails, the request starts its own
+  export (#326, #347). If it is still storing that record after 30 s, the
+  request fails with `EXPORT_STARTING`, with no `job_id`, and can be retried
+  shortly (#338).
 - The package is written to `/app/exports` (host `./exports`), never streamed.
 - Chunks are read with `include_vector=True`, paged, so memory does not scale
   with collection size.
