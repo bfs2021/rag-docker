@@ -1412,6 +1412,9 @@ ingest default.
 - **503 `SERVICE_UNAVAILABLE`** from those same requests when Weaviate can't be
   read for that check (#340). No job is created; try again when Weaviate is
   available. The cause is logged, not returned.
+- **503 `SERVICE_UNAVAILABLE`** from any of the three when Weaviate can't be read
+  to check that the collection exists (#349). No job is created. The cause is
+  logged, not returned.
 - **`SOURCES_REQUIRED`** (through the job) when the operation needs originals the
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured. Re-chunking is also
@@ -1445,6 +1448,9 @@ retained original has stored chunks (#328), a stored source file has no single
 retained original, or a retained original is missing from disk. `note` says
 which; when no retained original has stored chunks it says so, whatever else
 holds.
+
+- **503 `SERVICE_UNAVAILABLE`** when Weaviate can't be read for the options
+  (#349). The cause is logged, not returned.
 
 **Response 200:**
 ```json

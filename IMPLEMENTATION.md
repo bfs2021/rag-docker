@@ -8130,7 +8130,8 @@ def _listed_names(documents: dict) -> set[str]:
 
 
 class ServiceUnavailableError(Exception):
-    """Weaviate couldn't be read for the up-front re-chunk check (#340)."""
+    """Weaviate couldn't be read for the up-front re-chunk check (#340) or for
+    the tuning options (#349)."""
 
 
 # A collection whose retained originals all lack stored chunks (every file
@@ -8187,11 +8188,17 @@ def rechunk_refusal(collection: str) -> str | None:
     Used by the tuning options, so they offer re-chunking only when the job
     would accept it. Nothing to rebuild is reported first, as the start refuses
     it before the others (#328). An invalid index or blob path raises ValueError.
+    A Weaviate failure during the walk raises ServiceUnavailableError, which
+    the router answers with 503 rather than a bare 500 (#349).
     """
     documents = sources.load_index(collection)["documents"]
     if not documents:
         return RECHUNK_NOT_COVERED
-    uncovered, stored = _source_coverage(collection, documents)
+    try:
+        uncovered, stored = _source_coverage(collection, documents)
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Could not read %r for the tuning options", collection)
+        raise ServiceUnavailableError(collection) from exc
     if not stored & _listed_names(documents):
         return RECHUNK_NOTHING_TO_REBUILD
     for digest in documents:
@@ -9175,6 +9182,7 @@ three follow the job-and-poll pattern.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter
 
@@ -9192,10 +9200,21 @@ from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_deleting_error
 
 router = APIRouter(prefix="/tune")
+_log = logging.getLogger(__name__)
 
 
 async def _start(collection: str, operation: str, params: dict):
-    if not await wc.collection_exists(collection):
+    try:
+        exists = await wc.collection_exists(collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#349).
+        _log.exception("Could not check whether %r exists for a tune start", collection)
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         f"Cannot check whether '{collection}' exists: Weaviate could not "
+                         "be read. No job was started; try again when Weaviate is "
+                         "available.",
+                         detail={"collection": collection})
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         job_id = await tuning.start_tune_job(collection, operation, params)
@@ -9253,10 +9272,23 @@ async def tune_job_status(job_id: str):
     return TuneJobStatusResponse(**job)
 
 
+def _options_unavailable(collection: str):
+    return api_error(503, "SERVICE_UNAVAILABLE",
+                     f"Cannot read the tuning options for '{collection}': Weaviate could "
+                     "not be read. Try again when Weaviate is available.",
+                     detail={"collection": collection})
+
+
 @router.get("/{collection}", response_model=TuneOptionsResponse)
 async def tune_options(collection: str):
     """What this collection can be tuned with, given its fidelity."""
-    if not await wc.collection_exists(collection):
+    try:
+        exists = await wc.collection_exists(collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#349).
+        _log.exception("Could not check whether %r exists for the tuning options", collection)
+        return _options_unavailable(collection)
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         has_sources = await asyncio.to_thread(sources.has_sources, collection)
@@ -9265,6 +9297,9 @@ async def tune_options(collection: str):
                    if has_sources else None)
     except ValueError:
         return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
+    except tuning.ServiceUnavailableError:
+        # Weaviate couldn't be read for the re-chunk check; the cause is logged (#349).
+        return _options_unavailable(collection)
     can_rechunk = has_sources and refusal is None
     if not has_sources:
         note = ("No original documents were retained, so this collection cannot be "
@@ -13013,7 +13048,11 @@ a rechunk or a re-embed with chunking parameters, before any job is created, wit
 answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
 `COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
 listed name still start a job. A Weaviate error during the check answers 503
-`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340).
+`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340),
+also when the connection itself fails and for a re-embed with chunking parameters through its
+route, while a re-embed without them still starts. A Weaviate error checking that the
+collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
+answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
