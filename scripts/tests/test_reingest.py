@@ -742,7 +742,7 @@ class RechunkTests(unittest.TestCase):
                           AsyncMock(side_effect=ConnectionError("weaviate down"))):
             for operation, (route, body) in requests.items():
                 with self.subTest(operation=operation):
-                    with self.assertLogs(tuning_router._log, "ERROR"):
+                    with self.assertLogs(logging.getLogger("routers.tuning"), "ERROR"):
                         response = asyncio.run(route(body))
                     self.assertEqual(response.status_code, 503)
                     self.assertEqual(json.loads(response.body)["error"], {
@@ -770,7 +770,7 @@ class RechunkTests(unittest.TestCase):
         responses = {}
         with patch.object(tuning_router.wc, "collection_exists",
                           AsyncMock(side_effect=ConnectionError("weaviate down"))), \
-                self.assertLogs(tuning_router._log, "ERROR"):
+                self.assertLogs(logging.getLogger("routers.tuning"), "ERROR"):
             responses["existence check"] = asyncio.run(tuning_router.tune_options("Coll"))
         with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)), \
                 patch.object(wc, "get_client", return_value=SimpleNamespace(
@@ -786,6 +786,31 @@ class RechunkTests(unittest.TestCase):
                                "be read. Try again when Weaviate is available.",
                     "detail": {"collection": "Coll"}})
                 self.assertNotIn(b"weaviate down", response.body)
+
+    def test_a_missing_collection_is_still_404_at_tune_starts_and_options(self):
+        # #349 (reviewer): the existence check now sits in a try; a collection
+        # Weaviate reports as missing is still COLLECTION_NOT_FOUND, with no job.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest, ReembedRequest, ReindexRequest
+        calls = {
+            "rechunk": lambda: tuning_router.rechunk(RechunkRequest(collection="Gone")),
+            "reembed": lambda: tuning_router.reembed(ReembedRequest(collection="Gone")),
+            "reindex": lambda: tuning_router.reindex(ReindexRequest(collection="Gone")),
+            "options": lambda: tuning_router.tune_options("Gone"),
+        }
+        before = set(tuning._jobs)
+        with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=False)):
+            for case, call in calls.items():
+                with self.subTest(case=case):
+                    response = asyncio.run(call())
+                    self.assertEqual(response.status_code, 404)
+                    self.assertEqual(json.loads(response.body)["error"]["code"],
+                                     "COLLECTION_NOT_FOUND")
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Gone")),
+                                     (set(), []))
+
 
 class SchemaTests(unittest.TestCase):
     def test_a_record_written_before_the_field_reads_as_zero(self):
