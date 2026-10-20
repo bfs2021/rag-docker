@@ -95,6 +95,11 @@ class JobStatusResponse(BaseModel):
     files_completed: int
     files_failed: int
     chunks_stored: int
+    # Chunks sent to Weaviate and those it acknowledged without a per-chunk
+    # error, including ones removed again because the check failed (#302).
+    # Null on records written before they existed, where 0 would be untrue.
+    chunks_submitted: int | None = None
+    chunks_accepted: int | None = None
     errors: list[str]
     # Files the caller sent that could not be parsed at all; they never
     # became part of files_total, so without this they vanish silently. Also

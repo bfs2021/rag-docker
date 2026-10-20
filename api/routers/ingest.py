@@ -12,7 +12,8 @@ from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadRespo
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -69,6 +70,8 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
         )
+    except CollectionDeletingError:
+        return collection_deleting_error(collection)
     except ingest_pipeline.UploadRejected as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     except ValueError as exc:

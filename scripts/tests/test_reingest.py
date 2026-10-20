@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -305,6 +306,34 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((job["status"], job["files_failed"]), ("failed", 2))
         self.assertEqual(job["errors"], ["collection 'Coll' was deleted while this job was running"])
 
+    def test_a_failed_lookup_is_reported_as_the_lookup(self):
+        # #311: the lookup of the job's later files is not the marking, so its
+        # failure is named as the lookup; the file still changes nothing.
+        backend = FakeCollection(**{"p.txt": ["v1"], "q.txt": ["old"]})
+        lookups = []
+        has = backend.has
+
+        def flaky_has(collection, name):
+            lookups.append(name)
+            if name == "q.txt" and lookups.count("q.txt") == 1:
+                raise RuntimeError("weaviate read timed out")
+            return has(collection, name)
+
+        backend.has = flaky_has
+        with self.assertLogs("services.ingest_pipeline", "WARNING"):
+            job = self.run_job(backend, [("p.txt", "v2"), ("q.txt", "q2")])
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
+                         ("partial", 1, 1))
+        self.assertEqual(job["errors"], [
+            "up.zip:p.txt: could not check which later files in this upload replace earlier "
+            "chunks, so nothing was changed: weaviate read timed out"])
+        self.assertEqual([c["content"] for c in backend.chunks["p.txt"]], ["v1"])
+        # p.txt marked nothing and retained nothing; q.txt then marks and replaces.
+        self.assertEqual([r for _, r, _ in self.marks],
+                         ["documents were re-ingested, replacing their earlier chunks: q.txt"])
+        self.assertEqual([c["content"] for c in backend.chunks["q.txt"]], ["q2"])
+        self.assertEqual([n for n, _, _ in self.stored], ["q.txt"])
+
     def test_reason_lists_ten_names_then_a_count(self):
         names = {f"f{i:02}.txt": ["old"] for i in range(12)}
         backend = FakeCollection(**names)
@@ -455,6 +484,308 @@ class RechunkTests(unittest.TestCase):
         with self.stored(("a.txt", 0), ("b.txt", 0)):
             self.assertEqual(tuning._uncovered_source_files("Coll", sources.load_index("Coll")["documents"]), [])
 
+
+    def test_a_name_without_stored_chunks_is_not_rebuilt(self):
+        # #311: an index can list names the collection never showed; only the
+        # stored ones are rebuilt, and the index keeps the others.
+        sources.store("Coll", "kept.txt", b"shared text", replace=True)
+        sources.store("Coll", "ghost.txt", b"shared text", replace=True)
+        copies = []
+
+        def copyfile(src, dst, *args, **kwargs):
+            copies.append(Path(dst).name)
+            return real_copyfile(src, dst, *args, **kwargs)
+
+        real_copyfile = shutil.copyfile
+        with self.stored(("kept.txt", 0)), patch.object(tuning.shutil, "copyfile", copyfile):
+            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual([(c["source_file"], c["content"]) for c in chunks],
+                         [("kept.txt", "shared text")])
+        self.assertEqual(copies, ["kept.txt"])
+        filenames = [n for e in sources.load_index("Coll")["documents"].values() for n in e["filenames"]]
+        self.assertEqual(sorted(filenames), ["ghost.txt", "kept.txt"])
+
+    def test_a_missing_blob_is_refused_even_for_names_without_chunks(self):
+        sources.store("Coll", "kept.txt", b"kept", replace=True)
+        digest = sources.store("Coll", "ghost.txt", b"ghost", replace=True)
+        sources.blob_path("Coll", digest).unlink()
+        with self.stored(("kept.txt", 0)), self.assertRaises(tuning.PackageError) as caught:
+            tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual((caught.exception.code, caught.exception.detail.get("digest")),
+                         ("SOURCES_REQUIRED", digest))
+
+    def test_one_blob_under_many_names_is_parsed_once_per_stored_name(self):
+        # #311 (reviewer): the crafted-package case. One blob listed under many
+        # names, and a second digest none of whose names has chunks: only the
+        # stored name is parsed, and the chunk-less digest is never staged.
+        for i in range(50):
+            sources.store("Coll", f"n{i:02}.txt", b"one blob", replace=True)
+        sources.store("Coll", "orphan.txt", b"other blob", replace=True)
+        real_parse = tuning._parse_file
+        parsed = []
+
+        def parse(path):
+            parsed.append(Path(path).name)
+            return real_parse(path)
+
+        with self.stored(("n07.txt", 0)), patch.object(tuning, "_parse_file", parse):
+            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual(parsed, ["n07.txt"])
+        self.assertEqual([(c["source_file"], c["content"]) for c in chunks],
+                         [("n07.txt", "one blob")])
+        filenames = [n for e in sources.load_index("Coll")["documents"].values() for n in e["filenames"]]
+        self.assertEqual(len(filenames), 51)
+
+    NOTHING_TO_REBUILD = ("Cannot re-chunk 'Coll': no retained original file has stored "
+                          "chunks, so there is nothing to rebuild.")
+
+    def test_nothing_to_rebuild_is_refused_before_staging(self):
+        # #328: every retained file produced no chunks at ingest. That is
+        # refused as such, not blamed on the chunking parameters.
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+        sources.store("Coll", "blank.txt", b"two", replace=True)
+        copies = []
+        with self.stored(), patch.object(tuning.shutil, "copyfile", lambda s, d, *a, **k: copies.append(d)), \
+                self.assertRaises(tuning.PackageError) as caught:
+            tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual((caught.exception.code, caught.exception.message, caught.exception.detail),
+                         ("SOURCES_REQUIRED", self.NOTHING_TO_REBUILD, {"collection": "Coll"}))
+        self.assertEqual(copies, [])
+
+    def test_a_start_with_nothing_to_rebuild_is_refused_without_a_job(self):
+        # #328: the re-chunk start, and a re-embed with chunking parameters,
+        # refuse before any job record exists and release their guards.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0,
+                    "similarity_threshold": 0.85, "min_chunk_size": 0}
+        before = set(tuning._jobs)
+        with self.stored(("other.txt", 0)):
+            for operation in ("rechunk", "reembed"):
+                with self.subTest(operation=operation), self.assertRaises(tuning.PackageError) as caught:
+                    asyncio.run(tuning.start_tune_job("Coll", operation, {"chunking": chunking}))
+                self.assertEqual((caught.exception.code, caught.exception.message),
+                                 ("SOURCES_REQUIRED", self.NOTHING_TO_REBUILD))
+                self.assertEqual(set(tuning._jobs), before)
+                self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+            with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)):
+                response = asyncio.run(tuning_router.rechunk(RechunkRequest(collection="Coll")))
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCES_REQUIRED")
+            self.assertEqual(set(tuning._jobs), before)
+
+            # Re-embedding the stored chunk text has nothing to rebuild from
+            # the originals, so it still starts.
+            def run(job_id, collection, *args, **kwargs):
+                collection_writes.end_job("tune", job_id)
+                with tuning._lock:
+                    tuning._active.discard(collection)
+
+            async def start():
+                job_id = await tuning.start_tune_job("Coll", "reembed", {"chunking": None})
+                for _ in range(200):
+                    if not tuning._active:
+                        break
+                    await asyncio.sleep(0.01)
+                return job_id
+
+            with patch.object(tuning, "_run", run):
+                job_id = asyncio.run(start())
+        self.assertIn(job_id, set(tuning._jobs) - before)
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_the_up_front_check_runs_after_the_guards_and_only_for_rechunks(self):
+        # #328 (reviewer): TUNE_IN_PROGRESS and COLLECTION_DELETING are answered
+        # before the walk; a re-index, an invalid index (left to the job) and a
+        # collection with a stored listed name all start a job.
+        from services import collection_writes
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0,
+                    "similarity_threshold": 0.85, "min_chunk_size": 0}
+
+        def run(job_id, collection, *args, **kwargs):
+            collection_writes.end_job("tune", job_id)
+            with tuning._lock:
+                tuning._active.discard(collection)
+
+        async def start(operation, params):
+            job_id = await tuning.start_tune_job("Coll", operation, params)
+            for _ in range(200):
+                if not tuning._active:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        before = set(tuning._jobs)
+        started = []
+        with self.stored(("other.txt", 0)) as get_client, patch.object(tuning, "_run", run):
+            with tuning._lock:
+                tuning._active.add("Coll")
+            try:
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(tuning.start_tune_job("Coll", "rechunk", {"chunking": chunking}))
+            finally:
+                with tuning._lock:
+                    tuning._active.discard("Coll")
+            with patch.object(collection_writes, "register_job",
+                              side_effect=collection_writes.CollectionDeletingError("Coll")), \
+                    self.assertRaises(collection_writes.CollectionDeletingError):
+                asyncio.run(tuning.start_tune_job("Coll", "rechunk", {"chunking": chunking}))
+            self.assertEqual((get_client.call_count, set(tuning._jobs)), (0, before))
+            self.assertEqual(tuning._active, set())
+
+            started.append(asyncio.run(start("reindex", {})))
+            self.assertEqual(get_client.call_count, 0)
+            with patch.object(sources, "load_index", side_effect=ValueError("bad index")):
+                started.append(asyncio.run(start("rechunk", {"chunking": chunking})))
+        with self.stored(("other.txt", 0), ("empty.txt", 0)), patch.object(tuning, "_run", run):
+            started.append(asyncio.run(start("rechunk", {"chunking": chunking})))
+        self.assertEqual(set(tuning._jobs) - before, set(started))
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_a_weaviate_error_in_the_up_front_check_is_a_503(self):
+        # #340: a Weaviate failure while the start reads the collection was a
+        # bare 500. It is SERVICE_UNAVAILABLE, with no job, the guards released
+        # and the cause logged but not sent.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0,
+                    "similarity_threshold": 0.85, "min_chunk_size": 0}
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        before = set(tuning._jobs)
+        with patch.object(wc, "get_client", return_value=SimpleNamespace(
+                collections=SimpleNamespace(get=lambda name: coll))):
+            for operation in ("rechunk", "reembed"):
+                with self.subTest(operation=operation), self.assertLogs(tuning._log, "ERROR"), \
+                        self.assertRaises(tuning.ServiceUnavailableError):
+                    asyncio.run(tuning.start_tune_job("Coll", operation, {"chunking": chunking}))
+                self.assertEqual(set(tuning._jobs), before)
+                self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+            with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)), \
+                    self.assertLogs(tuning._log, "ERROR"):
+                response = asyncio.run(tuning_router.rechunk(RechunkRequest(collection="Coll")))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body)["error"], {
+            "code": "SERVICE_UNAVAILABLE",
+            "message": "Cannot check whether 'Coll' can be re-chunked: Weaviate could not be "
+                       "read. No job was started; try again when Weaviate is available.",
+            "detail": {"collection": "Coll"}})
+        self.assertNotIn(b"weaviate down", response.body)
+        self.assertEqual(set(tuning._jobs), before)
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_a_connect_failure_and_the_reembed_route_are_503_too(self):
+        # #340 (reviewer): a failure in get_client itself (no connection), not
+        # only in the walk, is SERVICE_UNAVAILABLE; so is a re-embed with
+        # chunking fields through its route. A re-embed without them never
+        # reads the collection, so it still starts.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import ReembedRequest
+        sources.store("Coll", "empty.txt", b"one", replace=True)
+
+        def run(job_id, collection, *args, **kwargs):
+            collection_writes.end_job("tune", job_id)
+            with tuning._lock:
+                tuning._active.discard(collection)
+
+        before = set(tuning._jobs)
+        with patch.object(wc, "get_client", side_effect=ConnectionError("no route to weaviate")), \
+                patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)):
+            with self.assertLogs(tuning._log, "ERROR"):
+                response = asyncio.run(tuning_router.reembed(ReembedRequest(
+                    collection="Coll", chunking_strategy="fixed", chunk_size=80)))
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(json.loads(response.body)["error"]["code"], "SERVICE_UNAVAILABLE")
+            self.assertNotIn(b"no route", response.body)
+            self.assertEqual(set(tuning._jobs), before)
+            self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+            async def start():
+                response = await tuning_router.reembed(ReembedRequest(collection="Coll"))
+                for _ in range(200):
+                    if not tuning._active:
+                        break
+                    await asyncio.sleep(0.01)
+                return response
+
+            with patch.object(tuning, "_run", run):
+                response = asyncio.run(start())
+        self.assertEqual(response.status, "queued")
+        self.assertIn(response.job_id, set(tuning._jobs) - before)
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_a_weaviate_error_checking_the_collection_at_a_tune_start_is_a_503(self):
+        # #349: the existence check every tune start makes was a bare 500 when
+        # Weaviate failed. It is SERVICE_UNAVAILABLE, with no job, nothing
+        # registered and the cause logged but not sent.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest, ReembedRequest, ReindexRequest
+        requests = {
+            "rechunk": (tuning_router.rechunk, RechunkRequest(collection="Coll")),
+            "reembed": (tuning_router.reembed, ReembedRequest(collection="Coll")),
+            "reindex": (tuning_router.reindex, ReindexRequest(collection="Coll")),
+        }
+        before = set(tuning._jobs)
+        with patch.object(tuning_router.wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))):
+            for operation, (route, body) in requests.items():
+                with self.subTest(operation=operation):
+                    with self.assertLogs(tuning_router._log, "ERROR"):
+                        response = asyncio.run(route(body))
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(json.loads(response.body)["error"], {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": "Cannot check whether 'Coll' exists: Weaviate could not be "
+                                   "read. No job was started; try again when Weaviate is "
+                                   "available.",
+                        "detail": {"collection": "Coll"}})
+                    self.assertNotIn(b"weaviate down", response.body)
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                     (set(), []))
+
+    def test_a_weaviate_error_reading_the_tuning_options_is_a_503(self):
+        # #349: GET /tune/{collection} reads Weaviate for the existence check
+        # and, with retained originals, for the re-chunk check. Either failing
+        # was a bare 500; it is SERVICE_UNAVAILABLE, the cause logged but not sent.
+        from routers import tuning as tuning_router
+        sources.store("Coll", "a.txt", b"one", replace=True)
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        responses = {}
+        with patch.object(tuning_router.wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))), \
+                self.assertLogs(tuning_router._log, "ERROR"):
+            responses["existence check"] = asyncio.run(tuning_router.tune_options("Coll"))
+        with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(wc, "get_client", return_value=SimpleNamespace(
+                    collections=SimpleNamespace(get=lambda name: coll))), \
+                self.assertLogs(tuning._log, "ERROR"):
+            responses["re-chunk check"] = asyncio.run(tuning_router.tune_options("Coll"))
+        for case, response in responses.items():
+            with self.subTest(case=case):
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(json.loads(response.body)["error"], {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": "Cannot read the tuning options for 'Coll': Weaviate could not "
+                               "be read. Try again when Weaviate is available.",
+                    "detail": {"collection": "Coll"}})
+                self.assertNotIn(b"weaviate down", response.body)
 
 class SchemaTests(unittest.TestCase):
     def test_a_record_written_before_the_field_reads_as_zero(self):

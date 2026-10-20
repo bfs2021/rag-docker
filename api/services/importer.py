@@ -730,6 +730,11 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            # Before the existence check: a target the delete hasn't removed yet
+            # would otherwise answer COLLECTION_EXISTS (#324).
+            if on_conflict == "abort" and collection_writes.delete_in_progress(target):
+                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
+                                   {"collection": target})
             exists = wc._collection_exists_sync(target)                 # check 5
             if exists and on_conflict == "abort":
                 raise PackageError(
@@ -744,7 +749,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
             # goes through _delete_collection_sync, which the registry never refuses.
-            collection_writes.register_job(target, "import", job_id)
+            # A target being deleted refuses the import (#302).
+            try:
+                collection_writes.register_job(target, "import", job_id)
+            except collection_writes.CollectionDeletingError:
+                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
+                                   {"collection": target}) from None
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -838,21 +848,28 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
             raise RuntimeError(filename)
         _active.add(filename)
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "filename": filename,
-        "on_conflict": on_conflict,
-        "collection": None,
-        "original_collection": None,
-        "chunks_written": 0,
-        "fidelity": None,
-        "renamed": False,
-        "notes": [],
-        "restored_sessions": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guard; the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "filename": filename,
+            "on_conflict": on_conflict,
+            "collection": None,
+            "original_collection": None,
+            "chunks_written": 0,
+            "fidelity": None,
+            "renamed": False,
+            "notes": [],
+            "restored_sessions": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        with _lock:
+            _active.discard(filename)
+        raise
     asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
     return job_id

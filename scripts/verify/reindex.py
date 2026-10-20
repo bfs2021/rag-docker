@@ -130,7 +130,7 @@ print('PASS independent API lifespan restores recovery, exact records and histor
     restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
     if restarted.returncode:print(restarted.stderr,flush=True)
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
-    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:])
+    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:]+'?confirm=true')
     check(deletion.status_code==200 and deletion.json()['objects_deleted']==len(before),'explicit lowercase-alias DELETE removes the retained backend copy')
     check(not await asyncio.to_thread(paths[0].exists) and not await asyncio.to_thread(snapshot.parent.parent.exists),'explicit recovery deletion retires exactly its ownership journal and metadata snapshots')
 
@@ -194,7 +194,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
             await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
             await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
         await asyncio.to_thread(collection_routes._save_registry, {canonical:'owned', alias:'owned', neighbor:'neighbor'})
-        response=await api.delete('/collections/'+caller)
+        response=await api.delete('/collections/'+caller+'?confirm=true')
         registry=await asyncio.to_thread(collection_routes._load_registry)
         check(registry=={neighbor:'neighbor'},'registry removes both aliases and preserves case-distinct neighbor')
         check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)

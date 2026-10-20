@@ -95,6 +95,9 @@ services:
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
+      # The most one upload's ZIPs may expand to in all, gzipped members'
+      # output included (2 GiB); over it the upload is refused (#298).
+      MAX_ZIP_EXPANDED_BYTES: 2147483648
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.

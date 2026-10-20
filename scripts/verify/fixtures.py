@@ -181,6 +181,10 @@ def write(target: pathlib.Path) -> None:
     (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
     (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
                                       encoding="utf-8")
+    # Issue #314. A JSON Lines file holds at most 1,000,000 lines, every line
+    # counting: jsonl_many_records.jsonl.gz is 1,000,001 records with no text
+    # (about 3 MB decompressed, a few KB gzipped), which fails the file.
+    (target / "jsonl_many_records.jsonl.gz").write_bytes(gzip.compress(b"{}\n" * 1_000_001, mtime=0))
 
     # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
     # files are about 2 MB. zip_over_declared.zip honestly declares a member of
@@ -198,6 +202,22 @@ def write(target: pathlib.Path) -> None:
     stream = gzip.compress(bytes(64 * 1024 * 1024), mtime=0)
     with zipfile.ZipFile(target / "zip_over_gzip.zip", "w", zipfile.ZIP_STORED) as z:
         z.writestr("big.json.gz", stream * 33)
+
+    # Issue #300. JSON files are parsed whole, so their input is limited to
+    # 30,000,000 bytes, and a file may keep at most 1,000,000 records.
+    # json_over_size.json is valid JSON one byte over the limit (spaces after
+    # the value); json_many_records.json is 1,000,001 tiny records (about
+    # 4 MB); json_over_size_gz.zip holds a .json.gz member that decompresses
+    # to one byte over the limit.
+    over = b'{"k": "v"}'
+    over += b" " * (30_000_001 - len(over))
+    (target / "json_over_size.json").write_bytes(over)
+    (target / "json_many_records.json").write_text("[" + ",".join(["[1]"] * 1_000_001) + "]")
+    with zipfile.ZipFile(target / "json_over_size_gz.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", gzip.compress(over, mtime=0))
+    # Reviewer test (#300): the input limit applies to a plain .json ZIP member.
+    with zipfile.ZipFile(target / "json_over_size_member.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("big.json", over)
 
 
 if __name__ == "__main__":

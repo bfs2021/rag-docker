@@ -30,6 +30,9 @@ LINE_LIMIT = ("is longer than 10,000,000 bytes, the most one line can hold; "
               "split the record across lines or files")
 
 
+RECORD_CAP = "has more than 1,000,000 records, the most one file can hold; split the file"
+
+
 def too_large(line):
     return (f"converts to more than 10,000,000 characters of text by line {line}, "
             f"the per-file limit for every chunking strategy; split the file")
@@ -96,20 +99,20 @@ class ConversionTests(JsonlTestCase):
 
     # ── S2.1, S2.3, S2.4, S3.5 ───────────────────────────────────────────────
     def test_crlf_bom_and_no_final_newline(self):
-        self.assertEqual(self.records('﻿{"a": 1}\r\n{"b": 2}\r\n{"c": 3}'),
+        self.assertEqual(self.records('\ufeff{"a": 1}\r\n{"b": 2}\r\n{"c": 3}'),
                          ["a: 1", "b: 2", "c: 3"])
 
     def test_trailing_blank_lines_are_accepted(self):
         self.assertEqual(self.records('{"a": 1}\n\n  \n\t\r\n'), ["a: 1"])
 
     def test_empty_and_blank_only_files_give_nothing(self):
-        for content in ("", "\n\n", " \t\r\n", "﻿", "{}\n[]\n"):
+        for content in ("", "\n\n", " \t\r\n", "\ufeff", "{}\n[]\n"):
             with self.subTest(content=content):
                 self.assertEqual(self.parse(content), ("", []))
 
     def test_u2028_inside_a_string_stays_in_its_line(self):
-        self.assertEqual(self.records('{"a": "one two"}\n{"b": 2}\n'),
-                         ["a: one two", "b: 2"])
+        self.assertEqual(self.records('{"a": "one\u2028two"}\n{"b": 2}\n'),
+                         ["a: one\u2028two", "b: 2"])
 
     def test_source_type(self):
         for name, wanted in (("x.jsonl", "jsonl"), ("X.JSONL", "jsonl"), ("x.jsonl.gz", "jsonl"),
@@ -131,7 +134,7 @@ class LineErrorTests(JsonlTestCase):
 
     def test_bom_on_a_later_line_is_invalid_json(self):
         with self.assertRaisesRegex(ValueError, r"^line 2 is not valid JSON: "):
-            self.parse('{"a": 1}\n﻿{"b": 2}\n')
+            self.parse('{"a": 1}\n\ufeff{"b": 2}\n')
 
     def test_nan_is_refused(self):
         self.assert_fails('{"a": NaN}\n', "line 1 is not valid JSON: NaN is not a JSON value")
@@ -173,6 +176,55 @@ class LineErrorTests(JsonlTestCase):
 
     def test_a_blank_line_is_reported_before_a_later_long_line(self):
         self.assert_fails('{"a": 1}\n\n' + "x" * 10_000_001 + "\n", "line 2 is blank")
+
+    # ── #314: the limit counts neither the line ending nor line 1's BOM ──────
+    def exact_line(self, extra=0):
+        line = '"' + "a" * (ingest_pipeline.MAX_JSONL_LINE_BYTES - 2 + extra) + '"'
+        self.assertEqual(len(line.encode()), 10_000_000 + extra)
+        return line
+
+    def test_a_crlf_line_of_exactly_the_limit_parses(self):
+        # The next line is read, so the ending ended the line; it adds no text.
+        text, elements = self.parse(self.exact_line() + '\r\n{}\r\n')
+        self.assertEqual((len(text), len(elements)), (10_000_000 - 2, 1))
+
+    def test_a_crlf_line_one_byte_over_the_limit_fails(self):
+        self.assert_fails('{"a": 1}\r\n' + self.exact_line(1) + "\r\n", f"line 2 {LINE_LIMIT}")
+
+    def test_an_lf_line_of_exactly_the_limit_before_another_record_parses(self):
+        # The next line is read, so the ending ended the line; it adds no text.
+        text, elements = self.parse(self.exact_line() + '\n{}\n')
+        self.assertEqual((len(text), len(elements)), (10_000_000 - 2, 1))
+
+    def test_the_bom_on_line_1_is_not_counted(self):
+        for ending in ("\n", "\r\n"):
+            with self.subTest(ending=ending):
+                text, _ = self.parse("\ufeff" + self.exact_line() + ending)
+                self.assertEqual(len(text), 10_000_000 - 2)
+                self.assert_fails("\ufeff" + self.exact_line(1) + ending, f"line 1 {LINE_LIMIT}")
+
+    def test_a_lone_carriage_return_is_not_a_line_ending(self):
+        # It stays part of the line, so an exact-limit line with one is one byte over.
+        self.assert_fails(self.exact_line() + "\r", f"line 1 {LINE_LIMIT}")
+        self.assert_fails('{"a": 1}\n' + self.exact_line() + "\r", f"line 2 {LINE_LIMIT}")
+
+    def test_lines_at_the_edge_of_the_read_window_fail(self):
+        # Added by the PR #329 testing review. The read takes the limit plus 5
+        # bytes (BOM and CRLF room): lines 1 to 5 bytes over the limit, whose
+        # CRLF is read whole, split or cut off, all fail on their own line.
+        for over in range(1, 6):
+            for ending in ("\n", "\r\n", ""):
+                with self.subTest(over=over, ending=repr(ending)):
+                    self.assert_fails('{"a": 1}\r\n' + self.exact_line(over) + ending,
+                                      f"line 2 {LINE_LIMIT}")
+                    self.assert_fails("\ufeff" + self.exact_line(over) + ending,
+                                      f"line 1 {LINE_LIMIT}")
+
+    def test_crlf_and_lf_give_the_same_error(self):
+        for ending in ("\n", "\r\n"):
+            with self.subTest(ending=ending):
+                self.assert_fails('{"a": 1}' + ending + '{"b": ' + ending,
+                                  "line 2 is not valid JSON: Expecting value at column 7")
 
 
 class BudgetTests(JsonlTestCase):
@@ -226,6 +278,63 @@ class BudgetTests(JsonlTestCase):
         self.assertLess(peak, 5 * 1024 * 1024, f"peak {peak} bytes")
 
 
+class RecordCapTests(JsonlTestCase):
+    # ── #314: at most 1,000,000 lines, every line counted ────────────────────
+    def capped(self, cap):
+        change = patch.object(ingest_pipeline, "MAX_JSON_RECORDS", cap)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def test_exactly_the_cap_parses_and_one_more_line_fails(self):
+        self.assertEqual(ingest_pipeline.MAX_JSON_RECORDS, 1_000_000)
+        lines = "{}\n" * 1_000_000
+        self.assertEqual(self.parse(lines), ("", []))
+        self.assert_fails(lines + "\n", RECORD_CAP)
+        self.assert_fails(lines + '{"a": 1}', RECORD_CAP)
+
+    def test_a_jsonl_gz_over_the_cap_is_prefixed(self):
+        self.assert_fails("{}\n" * 1_000_001, "was decompressed, but it " + RECORD_CAP, "doc.jsonl.gz")
+
+    def test_blank_lines_and_records_with_no_text_count(self):
+        self.capped(3)
+        self.assertEqual(self.records('{"a": 1}\n{}\n\n'), ["a: 1"])
+        message = "has more than 3 records, the most one file can hold; split the file"
+        for content in ('{"a": 1}\n{}\n\n\n', '{"a": 1}\n\n \n\t\n', '[]\n""\n{}\n{"a": 1}\n'):
+            with self.subTest(content=content):
+                self.assert_fails(content, message)
+
+    def test_a_last_line_without_newline_counts_and_a_final_newline_does_not(self):
+        self.capped(2)
+        self.assertEqual(self.records('{"a": 1}\n{"b": 2}\n'), ["a: 1", "b: 2"])
+        self.assertEqual(self.records('{"a": 1}\r\n{"b": 2}'), ["a: 1", "b: 2"])
+        self.assert_fails('{"a": 1}\n{"b": 2}\n{"c": 3}',
+                          "has more than 2 records, the most one file can hold; split the file")
+
+    def test_the_cap_is_reported_before_the_line_past_it_is_read_as_json(self):
+        self.capped(2)
+        self.assert_fails('{"a": 1}\n{"b": 2}\n{bad\n',
+                          "has more than 2 records, the most one file can hold; split the file")
+
+    def test_reading_stops_at_the_line_past_the_cap(self):
+        self.capped(1000)
+        path = self.write("{}\n" * 200_000)
+        positions = []
+        real = ingest_pipeline._jsonl_records
+
+        def watch(stream):
+            try:
+                return real(stream)
+            finally:
+                positions.append(stream.tell())
+
+        with patch.object(ingest_pipeline, "_jsonl_records", watch), \
+                self.assertRaises(ValueError) as caught:
+            ingest_pipeline._parse_file(path)
+        self.assertEqual(str(caught.exception),
+                         "has more than 1,000 records, the most one file can hold; split the file")
+        self.assertEqual(positions, [1001 * len("{}\n")])
+
+
 class GzipTests(JsonlTestCase):
     # ── S4 ───────────────────────────────────────────────────────────────────
     def assert_no_temp_left(self, keep):
@@ -242,6 +351,12 @@ class GzipTests(JsonlTestCase):
                           "was decompressed, but line 2 is not valid JSON: Expecting value at column 7",
                           "doc.jsonl.gz")
         self.assert_fails('{"a": 1}\n\n{"b": 2}\n', "was decompressed, but line 2 is blank", "doc.jsonl.gz")
+
+    def test_line_limit_error_is_prefixed(self):
+        # #314, from the PR #313 testing review.
+        line = '"' + "a" * (ingest_pipeline.MAX_JSONL_LINE_BYTES - 1) + '"'
+        self.assert_fails('{"a": 1}\n' + line + "\n", f"was decompressed, but line 2 {LINE_LIMIT}",
+                          "doc.jsonl.gz")
 
     def test_budget_error_is_prefixed(self):
         content = json.dumps("a" * 4_999_999) + "\n" + json.dumps("b" * 5_000_000) + "\n"
@@ -311,6 +426,72 @@ class JobTests(JsonlTestCase):
                          [("good.jsonl.gz", "jsonl", "a: 1\n\nb: 2")])
         self.assertEqual([name for name, _ in retained], ["good.jsonl.gz"])
         self.assertTrue(retained[0][1].startswith(b"\x1f\x8b"))  # the file as uploaded
+
+
+class JobOutcomeTests(JsonlTestCase):
+    """Job-level outcomes (#314, from the PR #313 testing review): an empty file
+    completes with 0 chunks, the 10,000-chunk limit fails the file, and
+    context_aware keeps each record one element."""
+
+    def run_job(self, files, strategy="fixed", chunk_size=1000):
+        tmp = Path(tempfile.mkdtemp())  # the job removes it when it ends
+        paths = []
+        for name, data in files:
+            path = tmp / name
+            path.write_bytes(data)
+            paths.append(path)
+        job_id = "t" + uuid.uuid4().hex[:7]
+        ingest_pipeline._jobs[job_id] = {
+            "job_id": job_id, "status": "queued", "files_total": len(paths),
+            "files_completed": 0, "files_failed": 0, "chunks_stored": 0,
+            "errors": [], "skipped": []}
+        self.addCleanup(ingest_pipeline._jobs.pop, job_id, None)
+        stored, retained = [], []
+        with patch.object(wc, "_insert_chunks_sync", lambda _c, chunks: stored.extend(chunks)), \
+                patch.object(wc, "_source_has_chunks_sync", return_value=False), \
+                patch.object(ingest_pipeline.sources, "store",
+                             lambda _c, name, data, *a, **k: retained.append(name)):
+            ingest_pipeline._process_job_sync(job_id, paths, tmp, "Coll", strategy,
+                                              chunk_size, 0, 0.85, 0, None)
+        return ingest_pipeline._jobs[job_id], stored, retained
+
+    def test_an_empty_file_completes_with_no_chunks(self):
+        for strategy in ("fixed", "overlap", "language", "context_aware", "semantic"):
+            with self.subTest(strategy=strategy):
+                job, stored, _ = self.run_job(
+                    [("empty.jsonl", b""), ("nothing.jsonl.gz", gzip.compress(b"{}\n[]\n\n"))],
+                    strategy)
+                self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
+                                  job["chunks_stored"], job["errors"]),
+                                 ("completed", 2, 0, 0, []))
+                self.assertEqual(stored, [])
+
+    def test_context_aware_keeps_each_record_one_element(self):
+        records = [json.dumps({"bill": f"HR-{i}", "title": "t" * 60}) for i in range(3)]
+        job, stored, _ = self.run_job([("r.jsonl", ("\n".join(records) + "\n").encode())],
+                                      "context_aware", chunk_size=100)
+        self.assertEqual(job["status"], "completed", job["errors"])
+        # Each record's text is under 100 characters, two together are over: one chunk each.
+        self.assertEqual([c["content"] for c in stored],
+                         [f"bill: HR-{i}\ntitle: " + "t" * 60 for i in range(3)])
+
+    def test_a_file_over_the_chunk_limit_fails_and_stores_nothing(self):
+        line = json.dumps({"body": "word " * 220_000}) + "\n"  # about 1.1M characters
+        job, stored, retained = self.run_job([("big.jsonl", line.encode())], "fixed", 100)
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(len(job["errors"]), 1)
+        self.assertTrue(job["errors"][0].startswith("big.jsonl: fixed chunking exceeds the per-file limit"),
+                        job["errors"][0])
+        self.assertIn("split the file", job["errors"][0])
+        self.assertEqual((stored, retained), ([], []))
+
+    def test_a_file_over_the_record_cap_fails_and_stores_nothing(self):
+        job, stored, retained = self.run_job(
+            [("many.jsonl.gz", gzip.compress(b"{}\n" * 1_000_001)), ("ok.jsonl", b'{"a": 1}\n')])
+        self.assertEqual(job["status"], "partial")
+        self.assertEqual(job["errors"], ["many.jsonl.gz: was decompressed, but it " + RECORD_CAP])
+        self.assertEqual([c["source_file"] for c in stored], ["ok.jsonl"])
+        self.assertEqual(retained, ["ok.jsonl"])
 
 
 class RechunkTests(unittest.TestCase):
