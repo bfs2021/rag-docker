@@ -277,7 +277,7 @@ rag-docker/
 │   ├── Dockerfile
 │   ├── .dockerignore
 │   ├── requirements.in   # Direct dependencies — edit this one
-│   ├── requirements.txt  # Generated lock — all 156 packages pinned; do not hand-edit
+│   ├── requirements.txt  # Generated lock — all packages pinned; do not hand-edit
 │   ├── main.py
 │   ├── config.py
 │   ├── utils.py
@@ -458,22 +458,13 @@ surviving a vectorizer. See `scripts/verify/README.md`.
 
 Both services pin their dependencies, so a rebuild six months from now installs the same versions as today.
 
-**Python (`api/`)** — `requirements.in` holds the direct dependencies; `requirements.txt` is the generated lock with all 156 packages pinned — those 9 plus everything they pull in — and is what the Dockerfile installs. To change a dependency:
+**Python (`api/`)** — `requirements.in` holds the direct dependencies; `requirements.txt` is the generated lock with all packages pinned — direct dependencies plus their transitive dependencies — and is what the Dockerfile installs. To change a dependency:
 
-```bash
-# 1. edit api/requirements.in, then rebuild so pip re-resolves
-docker compose build api
-
-# 2. regenerate the lock — keeps the header, drops the CPU-index packages
-docker run --rm rag-docker-api pip freeze \
-  | grep -viE '^(torch|torchvision)==' \
-  | LC_ALL=C sort > /tmp/pins.txt
-awk '/^[a-zA-Z0-9]/{exit} {print}' api/requirements.txt > /tmp/header.txt
-cat /tmp/header.txt /tmp/pins.txt > api/requirements.txt
-
-# 3. rebuild to confirm the lock installs cleanly, then commit both files
-docker compose build api
-```
+Follow the resolve-against-current-image procedure at the top of
+`api/requirements.in`: resolve changes with `pip install --dry-run --report`,
+update the sorted lock with the resolved pins, rebuild, then compare the image's
+`pip freeze` (excluding torch/torchvision) against the lock. Editing the input
+and rebuilding alone does not resolve changes because Docker installs the lock.
 
 `LC_ALL=C` keeps the ordering stable across machines, so re-locking produces a clean diff instead of a reshuffle.
 
@@ -731,3 +722,103 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/inges
 ```
 
 Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. Split large documents or select suitable chunk settings. These limits bound ingestion work independently of the upload byte limit.
+
+## Optional backend telemetry
+
+The API includes a private OpenTelemetry SDK lifecycle (#282), disabled by
+default. This foundation does not yet instrument requests/jobs, bridge Python
+logging, or install a collector (#283–#285). Existing application logs retain
+their existing content and behavior; the policy below applies only to OTLP.
+
+To enable it, inject these variables into the **API container** using your own
+Compose override or deployment environment. Compose does not automatically pass
+host variables through. No destination or secret is supplied by this repository.
+
+| Variable | Default / accepted values |
+|---|---|
+| `RAG_OTEL_ENABLED` | `false`; exact `true` or `false` |
+| `RAG_OTEL_ENDPOINT` | Required when enabled; HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
+| `RAG_OTEL_PROTOCOL` | `http/protobuf` only; gRPC is rejected |
+| `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
+| `RAG_OTEL_SERVICE_NAME` | `rag-api` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.1.0` |
+| `RAG_OTEL_ENVIRONMENT` | `development` |
+| `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
+| `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |
+| `RAG_OTEL_QUEUE_SIZE` | `256`; integer 1–4096 per trace/log queue |
+| `RAG_OTEL_BATCH_SIZE` | `64`; integer 1–512, no larger than queue |
+| `RAG_OTEL_TIMEOUT_MS` | `1000`; integer 100–10000 per transport attempt |
+| `RAG_OTEL_INTERVAL_MS` | `5000`; integer 1000–60000 for batching/metric export |
+| `RAG_OTEL_SHUTDOWN_MS` | `3000`; integer 100–30000 per lifecycle call |
+
+Service metadata is explicitly operator-selected public telemetry data: use
+non-sensitive identifiers (1–64 ASCII letters, digits, dots, underscores or
+hyphens, starting with a letter/digit). Do not put customer names or secrets in
+these fields. Headers belong in an uncommitted mounted secret file, never in
+service metadata. Credential headers require HTTPS, including loopback destinations;
+HTTP is accepted only without credentials. Header names are case-insensitive and
+duplicate names (including repeated JSON keys) are rejected. Exporter transport ignores ambient proxies/netrc and uses TLS
+verification; redirects are refused. An enabled runtime rejects a process-level
+`OTEL_SDK_DISABLED` value that the SDK recognizes as true (case-insensitive,
+ignoring surrounding whitespace), before reading secrets or creating exporters.
+Remove that setting or set it to false to enable RAG telemetry. Explicit bootstrap
+configuration mappings cannot override this process-level conflict. Disabled RAG
+telemetry remains a no-op regardless of that setting. The runtime never mutates
+the process environment. Other `OTEL_*` variables are not a supported
+configuration interface for this private runtime.
+
+Disabled mode creates no providers, workers or exporters and does not read the
+secret file. Invalid enabled configuration fails API startup with field-only
+errors. No global OTel provider or root logging handler is installed. Future
+instrumentation uses `app.state.telemetry.tracer`, `.logger` and `.meter`, with
+`force_flush()` and `shutdown()` for lifecycle. Raw SDK providers are internal
+implementation details and are not part of the supported runtime API. This
+encapsulation is not a security boundary against Python private-state access.
+
+Before trace/log queueing and again at the final protobuf transport boundary,
+the runtime drops arbitrary text. Queue records use runtime-owned resources and
+fixed scopes; log wrappers also use fixed limits and discard exception objects
+and context references. The runtime logger copies supplied plain records and both
+layers of supplied wrappers before SDK normalization or exception expansion,
+so caller-owned records remain unchanged. For supplied records and keyword
+emission, only schema-approved attribute strings are snapshotted before SDK
+delegation; forbidden mutable values are discarded, not recursively copied.
+Callers must not mutate their mappings while that snapshot is being constructed.
+Non-mapping attributes consistently become empty. Every emission form receives
+runtime-owned limits before SDK processing (16 attributes, 128 characters), so
+ambient `OTEL_LOGRECORD_ATTRIBUTE_*` and `OTEL_ATTRIBUTE_*` limits cannot truncate
+approved log attributes or cause emission errors.
+Wire resources contain only the three explicit
+service fields; scope is `rag.telemetry`. Span names are `rag.` plus startup,
+query, ingest, export, import, tuning or evaluation (unknown names become
+`rag.operation`). Allowed attributes are `rag.operation` with those operation
+values, `rag.outcome` with ok/error/cancelled, and `error.type` with
+timeout/connection/validation/internal. All other attributes, span events,
+links, trace state, status descriptions, log severity text and arbitrary log
+bodies are removed; log body becomes `rag.operation`. Trace/span IDs remain
+correlation fields, never authentication. The foundation metric allowlist is
+`rag.telemetry.check`; SDK views remove all metric dimensions before aggregation,
+and an explicit always-off exemplar filter prevents original measurement attributes
+from entering SDK exemplar reservoirs, even with ambient
+`OTEL_METRICS_EXEMPLAR_FILTER=always_on`. Export removes descriptions, units and
+exemplars. Export admits exactly one
+finite data point per metric; empty, malformed and multi-point metrics are
+rejected before consuming batch capacity. Multi-point input cannot be merged
+safely after removing dimensions. Histograms require at most 31 finite, strictly
+increasing boundaries, consistent bucket totals and finite optional sum/min/max
+with min no greater than max. Invalid histograms are dropped. Later stories extend this schema deliberately.
+Do not pass content into instrumentation even though the exporter excludes it:
+active SDK spans may retain inputs until completion.
+
+The pinned SDK and OTLP HTTP exporter are version 1.44.0. Bounded batch queues
+drop oldest pending records under load. Each export makes one HTTP attempt;
+HTTP failures, redirects and network exceptions become fixed diagnostics with
+no endpoint, headers or response body. No retries occur. Application work never
+waits for export. Flush/shutdown wait at most the configured lifecycle deadline
+and return whether processing completed, **not** proof of collector delivery.
+A single daemon lifecycle worker per runtime continues cleanup after a timeout;
+repeated calls reuse it. Requests timeouts cannot cancel OS DNS resolution or
+force-stop a stalled system call, so a timed-out export may finish later. There
+are no additional workers per record or per repeated lifecycle call. API cleanup
+runs on both startup failure and normal shutdown. Collector provisioning and
+end-to-end application instrumentation remain separate work.

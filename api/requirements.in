@@ -46,3 +46,7 @@ unstructured[pdf,docx,csv,md]>=0.14  # resolved: 0.27.5 -- 'md' extra pulls `mar
 langchain-text-splitters>=0.3     # resolved: 1.1.2
 sentence-transformers>=3.0        # resolved: 6.0.1
 python-multipart>=0.0.9           # resolved: 0.0.32
+
+# Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0

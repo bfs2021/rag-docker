@@ -6,7 +6,7 @@
 #     docker run --rm rag-docker-api pip freeze
 #
 # Direct dependencies (the human-maintained intent) live in requirements.in.
-# To change a dependency: edit requirements.in, rebuild, re-freeze, commit both.
+# To change a dependency: follow the resolution procedure in requirements.in.
 #
 # torch and torchvision are deliberately ABSENT. They are installed from the
 # PyTorch CPU index in api/Dockerfile because the default PyPI wheel pulls in
@@ -96,6 +96,11 @@ onnx==1.22.0
 onnxruntime==1.30.0
 opencv-python==5.0.0.93
 opentelemetry-api==1.44.0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
 orjson==3.12.0
 packaging==26.3
 pandas==2.3.3

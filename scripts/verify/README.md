@@ -633,3 +633,12 @@ Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Pyt
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
 three-save race that must not republish the same result over new edits.
+
+### Optional telemetry foundation (#282)
+
+Suite 01 runs `scripts/tests/test_telemetry.py` in the built API image with
+`--network none`; its real OTLP/protobuf receiver uses container loopback only.
+Checks cover SDK traces/logs/metrics, sentinel privacy across schema surfaces,
+configuration/no-op behavior, overload and bounded lifecycle failure. It also
+checks embedded copies with `scripts/tests/test_telemetry_implementation.py`.
+This does not claim application request/job instrumentation or collector setup.

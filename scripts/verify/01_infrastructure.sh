@@ -8,6 +8,13 @@ require_stack
 C="${PREFIX}Infra"
 
 section "§10.5 Infrastructure"
+# Synthetic loopback receiver inside an isolated container; no collector or
+# external network is needed and no request payload from the stack is captured.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry.py)
+check "OTel configuration, safe OTLP export and bounded lifecycle" $?
+python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
+check "OTel embedded implementation stays synchronized" $?
+
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
 # Also release the verify lock: this trap replaces the one lock.sh set.

@@ -1196,6 +1196,8 @@ langchain-text-splitters>=0.3
 sentence-transformers>=3.0
 python-multipart>=0.0.9
 aiofiles>=23.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
 ```
 
 **Dependency pinning (normative).** The list above is *intent*, held in
@@ -1206,16 +1208,16 @@ is current: that is exactly how `weaviate-client` drifted to a release requiring
 newer Weaviate server than the one pinned here, breaking every collection call
 while the stack still reported healthy.
 
-Regenerate the lock from the repo root after editing `requirements.in`:
+The SDK and OTLP HTTP exporter entries in `api/requirements.in` are required
+for enabled telemetry startup; lock regeneration must retain both at 1.44.0
+and resolve their transitive dependencies.
 
-```bash
-docker compose build api
-docker run --rm rag-docker-api:latest pip freeze \
-  | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
-awk '/^[a-zA-Z0-9]/{exit} {print}' api/requirements.txt > /tmp/header.txt
-cat /tmp/header.txt /tmp/pins.txt > api/requirements.txt
-docker compose build api          # confirm the lock installs cleanly
-```
+Regenerate the lock from the repo root using the procedure at the top of
+`api/requirements.in`: resolve the edited inputs against the current API image
+with `pip install --dry-run --report`, incorporate the resolved pins into the
+sorted lock, rebuild, and compare the resulting image's `pip freeze` (excluding
+torch/torchvision) to the lock. Editing the input and rebuilding alone does not
+resolve new dependencies, because the Dockerfile installs only the lock.
 
 `LC_ALL=C` keeps ordering stable so a re-lock produces a clean diff.
 
@@ -2645,3 +2647,51 @@ Overlap retains internal whitespace-only windows to preserve exact character cov
       *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
 
 - [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry.
+
+## Optional telemetry foundation (#282)
+
+The backend owns one optional private OpenTelemetry runtime initialized before
+startup clients and always closed on failed startup or shutdown. It is disabled
+by default with no exporter construction or telemetry egress. Enabled invalid
+configuration fails with field-only errors. Enabled RAG telemetry rejects a real
+process `OTEL_SDK_DISABLED` value whose stripped, lowercase value is `true`,
+before secret access or exporter construction, because all three pinned SDK
+providers otherwise silently disable signals. Explicit configuration mappings
+cannot mask this conflict; disabled RAG telemetry still returns a no-op. The
+runtime must not mutate the process environment or global providers.
+Configuration and finite safe schema
+are specified in README.md, “Optional backend telemetry”. No global providers,
+automatic request instrumentation, application log bridge or collector deployment
+are included in this foundation. Raw SDK providers remain internal; supported
+instrumentation uses the runtime tracer, safe logger and meter, with lifecycle
+through force_flush/shutdown. Python private-state access is outside this API
+contract, not prevented by a security sandbox.
+
+Only explicit service resource metadata, fixed instrumentation scope, finite
+operation/outcome/error values and trace identifiers may leave through OTLP.
+Prompts, answers, request/response bodies, credentials, filenames, paths,
+document text, free-form errors/events and metric dimensions are excluded. The
+export boundary rebuilds protobuf records; trace/log queue inputs are sanitized
+as well, including runtime-owned resource/scope metadata and log limits; queued
+logs retain neither exception objects nor caller context references. Processor
+sanitization must not modify caller-owned records. The runtime logger copies
+supplied plain records and wrapper/inner records before SDK processing so both
+normalization and exception expansion preserve caller-owned inputs; keyword
+emission remains supported. All three forms snapshot finite schema-approved
+attribute strings before SDK delegation, excluding forbidden mutable values;
+concurrent caller mutation during snapshot construction is unsupported. All
+non-mapping attributes normalize to empty. Each emission form is wrapped with
+runtime-owned limits before SDK processing, independent of ambient log/global
+attribute count and length limits.
+The private meter provider explicitly disables exemplar sampling so
+attributes removed by metric views cannot remain in exemplar reservoirs; ambient
+exemplar filter settings cannot override this policy. Existing application logging
+remains unchanged. Bounded SDK queues,
+one-attempt HTTP export and bounded lifecycle caller waits keep collector outages
+independent of application work; OS DNS cancellation is not guaranteed.
+
+Infrastructure verification runs real SDK traces/logs/metrics through a synthetic
+loopback OTLP receiver with sentinel content and checks disabled behavior,
+configuration validation, resources, sampling/signals, overload, export failure,
+flush/shutdown, and embedded implementation consistency. It requires no collector
+or external provider. Full acceptance runs only in the disposable verify project.

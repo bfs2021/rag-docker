@@ -10,55 +10,63 @@ from fastapi.middleware.cors import CORSMiddleware
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import asyncio
-    import logging
-    from services import goldstandard, metrics
-    from services import weaviate_client as wc
-    goldstandard.load_sessions_from_disk()
-    goldstandard.reconcile_interrupted_generations()
-    metrics.load_from_disk()
-    # Sweep only durably owned scratch. Verified recovery collections and
-    # unowned marker-like names must survive startup.
-    log = logging.getLogger(__name__)
+    from services.telemetry import bootstrap
+    runtime = bootstrap()
+    app.state.telemetry = runtime
     try:
-        abandoned = await wc.sweep_staging()
-        if abandoned:
-            log.warning("Removed %d staging collection(s) left by a previous run: %s. "
-                        "Re-import the package to try again; it is still in ./exports.",
-                        len(abandoned), ", ".join(abandoned))
-    except Exception:                                 # noqa: BLE001
-        log.exception("Startup sweep of staging collections failed")
-    try:
-        from services import importer
-        partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
-        if partial:
-            log.warning("Removed %d collection(s) left half-built by an interrupted "
-                        "import: %s. Re-import the package to try again.",
-                        len(partial), ", ".join(partial))
-        stale_dirs = await asyncio.to_thread(importer.sweep_stale_workdirs)
-        if stale_dirs:
-            log.warning("Removed %d abandoned extraction directory(ies): %s",
-                        len(stale_dirs), ", ".join(stale_dirs))
-    except Exception:                                 # noqa: BLE001
-        log.exception("Startup sweep of interrupted imports failed")
-    # Job records survive a restart (#23). After the sweeps, so a job interrupted
-    # mid-import is reported failed and its half-built collection already swept.
-    # No worker from the previous process is alive, so any job still queued or
-    # running is marked interrupted before the first request is served.
-    from services import exporter, importer, ingest_pipeline, tuning
-    interrupted = []
-    for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
-                         ("import", importer), ("tune", tuning)):
+        import logging
+        from services import goldstandard, metrics
+        from services import weaviate_client as wc
+        goldstandard.load_sessions_from_disk()
+        goldstandard.reconcile_interrupted_generations()
+        metrics.load_from_disk()
+        # Sweep only durably owned scratch. Verified recovery collections and
+        # unowned marker-like names must survive startup.
+        log = logging.getLogger(__name__)
         try:
-            marked = await asyncio.to_thread(module._jobs.load)
-            interrupted += [f"{kind} {job_id}" for job_id in marked]
-        except Exception:                             # noqa: BLE001
-            log.exception("Could not load the %s job records", kind)
-    if interrupted:
-        log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
-                    "says so; start them again.", len(interrupted), ", ".join(interrupted))
-    yield
-    from services import weaviate_client as wc
-    wc.close_client()
+            abandoned = await wc.sweep_staging()
+            if abandoned:
+                log.warning("Removed %d staging collection(s) left by a previous run: %s. "
+                            "Re-import the package to try again; it is still in ./exports.",
+                            len(abandoned), ", ".join(abandoned))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of staging collections failed")
+        try:
+            from services import importer
+            partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
+            if partial:
+                log.warning("Removed %d collection(s) left half-built by an interrupted "
+                            "import: %s. Re-import the package to try again.",
+                            len(partial), ", ".join(partial))
+            stale_dirs = await asyncio.to_thread(importer.sweep_stale_workdirs)
+            if stale_dirs:
+                log.warning("Removed %d abandoned extraction directory(ies): %s",
+                            len(stale_dirs), ", ".join(stale_dirs))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted imports failed")
+        # Job records survive a restart (#23). After the sweeps, so a job interrupted
+        # mid-import is reported failed and its half-built collection already swept.
+        # No worker from the previous process is alive, so any job still queued or
+        # running is marked interrupted before the first request is served.
+        from services import exporter, importer, ingest_pipeline, tuning
+        interrupted = []
+        for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
+                             ("import", importer), ("tune", tuning)):
+            try:
+                marked = await asyncio.to_thread(module._jobs.load)
+                interrupted += [f"{kind} {job_id}" for job_id in marked]
+            except Exception:                             # noqa: BLE001
+                log.exception("Could not load the %s job records", kind)
+        if interrupted:
+            log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
+                        "says so; start them again.", len(interrupted), ", ".join(interrupted))
+        yield
+    finally:
+        try:
+            from services import weaviate_client as wc
+            wc.close_client()
+        finally:
+            await asyncio.to_thread(runtime.shutdown)
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
