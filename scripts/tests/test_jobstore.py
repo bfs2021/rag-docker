@@ -442,6 +442,26 @@ class FirstHeld(Recording):
         self.stored.set()
 
 
+class FailThenHold(Recording):
+    """A Recording whose first write is held and then raises, and whose second
+    write is held until second_release, then stores."""
+
+    def __init__(self, kind):
+        super().__init__(kind, hold=True)
+        self.second_release = threading.Event()
+
+    def __setitem__(self, job_id, doc):
+        first = not self.ids
+        self.ids.append(job_id)
+        if first:
+            self.entered.set()
+            self.release.wait(10)
+            raise OSError("disk gone")
+        self.second_release.wait(10)
+        jobstore.JobStore.__setitem__(self, job_id, doc)
+        self.stored.set()
+
+
 class StartTests(StoreTestCase):
     """The four job starts store their first record off the event loop, and a
     start cancelled during that write leaves nothing behind (#309). A second
@@ -778,6 +798,57 @@ class StartTests(StoreTestCase):
         self.assertEqual(store[job_id]["status"], "queued")
         self.assertEqual(len(calls), 1)
         self.assertEqual(exporter._starting, {})
+
+    # Added by the testing reviewer (#338): the bound covers all of a start's
+    # waits together, counted from its first wait, not each wait afresh.
+    def test_the_bound_counts_from_the_first_wait_across_later_waits(self):
+        store = FailThenHold("export")
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(exporter, "_jobs", store),
+                       patch.object(exporter, "_run", side_effect=lambda *a, **k: calls.append(a)),
+                       patch.object(exporter, "START_WAIT", 2.0)):
+            change.start()
+            self.addCleanup(change.stop)
+        self.addCleanup(store.release.set)
+        self.addCleanup(store.second_release.set)
+        name = "Vfy338Total"
+
+        async def timed():
+            began = asyncio.get_running_loop().time()
+            try:
+                return await exporter.start_export_job(name), None
+            except exporter.ExportStartingError as exc:
+                return exc, asyncio.get_running_loop().time() - began
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            waiters = [asyncio.ensure_future(timed()) for _ in range(2)]
+            await asyncio.sleep(1.5)             # both wait on the first start
+            store.release.set()                  # its write fails; one waiter takes the slot
+            with self.assertRaises(OSError):
+                await first
+            # the other waits again, on the winner, whose write is held
+            done, _ = await asyncio.wait(waiters, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            gave_up = [w.result() for w in done]
+            store.second_release.set()
+            results = [await w for w in waiters]
+            return gave_up, results
+
+        gave_up, results = asyncio.run(run())
+        refused = [elapsed for value, elapsed in results if elapsed is not None]
+        started = [value for value, elapsed in results if elapsed is None]
+        self.assertEqual(len(refused), 1, results)
+        self.assertEqual(len(started), 1, results)
+        # 2.0 s from its first wait, not 1.5 + 2.0 s from its second
+        self.assertGreaterEqual(refused[0], 1.9)
+        self.assertLess(refused[0], 3.0)
+        self.assertEqual(exporter._active.get(name), started[0])
+        self.assertEqual(store[started[0]]["status"], "queued")
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, started[0])
 
     def test_the_route_answers_export_starting_with_no_job_id(self):
         from unittest.mock import AsyncMock
