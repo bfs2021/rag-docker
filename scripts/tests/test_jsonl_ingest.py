@@ -99,20 +99,20 @@ class ConversionTests(JsonlTestCase):
 
     # ── S2.1, S2.3, S2.4, S3.5 ───────────────────────────────────────────────
     def test_crlf_bom_and_no_final_newline(self):
-        self.assertEqual(self.records('﻿{"a": 1}\r\n{"b": 2}\r\n{"c": 3}'),
+        self.assertEqual(self.records('\ufeff{"a": 1}\r\n{"b": 2}\r\n{"c": 3}'),
                          ["a: 1", "b: 2", "c: 3"])
 
     def test_trailing_blank_lines_are_accepted(self):
         self.assertEqual(self.records('{"a": 1}\n\n  \n\t\r\n'), ["a: 1"])
 
     def test_empty_and_blank_only_files_give_nothing(self):
-        for content in ("", "\n\n", " \t\r\n", "﻿", "{}\n[]\n"):
+        for content in ("", "\n\n", " \t\r\n", "\ufeff", "{}\n[]\n"):
             with self.subTest(content=content):
                 self.assertEqual(self.parse(content), ("", []))
 
     def test_u2028_inside_a_string_stays_in_its_line(self):
-        self.assertEqual(self.records('{"a": "one two"}\n{"b": 2}\n'),
-                         ["a: one two", "b: 2"])
+        self.assertEqual(self.records('{"a": "one\u2028two"}\n{"b": 2}\n'),
+                         ["a: one\u2028two", "b: 2"])
 
     def test_source_type(self):
         for name, wanted in (("x.jsonl", "jsonl"), ("X.JSONL", "jsonl"), ("x.jsonl.gz", "jsonl"),
@@ -134,7 +134,7 @@ class LineErrorTests(JsonlTestCase):
 
     def test_bom_on_a_later_line_is_invalid_json(self):
         with self.assertRaisesRegex(ValueError, r"^line 2 is not valid JSON: "):
-            self.parse('{"a": 1}\n﻿{"b": 2}\n')
+            self.parse('{"a": 1}\n\ufeff{"b": 2}\n')
 
     def test_nan_is_refused(self):
         self.assert_fails('{"a": NaN}\n', "line 1 is not valid JSON: NaN is not a JSON value")
@@ -217,7 +217,7 @@ class LineErrorTests(JsonlTestCase):
                 with self.subTest(over=over, ending=repr(ending)):
                     self.assert_fails('{"a": 1}\r\n' + self.exact_line(over) + ending,
                                       f"line 2 {LINE_LIMIT}")
-                    self.assert_fails("﻿" + self.exact_line(over) + ending,
+                    self.assert_fails("\ufeff" + self.exact_line(over) + ending,
                                       f"line 1 {LINE_LIMIT}")
 
     def test_crlf_and_lf_give_the_same_error(self):
