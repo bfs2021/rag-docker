@@ -79,9 +79,17 @@ def private_ca():
                                        serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
         yield paths
 
+@contextlib.contextmanager
+def no_file_reads():
+    """Fail the test on a file read by os.open, Path.read_bytes, Path.open or builtin open."""
+    with contextlib.ExitStack() as stack:
+        for target in ('os.open', 'pathlib.Path.read_bytes', 'pathlib.Path.open', 'builtins.open'):
+            stack.enter_context(patch(target, side_effect=AssertionError('read '+target)))
+        yield
+
 class TelemetryTests(unittest.TestCase):
     def test_disabled_never_constructs_transport_or_reads_secrets(self):
-        with patch('services.telemetry._session', side_effect=AssertionError), patch('os.open', side_effect=AssertionError):
+        with patch('services.telemetry._session', side_effect=AssertionError), no_file_reads():
             runtime = bootstrap({'RAG_OTEL_HEADERS_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
             self.assertFalse(runtime.config.enabled)
             self.assertEqual(runtime._providers, [])
@@ -94,7 +102,7 @@ class TelemetryTests(unittest.TestCase):
                 before = dict(os.environ)
                 env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318',
                        'RAG_OTEL_HEADERS_FILE':SECRET, 'OTEL_SDK_DISABLED':'false'}
-                with patch('services.telemetry._session', side_effect=AssertionError), patch('os.open', side_effect=AssertionError):
+                with patch('services.telemetry._session', side_effect=AssertionError), no_file_reads():
                     for signals in ({}, {'RAG_OTEL_TRACES':'false'}, {'RAG_OTEL_LOGS':'false'}, {'RAG_OTEL_METRICS':'false'}):
                         with self.assertRaises(TelemetryConfigError) as error:
                             bootstrap({**env, **signals})
@@ -888,7 +896,7 @@ class TelemetryTests(unittest.TestCase):
             self.assertNotIn('/v1/logs', {path for path, _ in records})
 
     def test_ca_file_disabled_invalid_and_https_rule(self):
-        with patch('services.telemetry._session', side_effect=AssertionError), patch('os.open', side_effect=AssertionError), \
+        with patch('services.telemetry._session', side_effect=AssertionError), no_file_reads(), \
                 patch('ssl.create_default_context', side_effect=AssertionError):
             runtime = bootstrap({'RAG_OTEL_CA_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
             self.assertFalse(runtime.config.enabled)
@@ -1081,5 +1089,76 @@ class TelemetryTests(unittest.TestCase):
                 self.assertEqual(fired, [], key+' blocked on a path swapped for a FIFO')
                 self.assertEqual(str(raised.exception), 'Invalid '+key)
                 self.assertNotIn(path, str(raised.exception))
+
+    def test_reviewer_descriptor_closed_on_every_path(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        real_open = os.open
+        def closed(descriptor):
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                return True
+            return False
+        for key in ('RAG_OTEL_HEADERS_FILE', 'RAG_OTEL_CA_FILE'):
+            for case in ('read fails', 'swapped for a fifo'):
+                with self.subTest(key=key, case=case), tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, SECRET.replace('/', '_')+'-fd')
+                    Path(path).write_bytes(b'{}')
+                    opened, fired, done = [], [], threading.Event()
+                    def recording_open(name, flags, *args, **kwargs):
+                        if name == path and case == 'swapped for a fifo':
+                            os.remove(path); os.mkfifo(path)
+                        descriptor = real_open(name, flags, *args, **kwargs)
+                        if name == path:
+                            opened.append(descriptor)
+                        return descriptor
+                    def watchdog():
+                        if not done.wait(5):
+                            fired.append(True)
+                            os.close(real_open(path, os.O_WRONLY))
+                    if case == 'swapped for a fifo':
+                        threading.Thread(target=watchdog, daemon=True).start()
+                    try:
+                        with patch('os.open', side_effect=recording_open), \
+                                patch('os.fdopen', side_effect=OSError('read')), \
+                                patch('ssl.create_default_context', side_effect=AssertionError('loaded')), \
+                                self.assertRaises(TelemetryConfigError) as raised:
+                            Config.from_env({**base, key:path})
+                    finally:
+                        done.set()
+                    self.assertEqual(fired, [], key+' blocked on a path swapped for a FIFO')
+                    self.assertEqual(len(opened), 1)
+                    self.assertTrue(closed(opened[0]), key+' leaked its descriptor when '+case)
+                    self.assertEqual(str(raised.exception), 'Invalid '+key)
+                    self.assertNotIn(path, str(raised.exception))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'headers')
+            Path(path).write_text('{"Authorization":"a"}')
+            opened = []
+            def recording_open(name, flags, *args, **kwargs):
+                descriptor = real_open(name, flags, *args, **kwargs)
+                if name == path:
+                    opened.append(descriptor)
+                return descriptor
+            with patch('os.open', side_effect=recording_open):
+                cfg = Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path})
+            self.assertEqual(set(cfg.headers), {'Authorization'})
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(closed(opened[0]), 'RAG_OTEL_HEADERS_FILE leaked its descriptor after a successful read')
+
+    def test_reviewer_header_file_size_edge(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        body = '{"Authorization":"a"}'
+        for size, accepted in ((8192, True), (8193, False)):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, 'headers')
+                Path(path).write_text(body + ' '*(size-len(body)))
+                self.assertEqual(os.path.getsize(path), size)
+                if accepted:
+                    self.assertEqual(set(Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path}).headers), {'Authorization'})
+                else:
+                    with self.assertRaises(TelemetryConfigError) as raised:
+                        Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path})
+                    self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_HEADERS_FILE')
 
 if __name__ == '__main__':unittest.main()
