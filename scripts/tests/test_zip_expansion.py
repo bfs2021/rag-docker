@@ -63,6 +63,12 @@ def with_reserved_flag(data):
     return data[:3] + bytes([data[3] | 0x20]) + data[4:]
 
 
+def with_long_name(data, size):
+    """FNAME set, with a name of size bytes: the gzip reader reads it one byte
+    per call."""
+    return data[:3] + bytes([data[3] | 0x08]) + data[4:10] + b"n" * size + b"\0" + data[10:]
+
+
 def job_output(data):
     """How many bytes the job's reader (the gzip module) gets from data before
     it ends or refuses it."""
@@ -312,6 +318,72 @@ class GzipHeaderTests(CapHarness):
                 self.assertIsNone(problem)
                 # The member's own bytes, once, plus what the job would decompress.
                 self.assertEqual(budget.used, len(data) + job_output(data))
+
+    def test_damage_found_while_counting_a_gzip_member_is_damage(self):
+        # The ZIP layer fails inside the gzip count (an invalid deflate block
+        # in a .json.gz member): the zip is unreadable, not a gzip job error.
+        data = bytearray(zip_bytes([("a.json.gz", gzip.compress(b'{"a": 1}' * 1000, mtime=0))]))
+        data[30 + len("a.json.gz")] = 0x07   # BTYPE 11: an invalid deflate block
+        status, body = self.post(upload("dmg.zip", bytes(data)))
+        self.assertEqual((status, body["error"]["code"]), (400, "ARCHIVE_UNREADABLE"), body)
+        self.assertEqual([m["member"] for m in body["error"]["detail"]["members"]], ["a.json.gz"])
+        self.assertTrue(body["error"]["detail"]["members"][0]["reason"].startswith("damaged: Error -3"),
+                        body["error"]["detail"]["members"])
+        self.assertEqual(set(ingest_pipeline._jobs), self.jobs_before)
+        self.assertEqual(set(self.uploads.iterdir()), self.uploads_before)
+
+
+class GzipBufferTests(unittest.TestCase):
+    """The count reads a gzipped member a block at a time, though the gzip
+    reader reads header fields and padding one byte per call (#319)."""
+
+    def count_reads(self, data):
+        """How many reads of the ZIP member validating it takes; the count
+        itself must stay the member's bytes plus what the job decompresses."""
+        reads = []
+        real = ingest_pipeline._CountedMember.read
+
+        def read(member, size=-1):
+            reads.append(size)
+            return real(member, size)
+
+        buf = io.BytesIO(zip_bytes([("a.json.gz", data)]))
+        with zipfile.ZipFile(buf) as z, \
+                patch.object(ingest_pipeline._CountedMember, "read", read):
+            budget = ingest_pipeline._ExpansionBudget(10 * CAP)
+            problem = ingest_pipeline._member_problem(z, z.infolist()[0], budget, True)
+        self.assertIsNone(problem)
+        self.assertEqual(budget.used, len(data) + job_output(data))
+        return len(reads)
+
+    def test_zero_padding_is_read_in_blocks(self):
+        data = gzip.compress(b"x" * 1000) + b"\0" * (4 * 1024 * 1024)
+        self.assertLess(self.count_reads(data), 100)
+
+    def test_a_long_file_name_is_read_in_blocks(self):
+        data = with_long_name(gzip.compress(b"x" * 1000), 2 * 1024 * 1024)
+        self.assertEqual(job_output(data), 1000)
+        self.assertLess(self.count_reads(data), 100)
+
+    def test_data_read_ahead_past_the_stream_counts_once(self):
+        # The stream ends early and more than a block follows: the buffer
+        # reads part of it ahead, the caller reads the rest; each byte counts once.
+        # (The gzip reader refuses the junk after the stream, so the job gets
+        # nothing from it; the count matches that.)
+        data = gzip.compress(b"x" * 1000) + b"junk" + os.urandom(3 * 1024 * 1024)
+        self.assertLess(self.count_reads(data), 100)
+
+    def test_the_cap_still_stops_a_buffered_read(self):
+        # The member's own bytes pass the cap while the buffer fills for the
+        # gzip reader: _OverCap comes through the buffer and the gzip reader,
+        # not swallowed as invalid gzip data.
+        data = with_long_name(gzip.compress(b"x" * 1000), 2 * 1024 * 1024)
+        buf = io.BytesIO(zip_bytes([("a.json.gz", data)]))
+        with zipfile.ZipFile(buf) as z:
+            budget = ingest_pipeline._ExpansionBudget(CAP)
+            with self.assertRaises(ingest_pipeline._OverCap):
+                ingest_pipeline._member_problem(z, z.infolist()[0], budget, True)
+        self.assertLessEqual(budget.used, CAP + ingest_pipeline._BLOCK, budget.used)
 
 
 class EventLoopTests(unittest.TestCase):

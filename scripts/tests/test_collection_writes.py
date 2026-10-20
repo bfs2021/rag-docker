@@ -229,7 +229,7 @@ class DeletedRecoveryTests(unittest.TestCase):
                      patch.object(route, '_registry_lock', asyncio.Lock()), \
                      patch.object(route, '_load_registry', return_value=registry), \
                      patch.object(route, '_save_registry') as save:
-                    asyncio.run(route.delete_collection(caller))
+                    asyncio.run(route.delete_collection(caller, confirm='true'))
                     if fails:
                         save.assert_not_called()
                         self.assertEqual(len(registry), 3)

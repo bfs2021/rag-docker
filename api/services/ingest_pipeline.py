@@ -3,6 +3,7 @@ from services import telemetry
 import asyncio
 import errno
 import gzip
+import io
 import json
 import logging
 import mimetypes
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from services import collection_writes, jobstore
+from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
@@ -27,16 +28,19 @@ from services import weaviate_client as wc
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
 # Gzipped JSON is accepted inside a ZIP only (issue #290); gzipped JSON Lines
 # directly or inside a ZIP (#291). Either is decompressed when the job parses
-# it, never more than this many bytes. The bound is per file, so several
-# gzipped members could each reach it: a ZIP's members, their gzip output
-# included, are bounded together by settings.max_zip_expanded_bytes (#298). A
-# directly uploaded .jsonl.gz is bounded by this alone.
+# it: a .json.gz never past MAX_JSON_INPUT_BYTES (#300), a .jsonl.gz never past
+# MAX_GZIP_DECOMPRESSED_BYTES. The bounds are per file, so several gzipped
+# members could each reach them: a ZIP's members, their gzip output included,
+# are bounded together by settings.max_zip_expanded_bytes (#298). A directly
+# uploaded .jsonl.gz is bounded by its own limit alone.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
 MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 # The most of one JSON Lines line that is read (#291). A line is parsed whole,
 # so this bounds the memory one record can take (a 10 MB line of small numbers
 # parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+# It counts neither the line ending (`\n` or `\r\n`) nor line 1's byte-order
+# mark, so a CRLF file and an LF file behave the same (#314).
 MAX_JSONL_LINE_BYTES = 10_000_000
 
 # Job records survive an API restart (#23); see jobstore.py.
@@ -101,7 +105,8 @@ def _gzip_too_large() -> ValueError:
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
-    """Decompress src into dest in blocks, refusing more than the limit."""
+    """Decompress a .json.gz into dest in blocks, stopping as soon as the output
+    passes the JSON input limit (#300)."""
     written = 0
     try:
         with gzip.open(src, "rb") as gz, dest.open("wb") as out:
@@ -110,8 +115,8 @@ def _gunzip_bounded(src: Path, dest: Path) -> None:
                 if not block:
                     break
                 written += len(block)
-                if written > MAX_GZIP_DECOMPRESSED_BYTES:
-                    raise _gzip_too_large()
+                if written > MAX_JSON_INPUT_BYTES:
+                    raise ValueError(_json_input_too_large("decompresses to more than"))
                 out.write(block)
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
@@ -143,6 +148,42 @@ class _JsonTooLarge(_JsonError):
 # so the bound refuses nothing that could have been ingested; it only refuses
 # before the text is built.
 MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
+# The most bytes of one JSON file that are parsed (#300). A .json file is parsed
+# whole, before the text bound can be checked, and parsing takes up to about 34
+# times the file's size (`[[1],[1],...]`), so this bounds one file's parse at
+# about 1 GB. A .json.gz member stops decompressing here. JSON Lines files are
+# read a line at a time and have their own limits.
+MAX_JSON_INPUT_BYTES = 30_000_000
+# The most records one JSON file may keep (#300). Each kept record of a
+# top-level array becomes its own element, and the text bound alone still
+# allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
+# blank line between records). A file of more than this many records averages
+# under 8 characters a record; any other passes the text bound first.
+# It also bounds a JSON Lines file's lines (#314): every line counts, blank ones
+# and records with no text included, since those spend none of the text bound.
+# An element-schema file's items count too (#321): partition_json builds each
+# into an element, whatever its text.
+MAX_JSON_RECORDS = 1_000_000
+
+
+def _json_input_too_large(verb: str) -> str:
+    return (f"{verb} {MAX_JSON_INPUT_BYTES:,} bytes, the most one JSON file can hold; "
+            f"split the file or convert it to JSON Lines")
+
+
+def _too_many_records() -> str:
+    # One message for the JSON record cap and the JSON Lines line cap (#330).
+    return (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+            f"split the file")
+
+
+class _JsonTooManyRecords(_JsonError):
+    """Valid JSON with more kept records than one file may hold (#300)."""
+
+    def __init__(self) -> None:
+        detail = _too_many_records()
+        ValueError.__init__(self, detail)
+        self.detail = detail
 
 
 class _JsonNumber:
@@ -265,6 +306,10 @@ def _json_records(value: Any) -> list[str]:
             _json_lines(group, None, lines, budget)
             text = "\n".join(lines)
             if text.strip():
+                if records:
+                    budget.spend(2)  # the blank line before this record (#300)
+                if len(records) == MAX_JSON_RECORDS:
+                    raise _JsonTooManyRecords()
                 records.append(text)
             else:
                 budget.left = left  # a dropped record's text is not stored
@@ -276,12 +321,22 @@ def _json_records(value: Any) -> list[str]:
 def _parse_json(path: Path) -> tuple[str, list[Any]]:
     """Ordinary JSON becomes `key: value` text, one element per record. A file of
     serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    # Checked before anything is read: the parse is the cost (#300).
+    if path.stat().st_size > MAX_JSON_INPUT_BYTES:
+        raise ValueError(_json_input_too_large("is larger than"))
     raw, value = _read_json(path)
     if not raw:
         return "", []
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
+        # Each item becomes one element, so the record cap applies to the items,
+        # counted before any element is built (#321).
+        if len(value) > MAX_JSON_RECORDS:
+            raise _JsonTooManyRecords()
         from unstructured.partition.json import partition_json
+        # partition_json parses the text again: drop the first parse first, so
+        # the two are not held together (#300).
+        value = None
         # The text already read, so a byte-order mark is handled the same way.
         elements = partition_json(text=raw)
         return "\n".join(str(el) for el in elements), elements
@@ -299,7 +354,7 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         _gunzip_bounded(path, plain)
         try:
             return _parse_json(plain)
-        except _JsonTooLarge as exc:
+        except (_JsonTooLarge, _JsonTooManyRecords) as exc:
             raise ValueError(f"was decompressed, but it {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
@@ -321,7 +376,8 @@ class _JsonlError(ValueError):
 
 
 class _JsonlTooLarge(_JsonlError):
-    """A JSON Lines file whose text passes the per-file limit."""
+    """A JSON Lines file whose text passes the per-file limit, or with more lines
+    than one file may hold (#314)."""
 
 
 class _BoundedLines:
@@ -340,33 +396,40 @@ class _BoundedLines:
 
 
 _JSONL_BLANK = b" \t\r"
+_BOM = b"\xef\xbb\xbf"
 
 
 def _jsonl_records(stream: Any) -> list[str]:
     """The records of a JSON Lines file, one per line with text (#291).
 
-    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it, and stopped at
-    the first bad line or when the file's text passes the per-file limit, so
-    memory is bounded by one line and that limit, never by the file's size.
+    Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
+    ending and line 1's byte-order mark, and stopped at the first bad line, at
+    the line past MAX_JSON_RECORDS, or when the file's text passes the per-file
+    limit, so memory is bounded by one line and that limit, never by the file's
+    size, and work by the line count.
     """
     budget = _JsonBudget()
     records: list[str] = []
     number = 0
     blank = None  # the first blank line not yet followed by a record
     while True:
-        raw = stream.readline(MAX_JSONL_LINE_BYTES + 1)
+        # Room for line 1's byte-order mark and a CRLF beyond the limit (#314).
+        raw = stream.readline(MAX_JSONL_LINE_BYTES + len(_BOM) + 2)
         if not raw:
             break
         number += 1
-        if raw.endswith(b"\n"):
+        if number > MAX_JSON_RECORDS:
+            # Every line counts, so lines with no text can't run on to the gzip bound.
+            raise _JsonlTooLarge(_too_many_records())
+        if raw.endswith(b"\r\n"):
+            raw = raw[:-2]
+        elif raw.endswith(b"\n"):
             raw = raw[:-1]
-            too_long = False
-        else:
-            # No newline: either the last line, or a line over the limit.
-            too_long = len(raw) > MAX_JSONL_LINE_BYTES
         shift = 0
-        if number == 1 and raw.startswith(b"\xef\xbb\xbf"):
-            raw, shift = raw[3:], 3
+        if number == 1 and raw.startswith(_BOM):
+            raw, shift = raw[len(_BOM):], len(_BOM)
+        # A read cut short has no newline and is at least 2 bytes over the limit.
+        too_long = len(raw) > MAX_JSONL_LINE_BYTES
         if not too_long and not raw.strip(_JSONL_BLANK):
             if blank is None:
                 blank = number
@@ -497,6 +560,17 @@ def _store_chunks(collection: str, chunks: list[dict]) -> None:
         raise
 
 
+def _count_writes(job: dict, submitted: int, accepted: int, stored: int = 0) -> None:
+    """Add a file's insert to the job's sent, acknowledged and stored counts (#302).
+    Records made before the first two existed start them at 0. The counts change
+    in one update, so a status read never sees part of a file's counts (#324)."""
+    job.update({
+        "chunks_submitted": (job.get("chunks_submitted") or 0) + submitted,
+        "chunks_accepted": (job.get("chunks_accepted") or 0) + accepted,
+        "chunks_stored": job["chunks_stored"] + stored,
+    })
+
+
 def _has_chunks(collection: str, name: str) -> bool:
     """Whether the name already has chunks, which this file will replace (#22).
     It is the job's first backend call for a file, so a deleted collection is
@@ -515,6 +589,11 @@ class _StaleMarkFailed(Exception):
     """Gold-standard sessions could not be marked stale before a replacement."""
 
 
+class _StaleLookupFailed(Exception):
+    """Which later files in the job also replace earlier chunks could not be
+    looked up, so the stale reason could not be written (#311)."""
+
+
 # How many replaced names a stale reason lists before "and N more".
 _MAX_NAMED_FILES = 10
 
@@ -527,13 +606,18 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
     file fails and the collection is left as it was.
 
     The reason names this file and the job's later files that also have earlier
-    chunks, because a job marks at most once.
+    chunks, because a job marks at most once. A failed lookup of those raises
+    _StaleLookupFailed and only a failed marking _StaleMarkFailed, so the error
+    names the step that failed (#311); either way nothing has been marked.
     """
     try:
         names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
-        listed = ", ".join(names[:_MAX_NAMED_FILES])
-        if len(names) > _MAX_NAMED_FILES:
-            listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+    except Exception as exc:
+        raise _StaleLookupFailed(str(exc) or type(exc).__name__) from exc
+    listed = ", ".join(names[:_MAX_NAMED_FILES])
+    if len(names) > _MAX_NAMED_FILES:
+        listed += f" and {len(names) - _MAX_NAMED_FILES} more"
+    try:
         # Imported here: goldstandard imports weaviate_client, as tuning notes.
         from services import goldstandard
         goldstandard.mark_stale(
@@ -626,7 +710,14 @@ def _process_job_sync(
 
                 # Insert first, then remove the earlier chunks, never the other
                 # way round: a failed insert leaves the earlier version whole.
-                _store_chunks(collection, weaviate_chunks)
+                try:
+                    _store_chunks(collection, weaviate_chunks)
+                except Exception as exc:
+                    _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                    raise
+                # Stored counts here too, with the other two: counted later, a clean
+                # job would show its counts apart until then (#324).
+                _count_writes(job, len(chunks), len(chunks), len(chunks))
                 removed, problem = 0, None
                 if replacing:
                     removed, problem = _remove_earlier(collection, name, created, len(chunks))
@@ -653,7 +744,6 @@ def _process_job_sync(
                     # Names are logged with %r: one can hold a newline (#298).
                     _log.error("Could not retain source %r for %r: %s", name, collection, exc)
 
-                job["chunks_stored"] += len(chunks)
                 if problem is None:
                     job["files_completed"] += 1
                 else:
@@ -672,6 +762,12 @@ def _process_job_sync(
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
                     f"its chunks, so nothing was changed: {exc}")
+                _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
+            except _StaleLookupFailed as exc:
+                job["files_failed"] += 1
+                job["errors"].append(
+                    f"{label}: could not check which later files in this upload replace "
+                    f"earlier chunks, so nothing was changed: {exc}")
                 _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
                 telemetry.outcome("partial", exc)
@@ -769,6 +865,28 @@ class _CountedMember:
         return block
 
 
+class _RawMember(io.RawIOBase):
+    """A _CountedMember as raw I/O, for io.BufferedReader to read (#319).
+
+    The gzip reader reads header fields such as FNAME, and the zero padding
+    after a stream, one byte per call. Unbuffered, each byte was one read of
+    the ZIP member, so a few KB of zip could hold a thread for minutes. Every
+    byte still goes through the _CountedMember, so it counts once and an error
+    reading the member is still recorded there.
+    """
+
+    def __init__(self, member: _CountedMember) -> None:
+        self.member = member
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        block = self.member.read(len(buffer))
+        buffer[:len(block)] = block
+        return len(block)
+
+
 def _count_gzip_output(member: _CountedMember, budget: _ExpansionBudget) -> None:
     """Count what a gzipped member decompresses to, keeping none of it.
 
@@ -779,9 +897,14 @@ def _count_gzip_output(member: _CountedMember, budget: _ExpansionBudget) -> None
     some the job reads in full, which let them count nothing), concatenated
     streams and zero padding followed. Gzip data the reader refuses stops the
     count, and the job reports that file as it always has.
+
+    The member is read through a buffer, a block at a time (#319). Bytes the
+    buffer reads ahead are counted as they are read from the member, and the
+    caller reads the rest of the member after the count.
     """
     try:
-        with gzip.GzipFile(fileobj=member, mode="rb") as gz:
+        source = io.BufferedReader(_RawMember(member), _BLOCK)
+        with gzip.GzipFile(fileobj=source, mode="rb") as gz:
             while True:
                 block = gz.read(_BLOCK)
                 if not block:
@@ -1064,18 +1187,29 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "files_total": len(file_paths),
-        "files_completed": 0,
-        "files_failed": 0,
-        "chunks_stored": 0,
-        # Earlier chunks of the same names removed by this job (#22).
-        "chunks_replaced": 0,
-        "errors": [],
-        "skipped": skipped,
-    }
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile removes its uploads here; start_ingest_job ends the
+    # registration, and the store removes the record.
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "files_total": len(file_paths),
+            "files_completed": 0,
+            "files_failed": 0,
+            "chunks_stored": 0,
+            # Chunks sent to Weaviate, and those it acknowledged; chunks_stored
+            # counts only the checked ones (#302).
+            "chunks_submitted": 0,
+            "chunks_accepted": 0,
+            # Earlier chunks of the same names removed by this job (#22).
+            "chunks_replaced": 0,
+            "errors": [],
+            "skipped": skipped,
+        })
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
     @telemetry.admitted
     def _on_done(future: asyncio.Future) -> None:
@@ -1090,6 +1224,9 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                 telemetry.outcome("error", exc)
                 _log.error("ingest job %s failed: %s", job_id, exc)
                 job = _jobs.get(job_id)
+                # This write stays on the event loop (#309): a done callback is
+                # synchronous and can't await a thread, it runs only when an error
+                # escaped the worker, and it saves one record of about 1 KB.
                 if job and job["status"] not in ("completed", "partial", "failed"):
                     # The error first: the status change is the write that saves
                     # the record (#23), and an in-place append is not seen alone.

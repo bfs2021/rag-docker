@@ -22,7 +22,8 @@ from models.schemas import (
 )
 from services import exporter, importer, packager
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_deleting_error
 
 router = APIRouter()
 
@@ -36,6 +37,12 @@ async def start_export(body: ExportRequest):
                          f"Collection '{body.collection}' not found.")
     try:
         job_id = await exporter.start_export_job(body.collection, body.include_models)
+    except CollectionDeletingError:
+        return collection_deleting_error(body.collection)
+    except exporter.ExportStartingError:
+        # The running start hasn't stored its record yet, so no job_id to name (#338).
+        return api_error(409, "EXPORT_STARTING",
+                         f"An export of '{body.collection}' is starting; retry shortly.")
     except RuntimeError as exc:
         # start_export_job puts the already-running job id in the exception.
         return api_error(

@@ -37,11 +37,12 @@ log = logging.getLogger(__name__)
 class GoldStandardError(Exception):
     """Carries an API error code so the router does not have to guess."""
 
-    def __init__(self, code: str, message: str, status: int):
+    def __init__(self, code: str, message: str, status: int, detail=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.detail = detail
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
@@ -802,19 +803,49 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         cancelled = True
         raise
     finally:
-        # Before the status turns terminal: a client that sees generation end
-        # can delete the collection at once (#40).
-        end_job("goldstandard", session_id)
-        def finish(current):
-            if persistence_failure is not None:
-                _failed_generation(current, persistence_failure)
-                return
-            if current.get("status") == "generating":
-                current["status"] = ("cancelled" if cancelled else
-                    "failed" if not current["pairs"] and current.get("errors") else "completed")
-            if current.get("status") == "failed":
-                telemetry.outcome("error")
-        await asyncio.to_thread(_update_session_sync, session_id, finish)
+        await _settle_generation(session_id, cancelled, persistence_failure)
+
+
+async def _settle_generation(session_id: str, cancelled: bool,
+                             persistence_failure: Exception | None = None) -> None:
+    # Before the status turns terminal: a client that sees generation end
+    # can delete the collection at once (#40).
+    end_job("goldstandard", session_id)
+    def finish(current):
+        if persistence_failure is not None:
+            _failed_generation(current, persistence_failure)
+            return
+        if current.get("status") == "generating":
+            current["status"] = ("cancelled" if cancelled else
+                "failed" if not current["pairs"] and current.get("errors") else "completed")
+        if current.get("status") == "failed":
+            telemetry.outcome("error")
+    await asyncio.to_thread(_update_session_sync, session_id, finish)
+
+
+def _track_settling(session_id: str, task: asyncio.Task) -> None:
+    """Keep a settling task alive, and report it if it raises, as _on_task_done does."""
+    _tasks.add(task)
+    def done(t: asyncio.Task) -> None:
+        _tasks.discard(t)
+        exc = t.exception() if not t.cancelled() else None
+        if exc is not None:
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
+    task.add_done_callback(done)
+
+
+def _settle_abandoned_start(prepare: asyncio.Future) -> None:
+    """The request that started a generation was cancelled while it was being
+    prepared (#302). The preparation still ran to the end in its thread; if it
+    published and registered a session, nothing will generate for it, so it is
+    settled the way a cancelled generation is: registration ended, `cancelled`."""
+    if prepare.cancelled() or prepare.exception() is not None:
+        return                        # nothing was registered
+    session, _ = prepare.result()
+    session_id = session["session_id"]
+    _track_settling(session_id, asyncio.create_task(_settle_generation(session_id, cancelled=True)))
 
 
 _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
@@ -822,7 +853,13 @@ _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
 
 def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
-    from services.collection_writes import CollectionBusyError, guard
+    from services.collection_writes import (CollectionBusyError, delete_in_progress,
+                                            deleting_message, guard)
+    # Before the guard's one-second wait, so a delete in progress is reported as
+    # one, like the other job kinds report it (#302).
+    if delete_in_progress(collection):
+        raise GoldStandardError("COLLECTION_DELETING", deleting_message(collection), 409,
+                                detail={"collection": collection})
     try:
         with guard(collection, timeout=_GENERATION_GUARD_TIMEOUT_SECONDS):
             all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
@@ -861,8 +898,16 @@ async def start_generation(
 ) -> dict:
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
-    session, all_chunks = await asyncio.to_thread(
-        _prepare_generation_sync, collection, request.sample_size, request.seed)
+    # Shielded: cancelling a plain to_thread await loses the thread's result, and
+    # with it the registration it made, which then refused DELETE until a
+    # restart (#302). A cancelled caller hands the result to a settle step.
+    prepare = asyncio.ensure_future(asyncio.to_thread(
+        _prepare_generation_sync, collection, request.sample_size, request.seed))
+    try:
+        session, all_chunks = await asyncio.shield(prepare)
+    except asyncio.CancelledError:
+        prepare.add_done_callback(_settle_abandoned_start)
+        raise
     session_id = session["session_id"]
 
     try:

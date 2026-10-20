@@ -87,6 +87,10 @@ export interface JobStatus {
   skipped?: string[]
   // Earlier chunks of the same names this job removed (#22).
   chunks_replaced?: number
+  // Chunks sent to Weaviate and those it acknowledged (#302); null on records
+  // written before the fields existed. chunks_stored counts the checked ones.
+  chunks_submitted?: number | null
+  chunks_accepted?: number | null
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean

@@ -785,6 +785,18 @@ for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
   rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
   wait_for_job "/ingest/job/$rjob" 900 >/dev/null
 done
+# #311: the retained index can list a name the collection has no chunks for
+# (a file that produced none, or a crafted package); rechunk must skip it.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+docs = sources.load_index(c)["documents"]
+digest = next(d for d, e in docs.items() if "copy.txt" in e["filenames"])
+sources.store(c, "ghost.txt", sources.blob_path(c, digest).read_bytes(), replace=True)
+sys.exit(0 if "ghost.txt" in sources.load_index(c)["documents"][digest]["filenames"] else 1)
+ENDPY
+check "E17: a name with no stored chunks is added to the retained index" $?
 check_eq "E32: re-chunking is offered after a replacement and a second name" \
   "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
 api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
@@ -809,6 +821,19 @@ sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in 
          and "Parking Permits" in texts else 1)
 ENDPY
 check "E32: the rebuild holds only the new version, under both of its names" $?
+rc_index=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+print(sorted(n for e in sources.load_index(sys.argv[1])["documents"].values() for n in e["filenames"]))
+ENDPY
+)
+python3 - "$rc_index" <<'ENDPY'
+import json, sys
+names = {n for n, _ in json.load(open('/tmp/vfy_rc_chunks.json'))}
+sys.exit(0 if "ghost.txt" not in names and "'ghost.txt'" in sys.argv[1] else 1)
+ENDPY
+check "E17: a listed name with no stored chunks is not rebuilt, and the index still lists it" $? \
+  "index: $rc_index"
 drop_collection "$RC"
 rm -rf "$RCFIX"
 
@@ -834,6 +859,50 @@ wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
+
+# ── #328 (reviewer): retained originals with no stored chunks ────────────────
+# A file that produces no chunks is still retained at ingest. With nothing to
+# rebuild, re-chunking isn't offered and is refused up front: no job is made.
+NOCH="${PREFIX}Nochunks"
+NOCHFIX=$(mktemp -d)
+printf '   \n\n   \n' > "$NOCHFIX/blank.txt"
+drop_collection "$NOCH"; make_collection "$NOCH"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$NOCH" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$NOCHFIX/blank.txt" > /tmp/vfy_nc.json
+njob=$(jfield "['job_id']" < /tmp/vfy_nc.json)
+[ -n "$njob" ] && wait_for_job "/ingest/job/$njob" 900 >/dev/null
+nc_state=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$NOCH") <<'ENDPY'
+import sys
+from services import sources
+from services import weaviate_client as wc
+c = sys.argv[1]
+try:
+    stored = sum(1 for _ in wc.get_client().collections.get(c).iterator())
+finally:
+    wc.close_client()
+names = sorted(n for e in sources.load_index(c)["documents"].values() for n in e["filenames"])
+print(f"{stored} {names}")
+ENDPY
+)
+check_eq "#328: a file that produced no chunks is retained, and the collection holds none" \
+  "$nc_state" "0 ['blank.txt']"
+api_get "/tune/$NOCH" > /tmp/vfy_nc_tune.json
+check_eq "#328: GET /tune doesn't offer re-chunking with nothing to rebuild" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_nc_tune.json)" "False"
+check_eq "#328: GET /tune gives the nothing-to-rebuild reason" \
+  "$(jfield "['note']" < /tmp/vfy_nc_tune.json | cut -c1-48)" "No retained original file has stored chunks, so "
+for op in rechunk reembed; do
+  code=$(curl -s -o /tmp/vfy_nc_start.json -m 120 -w '%{http_code}' -X POST "$API/tune/$op" \
+    -H 'Content-Type: application/json' \
+    -d "{\"collection\":\"$NOCH\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}")
+  check_eq "#328: POST /tune/$op with chunking answers 409" "$code" "409"
+  check_eq "#328: POST /tune/$op with chunking is SOURCES_REQUIRED" \
+    "$(jfield "['error']['code']" < /tmp/vfy_nc_start.json)" "SOURCES_REQUIRED"
+  check_eq "#328: POST /tune/$op with chunking returns no job" \
+    "$(jfield ".get('job_id')" < /tmp/vfy_nc_start.json)" "None"
+done
+drop_collection "$NOCH"
+rm -rf "$NOCHFIX"
 
 # ── the help page and the package README share a source ──────────────────────
 api_get "/help/transfer" > /tmp/vfy_help.json
@@ -869,7 +938,8 @@ check "the help page has no unsubstituted placeholders" $?
 
 # ── export job status survives an API restart (#23; opt-in: restarts the API) ──
 # The export from the top of this suite must read back unchanged, and an export
-# killed part-way must read `failed` with INTERRUPTED, not 404. A synthetic
+# killed part-way must read `failed` with INTERRUPTED and its progress, not 404;
+# so must an import killed part-way (#309). A synthetic
 # 30,000-chunk collection (supplied vectors, no embedding) exports for about
 # 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
 # stop timeout the worker could finish the export during shutdown.
@@ -939,10 +1009,11 @@ after = json.load(open('/tmp/vfy_xrestart_after.json'))
 ok = (sys.argv[1] == "200" and after.get("status") == "failed"
       and after.get("error_code") == "INTERRUPTED"
       and after.get("error") == "Interrupted: the API restarted while this job was running. "
-                                "Start the export again.")
+                                "Start the export again."
+      and after.get("chunks_written", 0) > 0)
 sys.exit(0 if ok else 1)
 ENDPY
-    check "an interrupted export reads back 200 'failed' with INTERRUPTED" $? \
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers are the container's (root, mode 0700): remove
     # only the build directories that appeared during this export.
@@ -950,6 +1021,50 @@ ENDPY
     stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+  fi
+
+  # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
+  # collection, exported whole, dropped and imported back. The startup sweep
+  # removes the half-built collection the killed import leaves.
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
+  xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
+  xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
+  if [ "$xpkg_status" != completed ] || [ -z "$xpkg" ] || [ "$xpkg" = None ]; then
+    check "an import is running before the restart" 1 "the package export ended '$xpkg_status'; nothing restarted"
+  else
+    drop_collection "$XR"
+    api_post "/import" "{\"filename\":\"$xpkg\",\"on_conflict\":\"abort\"}" > /tmp/vfy_irestart_start.json
+    ijob_r=$(jfield "['job_id']" < /tmp/vfy_irestart_start.json)
+    # Import reports chunks_written once, after its insert, so the restart
+    # comes as soon as the job is running: unpacking, checks and the insert
+    # of 30,000 chunks still lie ahead of it.
+    state=""
+    for _ in $(seq 1 600); do
+      state=$(api_get "/import/job/$ijob_r" | jfield "['status']")
+      case "$state" in running|completed|failed) break ;; esac
+      sleep 0.2
+    done
+    if [ "$state" != running ]; then
+      check "an import is running before the restart" 1 "last status '$state'; nothing restarted"
+    else
+      _rag_require_lock_owner
+      (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+      for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+      code=$(curl -s -m 120 -o /tmp/vfy_irestart_after.json -w '%{http_code}' "$API/import/job/$ijob_r")
+      python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_irestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the import again.")
+sys.exit(0 if ok else 1)
+ENDPY
+      check "an interrupted import reads back 200 'failed' with INTERRUPTED" $? \
+        "$(head -c 300 /tmp/vfy_irestart_after.json)"
+    fi
+    rm -f "$EXPORTS/$xpkg"
   fi
   drop_collection "$XR"
 fi

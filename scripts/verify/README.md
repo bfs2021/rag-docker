@@ -211,14 +211,17 @@ counted (concatenated streams and zero padding too), a corrupt gzip accepted and
 one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
 member read and gzip counting stopped within one block once the cap is passed, gzip headers
 that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
-counted, the count equal to what the job's gzip reader produces, the exact message and
-`detail`, the 2 GiB default, and that ZIP work runs in a worker thread while the event loop
-serves other work. `02_ingest.sh` runs it in the API container, then, at the
-default cap, sends `zip_over_declared.zip` (declares 2,049 MiB) and `zip_over_gzip.zip` (a
-gzip member expanding to 2,112 MiB) through the proxy, checks each is refused with
-`ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent while the second is counted
-are answered within a second (a smoke check; the controlled test is the one that tells
-off-loop from on-loop work).
+counted, the count equal to what the job's gzip reader produces, zero padding and a long gzip
+file name read in blocks, bytes read ahead past a stream's end counted once, the cap still
+stopping a read through that buffer, ZIP damage found during the gzip count refused as
+`ARCHIVE_UNREADABLE`, the exact message and `detail`, the 2 GiB default, and that ZIP work runs
+in a worker thread while the event loop serves other work. `02_ingest.sh` runs it in the API
+container, checks that the API takes the 2 GiB cap from `docker-compose.yml`'s
+`MAX_ZIP_EXPANDED_BYTES`, then, at the default cap, sends `zip_over_declared.zip` (declares
+2,049 MiB) and `zip_over_gzip.zip` (a gzip member expanding to 2,112 MiB) through the proxy,
+checks each is refused with `ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent
+while the second is counted are answered within a second (a smoke check; the controlled test is
+the one that tells off-loop from on-loop work).
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -226,9 +229,23 @@ non-ASCII text and numbers as written, one element per top-level record, empty v
 files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
 converted text bounded by the chunker's per-file limit (a long key over many values fails
 fast with bounded memory), and readable errors for invalid JSON in `.json` files and
-`.json.gz` members. `02_ingest.sh` runs it in the API
-container, then ingests a nested `plain.json` through the proxy and reads its stored chunks
-back to confirm they hold that text.
+`.json.gz` members. For #300 it also checks the bounds on what one JSON file may cost: the
+blank lines between records charged to the text limit (exactly at the limit, and one dropped
+record refunded), the 1,000,000-record cap (records with no text not counted; a file of
+1,000,001 tiny records fails fast with a bounded peak and builds no elements; an
+element-schema file's items counted too, items with no text included, before `partition_json`
+runs, and the cap applied at and one past the edge when a retained element file is rechunked,
+#321), the 30,000,000-byte input limit at and one past the edge (element-schema files and a
+byte-order mark included), a `.json.gz` member that stops decompressing at that limit, the
+exact messages, a job where over-limit files fail alone, the traced peak of deep long keys and
+of an over-long scalar array, and that an element-schema file's first parse is freed before
+`partition_json` runs. `02_ingest.sh` runs it in the API container, then ingests a nested
+`plain.json` through the proxy and reads its stored chunks back to confirm they hold that text.
+It then uploads `json_over_size.json` (30,000,001 bytes), `json_many_records.json` (1,000,001
+records), `json_over_size_gz.zip` (a `.json.gz` member one byte over the limit when
+decompressed), `json_over_size_member.zip` (a `.json` member one byte over the limit) and
+`plain.json` together, and checks that the job is `partial`, each over-limit file fails with
+its exact message, and `plain.json` is stored.
 
 `scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
 becomes one `key: value` record per line, separated by blank lines, with one element per
@@ -237,12 +254,23 @@ no final newline, trailing blank lines accepted and U+2028 kept inside its line.
 error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
 non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
 text limit are checked at and one past their edges, and a file far over the limit stops
-being read at the line that passes it, with a small traced peak. Gzip: the same text as plain,
-the `was decompressed, but` prefix, corrupt, truncated and over-size data. It also checks
-`source_type` `jsonl`, a job that stores nothing for a bad file beside a good one, and
-rechunk of a retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a
-direct `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back,
-and checks that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing.
+being read at the line that passes it, with a small traced peak. The line limit counts neither
+the line ending nor line 1's byte-order mark (#314): it is checked at and one past its edge
+with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
+errors as an LF one. Lines 1 to 5 bytes over the limit, at the edge of the read window, fail
+on their own line with `\n`, `\r\n` or no ending, with and without the mark. The
+1,000,000-line cap (#314) is checked at and one past its edge, with
+blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
+same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
+errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job
+that stores nothing for a bad file beside a good one, job-level outcomes (#314: empty files
+complete with 0 chunks under every strategy, a file over the 10,000-chunk limit or the cap
+fails and stores nothing, `context_aware` keeps one chunk per record), and rechunk of a
+retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a direct
+`records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back, checks
+that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing, and that
+`jsonl_many_records.jsonl.gz` (1,000,001 `{}` lines, a few KB gzipped) fails with the
+record-cap message and stores nothing.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -258,6 +286,29 @@ container, then deletes a collection while a real ingest is still embedding (`40
 in place), again after the job completes (`200`, still gone 10 s later), and checks that an
 insert into a deleted collection fails without recreating it (auto-schema is off).
 
+`test_delete_busy.py` also covers #302. A `DELETE` without `?confirm=true` (case-insensitive)
+answers `400 CONFIRMATION_REQUIRED` before the collection is looked up. A `DELETE` held inside
+its backend delete refuses new jobs: the ingest, export, tune and generate routes answer
+`409 COLLECTION_DELETING` and leave nothing behind, generation without its one-second guard
+wait, and an import of the collection ends `failed` with that code, with `abort` even before the
+backend collection is gone, and at registration when the delete starts after its first check,
+while a `rename` import of a collection still present completes under its new name; a delete
+still waiting for another writer is not in progress, and one that waits behind a writer with no
+job deletes once it lets go. A gold-standard start cancelled mid-preparation ends its
+registration and leaves its session `cancelled`, and one whose preparation fails settles
+nothing. Import-replace's own delete runs through `importer._run`.
+`scripts/tests/test_write_counts.py` (#302, API container) checks `chunks_submitted` and
+`chunks_accepted`: the writer's counts on each kind of failure, a retried file counted once, job
+totals, a clean job's counts equal after each file's insert, and `null` on an older record.
+`scripts/tests/test_mcp_delete.py` runs on the host with the MCP SDK stubbed and checks
+`rag_delete_collection` sends `confirm=true` with `name` still its only input, and that
+`rag_ingest_status` passes the write counts through unchanged. `02_ingest.sh` runs all three,
+then checks on the live verify stack the `400` cases, a `confirm=TRUE` delete, and that a clean
+job's three counts agree.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's
+"Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
+answered `409 COLLECTION_DELETING` to check its message is shown.
+
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
 that writes nothing; status changes and terminal records are written at once, owner-only;
@@ -265,12 +316,28 @@ that writes nothing; status changes and terminal records are written at once, ow
 failed write raises nothing and keeps the previous file; ids can't name another path; startup
 marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
 `failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
-a real lifespan run marks a stored running export. `02_ingest.sh` runs it in the API
-container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
-(`docker compose restart --timeout 0 api`) while an upload is part-way and checks that a
-completed job reads back unchanged and the interrupted one reads `partial` with the
-interruption message; `05_transfer.sh` does the same for a completed export and one
-interrupted part-way through a synthetic 30,000-chunk collection (`failed`, `INTERRUPTED`).
+a real lifespan run marks a stored running export. While the API runs (#309), storing a
+record past the limit removes the finished records saved longest ago, from memory and disk,
+never a `queued` or `running` one, in the order of each record's own last write; and each of
+the four job starts writes its first record from a worker thread, and when cancelled during
+that write releases its guards and leaves no record (or, for ingest, upload folder), also when
+that abandoned write fails (logged). A second export of a collection started during the
+first one's write waits for it, then answers with the first job's id, which can be read, or,
+if the first start was cancelled or its write failed, starts its own (#326); it answers at
+once when the record is already stored, holds nothing if cancelled while it waits, and
+exports of other collections never wait. The wait is bounded (#338): past it, the second
+start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
+The bound counts once, from the second start's first wait: when the first start's write fails
+and another start takes the slot, waiting again on that one doesn't restart it (#347).
+`02_ingest.sh` runs it in the API container. With
+`RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
+completed job reads back unchanged, the one that stored a file reads `partial` and the one
+that stored none reads `failed`, both with the interruption message; `05_transfer.sh` does the
+same for a completed export, an export interrupted part-way through a synthetic 30,000-chunk
+collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of that collection
+interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
+operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
@@ -280,11 +347,25 @@ separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under thei
 names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
-marking failure fails only that file and changes nothing; a failed insert keeps the earlier
+marking failure fails only that file and changes nothing; a failed lookup of the later files
+is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
 reported at the first lookup (#40). Also the delete rounds, precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
-rechunk coverage and per-(digest, name) rebuilds. Weaviate and sessions are mocked.
+rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
+while a missing blob is still refused (#311), also for one blob under 50 names with one
+stored and a digest with none (only the stored name is parsed). A collection whose retained
+names have no stored chunks is refused as having nothing to rebuild, before staging and, for
+a rechunk or a re-embed with chunking parameters, before any job is created, with the route
+answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
+`COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
+listed name still start a job. A Weaviate error during the check answers 503
+`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340),
+also when the connection itself fails and for a re-embed with chunking parameters through its
+route, while a re-embed without them still starts. A Weaviate error checking that the
+collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
+answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
+Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
 names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
@@ -296,7 +377,12 @@ chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks th
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
-and checks that only the new text comes back, under both names.
+and checks that only the new text comes back, under both names. It also adds a name with no
+stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
+the index still lists it (E17, #311). It then ingests a whitespace-only file, which is retained with no
+chunks, and checks that `GET /tune` doesn't offer re-chunking and gives the nothing-to-rebuild
+note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields answer 409
+`SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
 refused before backend, model or staging work, with every backend mocked. Its
@@ -385,10 +471,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
-| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |

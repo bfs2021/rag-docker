@@ -69,6 +69,7 @@ class BusyTestCase(unittest.TestCase):
     def setUp(self):
         self.addCleanup(writes._active_jobs.clear)
         writes._active_jobs.clear()
+        self.addCleanup(writes._deleting.clear)
         self.backend = Backend("OwnedBusy")
         self.registry = {}
         stack = ExitStack()
@@ -184,6 +185,26 @@ class OrderingTests(BusyTestCase):
             release.set(); task.result(timeout=2)
         self.assert_busy(response, "ingest", "late", "An ingest job is running for this collection")
         self.assertLess(elapsed, 1.0)
+
+    def test_a_guard_held_without_a_job_is_waited_for_then_the_delete_runs(self):
+        # Reviewer's case: the poll loop retries while no job is registered, and
+        # deletes once the writer that held the guard lets go.
+        held = threading.Event(); release = threading.Event()
+        def holder():
+            with writes.guard("OwnedBusy"):
+                held.set(); release.wait(10)
+        with ThreadPoolExecutor() as pool:
+            task = pool.submit(holder); self.assertTrue(held.wait(2))
+            deleting = pool.submit(self.delete)
+            wait_until(lambda: writes._registry.get("OwnedBusy", [None, 0])[1] >= 2)
+            time.sleep(0.6)                       # at least two polls go by
+            self.assertFalse(deleting.done())
+            self.assertEqual(self.backend.deleted, [])
+            release.set(); task.result(timeout=2)
+            response = deleting.result(timeout=3)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.backend.deleted, ["OwnedBusy"])
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
 
     def test_a_job_registered_once_the_delete_holds_the_guard_refuses(self):
         real_guard = writes.guard
@@ -414,20 +435,354 @@ class KindRegistrationTests(BusyTestCase):
 
 
 class InternalDeletionTests(BusyTestCase):
-    def test_import_replace_internal_delete_is_not_refused_by_its_own_registration(self):
-        writes.register_job("OwnedBusy", "import", "replacing")
+    def test_import_replace_deletes_its_own_target_through_the_real_path(self):
+        # Through importer._run (#302): _run registers the job, then replace
+        # deletes the old target while registered. A delete that consulted the
+        # registry (delete_collection_when_idle) would refuse it and fail the job.
+        pkg = self.root / "pkg"; pkg.mkdir(); (pkg / "manifest.json").write_text("{}")
+        manifest = {"collection": {"name": "OwnedBusy", "chunk_count": 1}, "fidelity": "chunks-only"}
         client = MagicMock()
         client.collections.get.return_value.config.get.return_value = SimpleNamespace(name="OwnedBusy")
         client.collections.get.return_value.aggregate.over_all.return_value = SimpleNamespace(total_count=2)
+        registered_at_delete = []
+        client.collections.delete.side_effect = lambda name: registered_at_delete.append(
+            writes.active_jobs(name))
+        job_id = "replacing"
+        importer._jobs[job_id] = {
+            "job_id": job_id, "status": "queued", "filename": "owned.tar.gz",
+            "on_conflict": "replace", "collection": None, "original_collection": None,
+            "chunks_written": 0, "fidelity": None, "renamed": False, "notes": [],
+            "restored_sessions": [], "error": None, "error_code": None, "error_detail": None}
         from services import collection_recovery, ingest_config, retrieval_config, sources
-        with patch.object(wc, "_delete_collection_sync", new=_REAL_DELETE), \
-             patch.object(wc, "get_client", return_value=client), \
-             patch.object(collection_recovery, "retire_deleted"), \
-             patch.object(sources, "delete"), patch.object(retrieval_config, "delete"), \
-             patch.object(ingest_config, "delete"), patch.object(goldstandard, "mark_orphaned"):
-            self.assertEqual(wc._delete_collection_sync("OwnedBusy"), 2)
+        replace_patches = [
+            patch.object(wc, "_delete_collection_sync", new=_REAL_DELETE),
+            patch.object(wc, "get_client", return_value=client),
+            patch.object(collection_recovery, "begin",
+                         return_value={"staging": "OwnedBusyStaging", "state": "retained"}),
+            patch.object(collection_recovery, "retain"),
+            patch.object(collection_recovery, "discard"),
+            patch.object(collection_recovery, "retire_deleted"),
+            patch.object(collection_recovery, "sidecar_reference", return_value="owned"),
+            patch.object(sources, "delete"), patch.object(retrieval_config, "delete"),
+            patch.object(ingest_config, "delete"), patch.object(goldstandard, "mark_orphaned"),
+            patch.object(goldstandard, "sessions_for", return_value=[]),
+            patch.object(importer.packager, "exports_dir", return_value=self.root),
+            patch.object(importer.packager, "open_package", return_value=(pkg, manifest)),
+            patch.object(importer.packager, "verify_digests"),
+            patch.object(importer, "_check_embedding"),
+            patch.object(importer, "_ensure_models", return_value=[]),
+            patch.object(importer, "_mark_started", return_value="instance"),
+            patch.object(importer, "_mark_finished"),
+            patch.object(importer, "_build", return_value=1),
+            patch.object(importer, "_restore_sidecars", return_value=[]),
+        ]
+        with ExitStack() as stack:
+            for change in replace_patches:
+                stack.enter_context(change)
+            importer._run(job_id, "owned.tar.gz", "replace")
+        job = importer.get_job(job_id)
+        self.assertEqual(job["status"], "completed", job)
         client.collections.delete.assert_called_once_with("OwnedBusy")
-        self.assertEqual(writes.active_jobs("OwnedBusy"), [("import", "replacing")])
+        self.assertEqual(registered_at_delete, [[("import", job_id)]])
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+
+class ConfirmationTests(BusyTestCase):
+    """DELETE needs ?confirm=true, checked before anything is looked up (#302)."""
+
+    def delete_query(self, query, name="OwnedBusy"):
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://owned") as api:
+                return await api.delete(f"/collections/{name}{query}")
+        return asyncio.run(run())
+
+    def assert_confirmation_required(self, response):
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json(), {"error": {
+            "code": "CONFIRMATION_REQUIRED",
+            "message": "Add ?confirm=true to confirm deletion.", "detail": None}})
+
+    def test_a_missing_or_other_value_is_refused_before_any_lookup(self):
+        for query in ("", "?confirm=false", "?confirm=1", "?confirm=yes", "?confirm=",
+                      "?confirm=truee"):
+            with self.subTest(query=query):
+                wc._collection_exists_sync.reset_mock()
+                self.assert_confirmation_required(self.delete_query(query))
+                wc._collection_exists_sync.assert_not_called()
+        self.assertEqual(self.backend.deleted, [])
+        self.assertIn("OwnedBusy", self.backend.names)
+
+    def test_a_missing_collection_without_confirmation_is_400_not_404(self):
+        self.assert_confirmation_required(self.delete_query("", name="OwnedMissing"))
+        self.assertEqual(self.delete_query("?confirm=true", name="OwnedMissing").status_code, 404)
+
+    def test_true_is_matched_without_regard_to_case(self):
+        for query in ("?confirm=TRUE", "?confirm=True"):
+            with self.subTest(query=query):
+                self.backend.names.add("OwnedBusy")
+                response = self.delete_query(query)
+                self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.backend.deleted, ["OwnedBusy", "OwnedBusy"])
+
+
+DELETING = ("Collection '{}' is being deleted. Start the job again once the delete "
+            "finishes; the collection must be created again first.")
+
+
+class DeletingTests(BusyTestCase):
+    """New jobs are refused while a delete of their collection is in progress (#302)."""
+
+    @contextmanager
+    def deleting(self, gone_first=False):
+        """Hold a DELETE inside its backend delete, the in-progress window."""
+        entered = threading.Event(); release = threading.Event()
+        def blocking(name):
+            if gone_first:                  # the backend class is gone, the rest is not
+                self.backend.names.discard(writes.canonical(name))
+            entered.set(); assert release.wait(10)
+            return self.backend.delete(name)
+        wc._delete_collection_sync.side_effect = blocking
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(self.delete)
+            try:
+                self.assertTrue(entered.wait(3))
+                yield
+            finally:
+                release.set()
+                self.delete_response = future.result(timeout=5)
+        self.assertEqual(self.delete_response.status_code, 200, self.delete_response.text)
+
+    def call(self, method, path, **kwargs):
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://owned") as api:
+                return await api.request(method, path, **kwargs)
+        return asyncio.run(run())
+
+    def assert_deleting(self, response, name):
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json(), {"error": {
+            "code": "COLLECTION_DELETING", "message": DELETING.format(name),
+            "detail": {"collection": name}}})
+
+    def test_the_window_refuses_registration_under_either_spelling_and_then_clears(self):
+        self.assertFalse(writes.delete_in_progress("OwnedBusy"))
+        with self.deleting():
+            self.assertTrue(writes.delete_in_progress("OwnedBusy"))
+            self.assertTrue(writes.delete_in_progress("ownedBusy"))
+            for spelling in ("OwnedBusy", "ownedBusy"):
+                with self.assertRaises(writes.CollectionDeletingError):
+                    writes.register_job(spelling, "ingest", "late")
+            writes.register_job("OtherBusy", "ingest", "other")      # other names are unaffected
+            self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+        self.assertFalse(writes.delete_in_progress("OwnedBusy"))
+        self.assertEqual(writes._deleting, {})
+        writes.register_job("OwnedBusy", "ingest", "after")          # admitted again
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [("ingest", "after")])
+
+    def test_a_delete_waiting_for_another_writer_is_not_in_progress(self):
+        held = threading.Event(); release = threading.Event()
+        def holder():
+            with writes.guard("OwnedBusy"):
+                held.set(); release.wait(10)
+        with ThreadPoolExecutor() as pool:
+            task = pool.submit(holder); self.assertTrue(held.wait(2))
+            deleting = pool.submit(self.delete)
+            wait_until(lambda: writes._registry.get("OwnedBusy", [None, 0])[1] >= 2)
+            self.assertFalse(writes.delete_in_progress("OwnedBusy"))
+            writes.register_job("OwnedBusy", "ingest", "waiting")    # #40's ordering stands
+            response = deleting.result(timeout=2)
+            release.set(); task.result(timeout=2)
+        self.assert_busy(response, "ingest", "waiting", "An ingest job is running for this collection")
+
+    def test_ingest_upload_is_refused_and_leaves_nothing(self):
+        jobs_before = set(ingest_pipeline._jobs)
+        files_before = sorted(self.root.iterdir())
+        with self.deleting():
+            response = self.call("POST", "/ingest/upload", data={"collection": "ownedBusy"},
+                                 files={"files": ("one.txt", b"Owned text", "text/plain")})
+        self.assert_deleting(response, "ownedBusy")
+        self.assertEqual(set(ingest_pipeline._jobs), jobs_before)
+        self.assertEqual(sorted(self.root.iterdir()), files_before)
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+    def test_export_is_refused_and_leaves_nothing(self):
+        jobs_before = set(exporter._jobs)
+        with self.deleting():
+            response = self.call("POST", "/export", json={"collection": "OwnedBusy"})
+        self.assert_deleting(response, "OwnedBusy")
+        self.assertEqual(set(exporter._jobs), jobs_before)
+        self.assertIsNone(exporter._active.get("OwnedBusy"))
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+    def test_tune_is_refused_and_leaves_nothing(self):
+        jobs_before = set(tuning._jobs)
+        with self.deleting():
+            response = self.call("POST", "/tune/reembed", json={"collection": "OwnedBusy"})
+        self.assert_deleting(response, "OwnedBusy")
+        self.assertEqual(set(tuning._jobs), jobs_before)
+        self.assertNotIn("OwnedBusy", tuning._active)
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+    def test_generation_is_refused_without_waiting_for_the_guard(self):
+        with patch.object(goldstandard, "_store_generated_session") as store, \
+             patch.object(wc, "_sample_chunks_sync") as sample:
+            with self.deleting():
+                started = time.monotonic()
+                response = self.call("POST", "/goldstandard/generate",
+                                     json={"collection": "OwnedBusy", "sample_size": 1})
+                elapsed = time.monotonic() - started
+        self.assert_deleting(response, "OwnedBusy")
+        self.assertLess(elapsed, 0.5)          # the guard's wait would take a second
+        store.assert_not_called(); sample.assert_not_called()
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+    def run_import_during_delete(self, gone_first):
+        """An `abort` import run while a DELETE is held; returns the job and the build mock."""
+        pkg = self.root / "pkg"; pkg.mkdir(); (pkg / "manifest.json").write_text("{}")
+        manifest = {"collection": {"name": "OwnedBusy", "chunk_count": 1}, "fidelity": "chunks-only"}
+        with patch.object(importer.packager, "exports_dir", return_value=self.root), \
+             patch.object(importer.packager, "open_package", return_value=(pkg, manifest)), \
+             patch.object(importer.packager, "verify_digests"), \
+             patch.object(importer, "_check_embedding"), \
+             patch.object(importer, "_ensure_models", return_value=[]), \
+             patch.object(importer, "_build") as build:
+            async def run():
+                job_id = await importer.start_import_job("owned.tar.gz", "abort")
+                await asyncio.to_thread(wait_until, lambda: importer.get_job(job_id)["status"]
+                                        in ("completed", "failed"))
+                return job_id
+            with self.deleting(gone_first=gone_first):
+                job_id = asyncio.run(run())
+        return importer.get_job(job_id), build
+
+    def assert_import_refused(self, job, build):
+        self.assertEqual((job["status"], job["error_code"], job["error"], job["error_detail"]),
+                         ("failed", "COLLECTION_DELETING", DELETING.format("OwnedBusy"),
+                          {"collection": "OwnedBusy"}), job)
+        build.assert_not_called()
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+
+    def test_import_whose_target_is_being_deleted_fails_with_the_code(self):
+        self.assert_import_refused(*self.run_import_during_delete(gone_first=True))
+
+    def test_an_abort_import_whose_target_is_still_present_fails_with_the_code(self):
+        # The delete hasn't removed the backend collection yet: still DELETING,
+        # not COLLECTION_EXISTS (#324).
+        self.assert_import_refused(*self.run_import_during_delete(gone_first=False))
+
+    def test_an_abort_import_whose_delete_starts_after_the_check_is_refused_at_registration(self):
+        # Reviewer's case: the delete begins between the new check and the
+        # registration, so the registration's own refusal must still answer (#324).
+        with patch.object(writes, "delete_in_progress", return_value=False) as check:
+            job, build = self.run_import_during_delete(gone_first=True)
+        check.assert_called_with("OwnedBusy")
+        self.assert_import_refused(job, build)
+
+    def test_a_rename_import_whose_target_is_being_deleted_imports_under_the_new_name(self):
+        # Reviewer's case: rename is unchanged by #324; the new name is not being deleted.
+        pkg = self.root / "pkg"; pkg.mkdir(); (pkg / "manifest.json").write_text("{}")
+        manifest = {"collection": {"name": "OwnedBusy", "chunk_count": 1}, "fidelity": "chunks-only"}
+        with patch.object(importer.packager, "exports_dir", return_value=self.root), \
+             patch.object(importer.packager, "open_package", return_value=(pkg, manifest)), \
+             patch.object(importer.packager, "verify_digests"), \
+             patch.object(importer, "_check_embedding"), \
+             patch.object(importer, "_ensure_models", return_value=[]), \
+             patch.object(importer, "_mark_started", return_value="instance"), \
+             patch.object(importer, "_mark_finished"), \
+             patch.object(importer, "_restore_sidecars", return_value=[]), \
+             patch.object(importer, "_build", return_value=1) as build:
+            async def run():
+                job_id = await importer.start_import_job("owned.tar.gz", "rename")
+                await asyncio.to_thread(wait_until, lambda: importer.get_job(job_id)["status"]
+                                        in ("completed", "failed"))
+                return job_id
+            with self.deleting(gone_first=False):
+                job_id = asyncio.run(run())
+        job = importer.get_job(job_id)
+        self.assertEqual(job["status"], "completed", job)
+        self.assertTrue(job["renamed"], job)
+        self.assertTrue(job["collection"].startswith("OwnedBusy_imported_"), job)
+        self.assertEqual(build.call_args.args[0], job["collection"])
+        self.assertEqual(writes.active_jobs(job["collection"]), [])
+
+
+class GenerationCancelTests(BusyTestCase):
+    """A start cancelled while it is prepared releases the collection (#302)."""
+
+    def run_cancelled_start(self, update_fails=False):
+        sessions = {}
+        def store(session):
+            session = {**session, "session_id": "gs_cancelled"}; sessions[session["session_id"]] = session
+            return session
+        def update(session_id, change):
+            if update_fails:
+                raise OSError("Owned settle failure")
+            return change(sessions[session_id])
+        sampling = threading.Event(); gate = threading.Event()
+        def sample(collection, limit, seed):
+            sampling.set(); assert gate.wait(5); return [{"content": "Owned"}]
+        report = AsyncMock()
+        async def run():
+            task = asyncio.create_task(goldstandard.start_generation("OwnedBusy", 1, None))
+            await asyncio.to_thread(sampling.wait, 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            gate.set()
+            deadline = time.monotonic() + 3
+            while (goldstandard._tasks or "gs_cancelled" not in sessions
+                   or (not update_fails and sessions["gs_cancelled"]["status"] == "generating")
+                   or (update_fails and not report.await_count)):
+                self.assertLess(time.monotonic(), deadline, "the abandoned start was never settled")
+                await asyncio.sleep(0.01)
+        with patch.object(wc, "_sample_chunks_sync", side_effect=sample), \
+             patch.object(goldstandard, "_store_generated_session", side_effect=store), \
+             patch.object(goldstandard, "_update_session_sync", side_effect=update), \
+             patch.object(goldstandard, "_record_generation_failure", report), \
+             patch.object(goldstandard, "_generate_pair") as pair:
+            asyncio.run(run())
+        pair.assert_not_called()
+        return sessions["gs_cancelled"], report
+
+    def test_the_registration_ends_and_the_session_is_cancelled(self):
+        session, report = self.run_cancelled_start()
+        self.assertEqual(session["status"], "cancelled")
+        report.assert_not_awaited()
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+        self.assertEqual(self.delete().status_code, 200)
+
+    def test_a_cancelled_start_whose_preparation_fails_settles_nothing(self):
+        # Reviewer's case: the preparation raises after the caller is cancelled,
+        # so no session was published or registered and nothing is settled.
+        sampling = threading.Event(); gate = threading.Event()
+        def sample(collection, limit, seed):
+            sampling.set(); assert gate.wait(5)
+            raise wc.CollectionNotFoundError(collection)
+        async def run():
+            task = asyncio.create_task(goldstandard.start_generation("OwnedBusy", 1, None))
+            await asyncio.to_thread(sampling.wait, 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            gate.set()
+            await asyncio.sleep(0.3)               # the thread ends and its callback runs
+        with patch.object(wc, "_sample_chunks_sync", side_effect=sample), \
+             patch.object(goldstandard, "_store_generated_session") as store, \
+             patch.object(goldstandard, "_settle_generation") as settle:
+            asyncio.run(run())
+        store.assert_not_called(); settle.assert_not_called()
+        self.assertEqual(goldstandard._tasks, set())
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+        self.assertEqual(self.delete().status_code, 200)
+
+    def test_a_settle_that_fails_is_reported_as_a_failed_generation(self):
+        session, report = self.run_cancelled_start(update_fails=True)
+        self.assertEqual(report.await_args.args[0], "gs_cancelled")
+        self.assertIsInstance(report.await_args.args[1], OSError)
+        self.assertEqual(writes.active_jobs("OwnedBusy"), [])
+        self.assertEqual(self.delete().status_code, 200)
 
 
 _REAL_DELETE = wc._delete_collection_sync

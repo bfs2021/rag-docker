@@ -239,18 +239,38 @@ def verify(collection, records, *, exact: bool) -> int:
         return expected.verify(collection, exact=exact)
 
 
+def _record_counts(exc: Exception, submitted: int, accepted: int) -> None:
+    """Attach what a failed insert sent and had acknowledged, for ingest's job
+    counts (#302): `chunks_stored` only counts checked chunks."""
+    try:
+        exc.write_counts = (submitted, accepted)
+    except Exception:                     # an exception type that refuses attributes
+        pass
+
+
+def write_counts(exc: BaseException | None) -> tuple[int, int] | None:
+    """(submitted, accepted) recorded on a failed insert's exception or its cause."""
+    for error in (exc, getattr(exc, "__cause__", None)):
+        counts = getattr(error, "write_counts", None)
+        if counts is not None:
+            return counts
+    return None
+
+
 def insert(collection, records, *, exact: bool = True, expected_count: int | None = None,
            cleanup_owned: bool = False) -> int:
     """Preflight a reusable stream, flush, then compare persisted fingerprints.
 
     Only ingestion-generated UUIDs may be rolled back individually. Import and
     tuning own new collections and retain/remove them at their operation boundary.
+    A failure carries `write_counts` = (records queued, records the flushed batch
+    acknowledged without a per-object error); 0 acknowledged if it never flushed.
     """
     factory = _factory(records)
     with ExpectedRecords() as expected:
         expected.capture(factory, expected_count, generated_only=cleanup_owned)
+        queued = accepted = 0
         try:
-            queued = 0
             with telemetry.span("weaviate.batch"):
                 with collection.batch.dynamic() as batch:
                     for position, record in enumerate(factory()):
@@ -260,6 +280,7 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
                     if queued != expected.count:
                         raise ValueError("Record stream changed after preflight")
                 failed = collection.batch.failed_objects
+                accepted = queued - len(failed or ())
                 if failed:
                     detail = getattr(failed[0], "message", None)
                     raise RuntimeError(
@@ -267,9 +288,12 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
                         + (f": {detail}" if detail else ""))
             return expected.verify(collection, exact=exact)
         except Exception as original:
+            _record_counts(original, queued, accepted)
             if cleanup_owned:
                 try:
                     expected.rollback(collection)
                 except Exception as cleanup:
-                    raise BatchCleanupError(original, cleanup) from original
+                    error = BatchCleanupError(original, cleanup)
+                    _record_counts(error, queued, accepted)
+                    raise error from original
             raise

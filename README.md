@@ -118,6 +118,8 @@ A collection is a named vector index that holds chunks from one or more document
 
 Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically.
 
+Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents.
+
 Supported chunking strategies:
 
 | Strategy | Best for |
@@ -238,6 +240,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
 | `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
+| `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 

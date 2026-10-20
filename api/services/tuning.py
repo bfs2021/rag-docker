@@ -114,20 +114,24 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 _MISSING_CHUNK_INDEX = object()
 
 
-def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
-    """Stored source files a rebuild from the retained originals would not reproduce."""
+def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
+    """The stored source files a rebuild from the retained originals would not
+    reproduce, and every name that has stored chunks, from one walk of the
+    collection. A rebuild emits only the stored names (#311)."""
     by_filename: dict[str, list[str]] = {}
     for digest, entry in documents.items():
         for filename in entry["filenames"]:
             by_filename.setdefault(filename, []).append(digest)
     seen: dict[str, set] = {}
     uncovered = set()
+    stored = set()
     for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator):
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
+        stored.add(filename)
         # A rebuild emits one chunk set per (digest, name) (#22), so a name is
         # covered when exactly one digest lists it, whichever of its names it is.
         if len(by_filename.get(filename, [])) != 1:
@@ -140,22 +144,94 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
         if index in indices:
             uncovered.add(filename)
         indices.add(index)
-    return sorted(uncovered)
+    return sorted(uncovered), stored
 
 
-def can_rechunk(collection: str) -> bool:
-    """Whether re-chunking would pass the checks made before parsing.
+def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
+    """Stored source files a rebuild from the retained originals would not reproduce."""
+    return _source_coverage(collection, documents)[0]
+
+
+def _listed_names(documents: dict) -> set[str]:
+    return {filename for entry in documents.values() for filename in entry["filenames"]}
+
+
+class ServiceUnavailableError(Exception):
+    """Weaviate couldn't be read for the up-front re-chunk check (#340) or for
+    the tuning options (#349)."""
+
+
+# A collection whose retained originals all lack stored chunks (every file
+# produced none at ingest) has nothing to rebuild, since a rebuild emits only
+# stored names (#311). It isn't offered re-chunking, and a request is refused
+# before any job runs (#328).
+def _nothing_to_rebuild(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCES_REQUIRED",
+        f"Cannot re-chunk '{collection}': no retained original file has stored "
+        "chunks, so there is nothing to rebuild.",
+        {"collection": collection})
+
+
+def _has_stored_listed_name(collection: str, documents: dict) -> bool:
+    """Whether any name the index lists has stored chunks; stops at the first."""
+    names = _listed_names(documents)
+    for obj in wc.get_client().collections.get(collection).iterator():
+        if (obj.properties or {}).get("source_file") in names:
+            return True
+    return False
+
+
+def _refuse_nothing_to_rebuild(collection: str) -> None:
+    """The one re-chunk refusal made before a job is created (#328).
+
+    The other refusals, and an invalid index, are still reported by the job.
+    A Weaviate failure during the walk raises ServiceUnavailableError, which
+    the router answers with 503 rather than a bare 500 (#340).
+    """
+    try:
+        documents = sources.load_index(collection)["documents"]
+    except ValueError:
+        return
+    if not documents:
+        return
+    try:
+        stored = _has_stored_listed_name(collection, documents)
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Could not read %r for the re-chunk check", collection)
+        raise ServiceUnavailableError(collection) from exc
+    if not stored:
+        raise _nothing_to_rebuild(collection)
+
+
+# Why the tuning options don't offer re-chunking; see rechunk_refusal.
+RECHUNK_NOTHING_TO_REBUILD = "nothing-to-rebuild"
+RECHUNK_NOT_COVERED = "not-covered"
+
+
+def rechunk_refusal(collection: str) -> str | None:
+    """Why re-chunking would fail the checks made before parsing, or None.
 
     Used by the tuning options, so they offer re-chunking only when the job
-    would accept it. An invalid index or blob path raises ValueError.
+    would accept it. Nothing to rebuild is reported first, as the start refuses
+    it before the others (#328). An invalid index or blob path raises ValueError.
+    A Weaviate failure during the walk raises ServiceUnavailableError, which
+    the router answers with 503 rather than a bare 500 (#349).
     """
     documents = sources.load_index(collection)["documents"]
     if not documents:
-        return False
+        return RECHUNK_NOT_COVERED
+    try:
+        uncovered, stored = _source_coverage(collection, documents)
+    except Exception as exc:                          # noqa: BLE001
+        _log.exception("Could not read %r for the tuning options", collection)
+        raise ServiceUnavailableError(collection) from exc
+    if not stored & _listed_names(documents):
+        return RECHUNK_NOTHING_TO_REBUILD
     for digest in documents:
         if not sources.blob_path(collection, digest).is_file():
-            return False
-    return not _uncovered_source_files(collection, documents)
+            return RECHUNK_NOT_COVERED
+    return RECHUNK_NOT_COVERED if uncovered else None
 
 
 @telemetry.traced("rag.chunk")
@@ -186,8 +262,15 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     # digest (re-uploaded before #22 made re-ingesting replace), duplicate chunk
     # sets and a name with no retained original are refused before staging:
     # replacing from the retained subset would lose chunks, and a successful
-    # cutover discards their recovery copy.
-    uncovered = _uncovered_source_files(collection, documents)
+    # cutover discards their recovery copy. Only names with stored chunks are
+    # rebuilt (#311): an index can list a name the collection never showed (a
+    # file that produced no chunks, or an imported package listing one blob
+    # under many names), and rebuilding it would cost a parse and an embedding
+    # each time. With no listed name stored there is nothing to rebuild, which
+    # is refused as such rather than as a chunking problem (#328).
+    uncovered, stored = _source_coverage(collection, documents)
+    if not stored & _listed_names(documents):
+        raise _nothing_to_rebuild(collection)
     if uncovered:
         raise PackageError(
             "SOURCES_REQUIRED",
@@ -210,6 +293,8 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                     f"'{collection}' cannot be rebuilt from its originals.",
                     {"collection": collection, "digest": digest})
             for filename in entry["filenames"]:
+                if filename not in stored:
+                    continue
                 # Parsers dispatch on the file extension, so the original name
                 # has to be restored before parsing; each pair is staged in a
                 # directory of its own, so a/report.txt and b/report.txt can't
@@ -459,21 +544,39 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         if collection in _active:
             raise RuntimeError(collection)
         _active.add(collection)
+    # Lets DELETE /collections refuse while this job rebuilds the collection
+    # (#40). Before the job record, so a refusal during a delete leaves none (#302).
+    try:
+        collection_writes.register_job(collection, "tune", job_id)
+    except collection_writes.CollectionDeletingError:
+        with _lock:
+            _active.discard(collection)
+        raise
 
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "collection": collection,
-        "operation": operation,
-        "chunks_total": 0,
-        "chunks_written": 0,
-        "notes": [],
-        "error": None,
-        "error_code": None,
-        "error_detail": None,
-    }
-    # Lets DELETE /collections refuse while this job rebuilds the collection (#40).
-    collection_writes.register_job(collection, "tune", job_id)
+    # The first write is durable, so it runs off the event loop (#309). A start
+    # cancelled meanwhile releases its guards; the store removes the record.
+    try:
+        # A re-chunk with nothing to rebuild is refused here, before any job
+        # exists (#328); the walk runs off the event loop too.
+        if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
+            await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "collection": collection,
+            "operation": operation,
+            "chunks_total": 0,
+            "chunks_written": 0,
+            "notes": [],
+            "error": None,
+            "error_code": None,
+            "error_detail": None,
+        })
+    except BaseException:
+        collection_writes.end_job("tune", job_id)
+        with _lock:
+            _active.discard(collection)
+        raise
     task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, operation, params, source_collection=source_collection))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))

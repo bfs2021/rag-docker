@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/zip_over_gzip.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/json_over_size_member.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -110,6 +110,12 @@ check "only the other gzip member is skipped, as unsupported" $?
   api python - < scripts/tests/test_zip_expansion.py)
 check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
 
+# docker-compose.yml sets the cap (#319), and the API reads that value.
+cap_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings; print(os.environ.get("MAX_ZIP_EXPANDED_BYTES"), settings.max_zip_expanded_bytes)' | tr -d '\r')
+[ "$cap_env" = "2147483648 2147483648" ]
+check "docker-compose.yml sets MAX_ZIP_EXPANDED_BYTES to 2 GiB and the API uses it" $? "env and setting: $cap_env"
+
 # The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
 too_large() {
   local name="$1" code
@@ -153,7 +159,7 @@ read -r code err_code text_ok < /tmp/vfy_cap_result.txt
 [ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
 check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
   "HTTP=$code code=$err_code exact-message=$text_ok"
-[ "$slow" = 0 ]
+[ "$slow" = 0 ] && [ "$probes" -gt 0 ]
 check "job polls are answered while a ZIP is being counted" $? \
   "$probes probes, $slow slow or failed, slowest ${worst}s"
 
@@ -188,6 +194,31 @@ if missing or syntax:
 ENDPY
 )
 check "its chunks hold key: value text with non-ASCII kept" $?
+
+# JSON input, records and text are bounded (#300): each over-limit file fails
+# alone with its own reason, and the good file beside them is stored.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/json_over_size.json" "$FIX/json_many_records.json" \
+  "$FIX/json_over_size_gz.zip" "$FIX/json_over_size_member.zip" "$FIX/plain.json"
+read -r status chunks errors_ok <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = {
+    'json_over_size.json: is larger than 30,000,000 bytes, the most one JSON file can hold; '
+    'split the file or convert it to JSON Lines',
+    'json_many_records.json: has more than 1,000,000 records, the most one file can hold; '
+    'split the file',
+    'json_over_size_gz.zip:big.json.gz: decompresses to more than 30,000,000 bytes, the most '
+    'one JSON file can hold; split the file or convert it to JSON Lines',
+    'json_over_size_member.zip:big.json: is larger than 30,000,000 bytes, the most one JSON '
+    'file can hold; split the file or convert it to JSON Lines',
+}
+ok = len(d['errors']) == 4 and set(d['errors']) == want
+if not ok:
+    import sys; print(repr(d['errors']), file=sys.stderr)
+print(d['status'], d['chunks_stored'], 'yes' if ok else 'no')")"
+[ "$status" = partial ] && [ "$chunks" -gt 0 ] && [ "$errors_ok" = yes ]
+check "over-size, over-cap, over-size .json.gz and over-size ZIP-member JSON fail alone with their reasons" $? \
+  "status=$status chunks=$chunks exact-errors=$errors_ok"
 
 # ── JSON Lines (#291) ────────────────────────────────────────────────────────
 # Controlled cases: conversion per line, blank and malformed lines, the line
@@ -239,6 +270,22 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 [ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
 check "a malformed line fails the file with its line number and stores nothing" $? \
   "status=$status error=$first_error stored=$stored"
+
+# A JSON Lines file holds at most 1,000,000 lines, records with no text
+# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
+read -r status cap_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+        'the most one file can hold; split the file']
+print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
+check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+  "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
@@ -506,6 +553,13 @@ job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_
 check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
+# Submitted, accepted and stored chunks are counted apart (#302); a clean job's
+# three counts agree, and stored is the checked count it always was.
+read -r n_sub n_acc n_sto <<<"$(api_get "/ingest/job/$job" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(d.get('chunks_submitted'), d.get('chunks_accepted'), d.get('chunks_stored'))")"
+[ "$n_sub" = "$n_sto" ] && [ "$n_acc" = "$n_sto" ] && [ "${n_sto:-0}" -gt 0 ] 2>/dev/null
+check "a clean job reports chunks_submitted = chunks_accepted = chunks_stored" $? \
+  "submitted=$n_sub accepted=$n_acc stored=$n_sto"
 
 # ── deleting a collection while an ingest job runs (#40) ─────────────────────
 # A DELETE sent during a job used to wait for it and then remove what it stored,
@@ -514,6 +568,33 @@ check_eq "job reaches 'completed'" "$final" "completed"
 # request orderings, and the job's report when its collection disappears.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
 check "delete-while-busy: job kinds, request orderings and the job's report" $?
+# Confirmation, a delete in progress refusing new jobs, and a cancelled
+# generation start (#302); then the job write counts and the MCP delete tool.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_write_counts.py)
+check "ingest jobs count submitted, accepted and stored chunks apart" $?
+python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
+check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+
+# DELETE needs ?confirm=true, checked before the collection is looked up (#302).
+CC="${PREFIX}Confirm"
+drop_collection "$CC"; make_collection "$CC"
+confirm_code() {   # HTTP status and error code of a DELETE with this query
+  _rag_require_lock_owner
+  local http; http=$(curl -s -m 120 -o /tmp/vfy_confirm.json -w '%{http_code}' -X DELETE "$API/collections/$1$2")
+  printf '%s %s' "$http" "$(python3 -c "
+import json
+try: print(json.load(open('/tmp/vfy_confirm.json'))['error']['code'])
+except Exception: print('-')")"
+}
+check_eq "DELETE without confirm is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=false is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "?confirm=false")" "400 CONFIRMATION_REQUIRED"
+check_eq "a refused DELETE leaves the collection in place" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "True"
+check_eq "DELETE of a missing collection without confirm is 400, not 404" \
+  "$(confirm_code "${PREFIX}ConfirmMissing" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=TRUE (any case) deletes" "$(confirm_code "$CC" "?confirm=TRUE" | cut -d' ' -f1)" "200"
+check_eq "the confirmed delete removed the collection" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "False"
 
 DC="${PREFIX}DeleteBusy"
 drop_collection "$DC"; make_collection "$DC"
@@ -599,10 +680,12 @@ check "an insert into a deleted collection fails and does not recreate it" $? \
 
 # ── job status survives an API restart (#23; opt-in: restarts the API) ───────
 # Before #23 every job answered 404 after a restart. A job that finished must
-# read back unchanged, and one interrupted after storing a file must read
-# `partial` with the interruption message. `--timeout 0`: with the default 10 s
-# stop timeout the worker could finish the job during shutdown.
+# read back unchanged, one interrupted after storing a file must read `partial`
+# with the interruption message, and one interrupted before storing any file
+# must read `failed` with it (#309). `--timeout 0`: with the default 10 s stop
+# timeout the worker could finish the job during shutdown.
 JR="${PREFIX}JobRestart"
+JN="${PREFIX}JobRestartNone"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
 if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
@@ -611,6 +694,7 @@ elif [ -n "$restart_refusal" ]; then
   check "ingest job status across an API restart" 1 "$restart_refusal"
 else
   drop_collection "$JR"; make_collection "$JR"
+  drop_collection "$JN"; make_collection "$JN"
   ingest "$JR" fixed 300 50 "$FIX/policies.txt"
   done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
   api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
@@ -626,7 +710,6 @@ ENDPY
   curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
     -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
     -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
-  rm -rf "$slow_dir"
   slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
   state=""
   for _ in $(seq 1 600); do
@@ -638,9 +721,16 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     sleep 0.5
   done
   if [ "$state" != running-stored ]; then
+    rm -rf "$slow_dir"
     check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
   else
+    # Only the slow file, so nothing is stored before the restart (#309).
+    curl -s -m 600 -o /tmp/vfy_restart_none_start.json -X POST "$API/ingest/upload" -F "collection=$JN" \
+      -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$slow_dir/slow.txt"
+    rm -rf "$slow_dir"
+    none_job=$(jfield "['job_id']" < /tmp/vfy_restart_none_start.json)
     sleep 2
+    api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -663,8 +753,27 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
       "$(head -c 300 /tmp/vfy_restart_after.json)"
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_none_after.json -w '%{http_code}' "$API/ingest/job/$none_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+try:
+    before = json.load(open('/tmp/vfy_restart_none_before.json'))
+    after = json.load(open('/tmp/vfy_restart_none_after.json'))
+except (OSError, ValueError):
+    sys.exit(1)
+ok = (before.get("status") in ("queued", "running") and before.get("files_completed") == 0
+      and sys.argv[1] == "200" and after.get("status") == "failed"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == 0)
+print(before.get("status"), sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an ingest interrupted before storing a file reads back 200 'failed' with the message" $? \
+      "before: $(head -c 200 /tmp/vfy_restart_none_before.json); after: $(head -c 300 /tmp/vfy_restart_none_after.json)"
   fi
   drop_collection "$JR"
+  drop_collection "$JN"
 fi
 
 drop_collection "$C"

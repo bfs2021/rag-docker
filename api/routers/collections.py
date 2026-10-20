@@ -109,7 +109,11 @@ def _busy_error(name: str, jobs: list[tuple[str, str]]):
 
 
 @router.delete("/{name}", status_code=200)
-async def delete_collection(name: str):
+async def delete_collection(name: str, confirm: str | None = None):
+    # Checked first, before the collection is even looked up, and as text, so a
+    # value other than `true` is a 400 like a missing one, never a 422 (#302).
+    if (confirm or "").lower() != "true":
+        return api_error(400, "CONFIRMATION_REQUIRED", "Add ?confirm=true to confirm deletion.")
     if not await wc.collection_exists(name):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
