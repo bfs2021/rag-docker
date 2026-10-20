@@ -365,6 +365,10 @@ ignore valid HNSW settings.
 
 **Response 409** if collection already exists.
 
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check whether the
+collection exists (#366). No collection is created; `detail` is `{"collection": "<name>"}`.
+The cause is logged, not returned.
+
 ---
 
 ```
@@ -389,6 +393,10 @@ Before deletion, resolves the backend's canonical collection name. After success
 ```json
 { "error": { "code": "COLLECTION_NOT_FOUND", "message": "Collection 'Documents' does not exist.", "detail": null } }
 ```
+
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
+collection exists (#366). Nothing is deleted; `detail` is `{"collection": "<name>"}`. The
+cause is logged, not returned. Confirmation is still checked first.
 
 **Response 400** if `confirm=true` is not supplied:
 ```json
@@ -507,6 +515,7 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
 | 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
 | 409 | `COLLECTION_DELETING` | a delete of the collection is in progress (§3.1.2; #302); nothing is saved or queued |
+| 503 | `SERVICE_UNAVAILABLE` | Weaviate can't be read to check that the collection exists (#366); nothing is saved or queued, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned |
 | 500 | `INGEST_FAILED` | anything unexpected; the message says so and the API log holds the traceback, collection and filenames |
 
 The ZIP messages name the upload, say nothing from it was imported, name the unreadable
@@ -806,6 +815,10 @@ When `include_citations` is `true`:
 
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
+collection exists (#366). No query is run; `detail` is `{"collection": "<name>"}`. The cause
+is logged, not returned.
+
 **RAG pipeline (internal steps):**
 1. Reformat user question for retrieval using Phi-3.5 Mini (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
@@ -899,6 +912,10 @@ deletion removed the collection before sampling, it returns
 `404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes. A delete in
 progress is checked before that wait and answers `409 COLLECTION_DELETING` at once (§3.1.2;
 #302).
+
+When Weaviate can't be read to check that the collection exists, generation answers
+`503 SERVICE_UNAVAILABLE` without creating a session or model task (#366); `detail` is
+`{"collection": "<name>"}`. The cause is logged, not returned.
 
 If the request that started a generation is cancelled while the session is being prepared,
 the preparation still finishes; a session it published is then settled as a cancelled
@@ -1268,6 +1285,9 @@ The job reports `models_bundled` — what the package actually carries, which is
 
 - **404 `COLLECTION_NOT_FOUND`** if the collection does not exist. Checked
   before a job is created, so a typo does not leave a failed job behind.
+- **503 `SERVICE_UNAVAILABLE`** when Weaviate can't be read for that check
+  (#366). No job is created; `detail` is `{"collection": "<name>"}`. The cause
+  is logged, not returned.
 - **409 `EXPORT_IN_PROGRESS`** if an export of the same collection is already
   running; `detail.job_id` names it. Two concurrent exports of one collection
   would race on the staging directory and the temporary archive. Exports of

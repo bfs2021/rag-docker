@@ -365,6 +365,12 @@ also when the connection itself fails and for a re-embed with chunking parameter
 route, while a re-embed without them still starts. A Weaviate error checking that the
 collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
 answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
+The same existence check in `POST /query`, `POST /goldstandard/generate`, `POST /collections`,
+`DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, naming the collection, with the cause logged, not
+sent, and nothing run, created or saved; a collection Weaviate reports missing is still 404
+`COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
+create (#366).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest

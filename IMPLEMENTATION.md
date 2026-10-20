@@ -667,6 +667,14 @@ def collection_deleting_error(name: str) -> JSONResponse:
     from services.collection_writes import deleting_message
     return api_error(409, "COLLECTION_DELETING", deleting_message(name),
                      detail={"collection": name})
+
+
+def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
+    """A request refused because Weaviate couldn't say whether its collection exists (#366)."""
+    return api_error(503, "SERVICE_UNAVAILABLE",
+                     f"Cannot check whether '{name}' exists: Weaviate could not be read. "
+                     f"{outcome}; try again when Weaviate is available.",
+                     detail={"collection": name})
 ```
 
 ### api/config.py
@@ -8740,6 +8748,7 @@ async def transfer_help():
 from __future__ import annotations
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8754,9 +8763,10 @@ from models.schemas import (
 )
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/collections")
+_log = logging.getLogger(__name__)
 
 _REGISTRY_FILE: Path | None = None
 _registry_lock = asyncio.Lock()
@@ -8805,7 +8815,13 @@ async def list_collections():
 
 @router.post("", status_code=201)
 async def create_collection(body: CreateCollectionRequest):
-    if await wc.collection_exists(body.name):
+    try:
+        exists = await wc.collection_exists(body.name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists before creating it", body.name)
+        return collection_check_unavailable(body.name, "No collection was created")
+    if exists:
         return api_error(409, "COLLECTION_EXISTS", f"Collection '{body.name}' already exists.")
 
     try:
@@ -8853,7 +8869,13 @@ async def delete_collection(name: str, confirm: str | None = None):
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":
         return api_error(400, "CONFIRMATION_REQUIRED", "Add ?confirm=true to confirm deletion.")
-    if not await wc.collection_exists(name):
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists before deleting it", name)
+        return collection_check_unavailable(name, "Nothing was deleted")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
     try:
@@ -8893,7 +8915,7 @@ from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
-from utils import api_error, collection_deleting_error
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -8937,7 +8959,13 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
-    if not await wc.collection_exists(collection):
+    try:
+        exists = await wc.collection_exists(collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an ingest upload", collection)
+        return collection_check_unavailable(collection, "No job was started")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
 
     try:
@@ -8991,20 +9019,29 @@ async def save_ingest_config(body: SaveIngestConfigBody):
 ```python
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter
 
 from models.schemas import QueryRequest, QueryResponse
 from services import metrics
 from services import rag_pipeline
 from services import weaviate_client as wc
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/query")
+_log = logging.getLogger(__name__)
 
 
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for a query", body.collection)
+        return collection_check_unavailable(body.collection, "No query was run")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
     result = await rag_pipeline.run_query(
@@ -9072,6 +9109,7 @@ job-polling shape so both live behind one prefix-free router.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -9089,14 +9127,21 @@ from models.schemas import (
 from services import exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
-from utils import api_error, collection_deleting_error
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an export", body.collection)
+        return collection_check_unavailable(body.collection, "No job was started")
+    if not exists:
         # Checked before a job exists, so a typo does not leave a failed job
         # lying around for the user to interpret.
         return api_error(404, "COLLECTION_NOT_FOUND",
@@ -9342,6 +9387,7 @@ async def tune_options(collection: str):
 ```python
 from __future__ import annotations
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -9361,14 +9407,22 @@ from models.schemas import (
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/goldstandard")
+_log = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
 async def generate(body: GenerateRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for a gold-standard generation",
+                       body.collection)
+        return collection_check_unavailable(body.collection, "No generation was started")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
     try:
@@ -13070,6 +13124,12 @@ also when the connection itself fails and for a re-embed with chunking parameter
 route, while a re-embed without them still starts. A Weaviate error checking that the
 collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
 answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
+The same existence check in `POST /query`, `POST /goldstandard/generate`, `POST /collections`,
+`DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, naming the collection, with the cause logged, not
+sent, and nothing run, created or saved; a collection Weaviate reports missing is still 404
+`COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
+create (#366).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest

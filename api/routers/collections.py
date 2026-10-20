@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,9 +16,10 @@ from models.schemas import (
 )
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/collections")
+_log = logging.getLogger(__name__)
 
 _REGISTRY_FILE: Path | None = None
 _registry_lock = asyncio.Lock()
@@ -66,7 +68,13 @@ async def list_collections():
 
 @router.post("", status_code=201)
 async def create_collection(body: CreateCollectionRequest):
-    if await wc.collection_exists(body.name):
+    try:
+        exists = await wc.collection_exists(body.name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists before creating it", body.name)
+        return collection_check_unavailable(body.name, "No collection was created")
+    if exists:
         return api_error(409, "COLLECTION_EXISTS", f"Collection '{body.name}' already exists.")
 
     try:
@@ -114,7 +122,13 @@ async def delete_collection(name: str, confirm: str | None = None):
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":
         return api_error(400, "CONFIRMATION_REQUIRED", "Add ?confirm=true to confirm deletion.")
-    if not await wc.collection_exists(name):
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists before deleting it", name)
+        return collection_check_unavailable(name, "Nothing was deleted")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
     try:
