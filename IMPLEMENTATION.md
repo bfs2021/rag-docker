@@ -23894,6 +23894,28 @@ class TelemetryConfigError(ValueError):
     """Messages contain field names only, never configuration values."""
 
 
+def _read_regular_file(path, limit):
+    """Return at most limit + 1 bytes of a regular file, never blocking.
+
+    The path is checked before it is opened, so a FIFO, device or directory is
+    never opened, and the open descriptor is checked again before any read, so
+    a path swapped after the first check is refused too. O_NONBLOCK keeps that
+    open from waiting for a FIFO writer.
+    """
+    if not stat.S_ISREG(Path(path).stat().st_mode):
+        raise ValueError
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with source:
+        return source.read(limit + 1)
+
+
 @dataclass(frozen=True)
 class Config:
     enabled: bool = False
@@ -23961,10 +23983,7 @@ class Config:
         secret_file = value("HEADERS_FILE", "")
         if secret_file:
             try:
-                if not stat.S_ISREG(Path(secret_file).stat().st_mode):
-                    raise ValueError
-                with Path(secret_file).open("rb") as source:
-                    raw = source.read(8193)
+                raw = _read_regular_file(secret_file, 8192)
                 if len(raw) > 8192:
                     raise ValueError
                 def header_pairs(pairs):
@@ -23992,11 +24011,8 @@ class Config:
         ca_file = value("CA_FILE", "")
         if ca_file:
             try:
-                if not stat.S_ISREG(Path(ca_file).stat().st_mode):
+                if len(_read_regular_file(ca_file, 1048576)) > 1048576:
                     raise ValueError
-                with Path(ca_file).open("rb") as source:
-                    if len(source.read(1048577)) > 1048576:
-                        raise ValueError
                 ssl.create_default_context(cafile=ca_file)
             except (OSError, ValueError, TypeError):
                 raise TelemetryConfigError("Invalid RAG_OTEL_CA_FILE") from None
@@ -24437,7 +24453,7 @@ def private_ca():
 
 class TelemetryTests(unittest.TestCase):
     def test_disabled_never_constructs_transport_or_reads_secrets(self):
-        with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+        with patch('services.telemetry._session', side_effect=AssertionError), patch('os.open', side_effect=AssertionError):
             runtime = bootstrap({'RAG_OTEL_HEADERS_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
             self.assertFalse(runtime.config.enabled)
             self.assertEqual(runtime._providers, [])
@@ -24450,7 +24466,7 @@ class TelemetryTests(unittest.TestCase):
                 before = dict(os.environ)
                 env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318',
                        'RAG_OTEL_HEADERS_FILE':SECRET, 'OTEL_SDK_DISABLED':'false'}
-                with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+                with patch('services.telemetry._session', side_effect=AssertionError), patch('os.open', side_effect=AssertionError):
                     for signals in ({}, {'RAG_OTEL_TRACES':'false'}, {'RAG_OTEL_LOGS':'false'}, {'RAG_OTEL_METRICS':'false'}):
                         with self.assertRaises(TelemetryConfigError) as error:
                             bootstrap({**env, **signals})
@@ -25244,7 +25260,7 @@ class TelemetryTests(unittest.TestCase):
             self.assertNotIn('/v1/logs', {path for path, _ in records})
 
     def test_ca_file_disabled_invalid_and_https_rule(self):
-        with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError), \
+        with patch('services.telemetry._session', side_effect=AssertionError), patch('os.open', side_effect=AssertionError), \
                 patch('ssl.create_default_context', side_effect=AssertionError):
             runtime = bootstrap({'RAG_OTEL_CA_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
             self.assertFalse(runtime.config.enabled)
@@ -25332,7 +25348,7 @@ class TelemetryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             unreadable = os.path.join(directory, 'unreadable-'+SECRET.replace('/', '_'))
             Path(unreadable).write_bytes(b'')
-            with patch('pathlib.Path.open', side_effect=PermissionError) as opened, self.assertRaises(TelemetryConfigError) as raised:
+            with patch('os.open', side_effect=PermissionError) as opened, self.assertRaises(TelemetryConfigError) as raised:
                 Config.from_env({**base, 'RAG_OTEL_CA_FILE':unreadable})
             opened.assert_called()
         self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_CA_FILE')
@@ -25389,6 +25405,54 @@ class TelemetryTests(unittest.TestCase):
                     self.assertEqual(str(outcome[0]), 'Invalid '+key)
                     self.assertNotIn(SECRET, str(outcome[0]))
                     self.assertNotIn(path, str(outcome[0]))
+
+    def test_reviewer_non_regular_paths_are_never_opened(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = os.path.join(directory, SECRET.replace('/', '_')+'-fifo')
+            os.mkfifo(fifo)
+            for key in ('RAG_OTEL_HEADERS_FILE', 'RAG_OTEL_CA_FILE'):
+                for kind, path in (('character device', os.devnull), ('fifo', fifo), ('directory', directory)):
+                    with self.subTest(key=key, kind=kind):
+                        with patch('os.open', side_effect=AssertionError('opened')) as opened, \
+                                patch('ssl.create_default_context', side_effect=AssertionError('loaded')), \
+                                self.assertRaises(TelemetryConfigError) as raised:
+                            Config.from_env({**base, key:path})
+                        opened.assert_not_called()
+                        self.assertEqual(str(raised.exception), 'Invalid '+key)
+                        self.assertNotIn(path, str(raised.exception))
+
+    def test_path_swapped_for_fifo_after_check_is_refused_without_blocking(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        real_open = os.open
+        for key in ('RAG_OTEL_HEADERS_FILE', 'RAG_OTEL_CA_FILE'):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, SECRET.replace('/', '_')+'-swapped')
+                Path(path).write_bytes(b'{}')
+                swapped, fired, done = [], [], threading.Event()
+                def swap_then_open(name, flags, *args, **kwargs):
+                    if name == path and not swapped:
+                        os.remove(path)
+                        os.mkfifo(path)
+                        swapped.append(True)
+                    return real_open(name, flags, *args, **kwargs)
+                def watchdog():
+                    if not done.wait(5):
+                        fired.append(True)
+                        os.close(real_open(path, os.O_WRONLY))
+                threading.Thread(target=watchdog, daemon=True).start()
+                try:
+                    with patch('os.open', side_effect=swap_then_open), \
+                            patch('os.fdopen', side_effect=AssertionError('read')), \
+                            patch('ssl.create_default_context', side_effect=AssertionError('loaded')), \
+                            self.assertRaises(TelemetryConfigError) as raised:
+                        Config.from_env({**base, key:path})
+                finally:
+                    done.set()
+                self.assertEqual(swapped, [True])
+                self.assertEqual(fired, [], key+' blocked on a path swapped for a FIFO')
+                self.assertEqual(str(raised.exception), 'Invalid '+key)
+                self.assertNotIn(path, str(raised.exception))
 
 if __name__ == '__main__':unittest.main()
 ```
