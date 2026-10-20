@@ -958,4 +958,80 @@ class TelemetryTests(unittest.TestCase):
                 server.server_close()
                 thread.join()
 
+    def test_reviewer_ca_file_is_the_only_trust_store(self):
+        import ssl
+        import requests
+        records = []; verify = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                records.append(self.path); self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(200); self.end_headers()
+            def log_message(self, *args):
+                pass
+        post = requests.Session.post
+        def spy(session, url, *args, **kwargs):
+            verify.append(kwargs.get('verify'))
+            return post(session, url, *args, **kwargs)
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            unreadable = os.path.join(directory, 'unreadable-'+SECRET.replace('/', '_'))
+            Path(unreadable).write_bytes(b'')
+            with patch('pathlib.Path.open', side_effect=PermissionError) as opened, self.assertRaises(TelemetryConfigError) as raised:
+                Config.from_env({**base, 'RAG_OTEL_CA_FILE':unreadable})
+            opened.assert_called()
+        self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_CA_FILE')
+        with private_ca() as paths, private_ca() as other, tempfile.TemporaryDirectory() as directory:
+            both = os.path.join(directory, 'both.pem')
+            Path(both).write_bytes(Path(other['ca']).read_bytes() + Path(paths['ca']).read_bytes())
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(paths['server'], paths['key'])
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':f'https://127.0.0.1:{server.server_port}',
+                       'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false'}
+                for name, ca_file, delivered in (('unset', None, False), ('other CA only', other['ca'], False),
+                                                 ('bundle with both CAs', both, True)):
+                    with self.subTest(case=name), patch.object(requests.Session, 'post', spy):
+                        records.clear(); verify.clear()
+                        runtime = bootstrap({**env, 'RAG_OTEL_CA_FILE':ca_file} if ca_file else env)
+                        try:
+                            with runtime.tracer.start_as_current_span('rag.query'):
+                                pass
+                            runtime.force_flush()
+                        finally:
+                            runtime.shutdown()
+                        self.assertEqual(records, ['/v1/traces'] if delivered else [])
+                        self.assertTrue(verify)
+                        self.assertEqual(set(verify), {ca_file or True})
+            finally:
+                server.shutdown(); server.server_close(); thread.join()
+
+    def test_non_regular_files_are_refused_without_blocking(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = os.path.join(directory, SECRET.replace('/', '_')+'-fifo')
+            os.mkfifo(fifo)
+            for key, path in (('RAG_OTEL_HEADERS_FILE', fifo), ('RAG_OTEL_HEADERS_FILE', directory),
+                              ('RAG_OTEL_CA_FILE', fifo)):
+                with self.subTest(key=key, kind='fifo' if path == fifo else 'directory'):
+                    outcome = []
+                    def load():
+                        try:
+                            Config.from_env({**base, key:path})
+                        except Exception as error:
+                            outcome.append(error)
+                    worker = threading.Thread(target=load, daemon=True); worker.start()
+                    worker.join(5)
+                    if worker.is_alive():
+                        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                        worker.join(5)
+                        self.fail(key+' blocked on a non-regular file')
+                    self.assertEqual(len(outcome), 1)
+                    self.assertIsInstance(outcome[0], TelemetryConfigError)
+                    self.assertEqual(str(outcome[0]), 'Invalid '+key)
+                    self.assertNotIn(SECRET, str(outcome[0]))
+                    self.assertNotIn(path, str(outcome[0]))
+
 if __name__ == '__main__':unittest.main()

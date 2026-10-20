@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import ssl
+import stat
 import threading
 import time
 from urllib.parse import urlsplit
@@ -89,6 +90,8 @@ class Config:
         secret_file = value("HEADERS_FILE", "")
         if secret_file:
             try:
+                if not stat.S_ISREG(Path(secret_file).stat().st_mode):
+                    raise ValueError
                 with Path(secret_file).open("rb") as source:
                     raw = source.read(8193)
                 if len(raw) > 8192:
@@ -118,6 +121,8 @@ class Config:
         ca_file = value("CA_FILE", "")
         if ca_file:
             try:
+                if not stat.S_ISREG(Path(ca_file).stat().st_mode):
+                    raise ValueError
                 with Path(ca_file).open("rb") as source:
                     if len(source.read(1048577)) > 1048576:
                         raise ValueError
