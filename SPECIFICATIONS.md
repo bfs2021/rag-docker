@@ -2032,6 +2032,26 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | Gold standard `sample_size` | 20 | 1 | 100 | |
 | `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
 
+Optional telemetry (#282) is configured by API container environment settings, not request parameters. They are read only when `RAG_OTEL_ENABLED` is `true`; an invalid value fails API startup with an error naming the field only. See "Optional telemetry foundation (#282)" below and README "Optional backend telemetry".
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_OTEL_ENABLED` | `false` | Exact `true` or `false` |
+| `RAG_OTEL_ENDPOINT` | none (required when enabled) | HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
+| `RAG_OTEL_PROTOCOL` | `http/protobuf` | `http/protobuf` only |
+| `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
+| `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle; at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
+| `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
+| `RAG_OTEL_SERVICE_VERSION` | `1.1.0` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | `true` | Exact `true` or `false` |
+| `RAG_OTEL_SAMPLE_RATIO` | `1.0` | Finite 0–1 |
+| `RAG_OTEL_QUEUE_SIZE` | `256` | Integer 1–4096 |
+| `RAG_OTEL_BATCH_SIZE` | `64` | Integer 1–512, no larger than `RAG_OTEL_QUEUE_SIZE` |
+| `RAG_OTEL_TIMEOUT_MS` | `1000` | Integer 100–10000 |
+| `RAG_OTEL_INTERVAL_MS` | `5000` | Integer 1000–60000 |
+| `RAG_OTEL_SHUTDOWN_MS` | `3000` | Integer 100–30000 |
+
 ---
 
 ## 9. File and Directory Structure
@@ -2533,6 +2553,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       weaviate publish nothing; ollama and ui expose container ports only.*
 - [x] Docker Engine is 28.0.0 or newer; older engines are outside the supported localhost-isolation profile. The infrastructure suite checks the daemon version.
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
+- [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8) fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
+  *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
 
 ---
 
@@ -2659,8 +2681,11 @@ before secret access or exporter construction, because all three pinned SDK
 providers otherwise silently disable signals. Explicit configuration mappings
 cannot mask this conflict; disabled RAG telemetry still returns a no-op. The
 runtime must not mutate the process environment or global providers.
-Configuration and finite safe schema
-are specified in README.md, “Optional backend telemetry”. No global providers,
+Configuration is listed in §8 and, with the finite safe
+schema, specified in README.md, “Optional backend telemetry”. An optional
+`RAG_OTEL_CA_FILE` (#356) names a mounted CA bundle for an HTTPS collector behind
+a private CA: it is validated once at startup, replaces the bundled roots for
+export, and is re-read by requests on new connections. No global providers,
 automatic request instrumentation, application log bridge or collector deployment
 are included in this foundation. Raw SDK providers remain internal; supported
 instrumentation uses the runtime tracer, safe logger and meter, with lifecycle

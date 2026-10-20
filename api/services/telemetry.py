@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import ssl
 import threading
 import time
 from urllib.parse import urlsplit
@@ -38,6 +39,7 @@ class Config:
     timeout_ms: int = 1000
     interval_ms: int = 5000
     shutdown_ms: int = 3000
+    ca_file: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls, env=None):
@@ -111,6 +113,19 @@ class Config:
                 raise TelemetryConfigError("Invalid RAG_OTEL_HEADERS_FILE") from None
         if headers and url.scheme != "https":
             raise TelemetryConfigError("RAG_OTEL_HEADERS_FILE requires HTTPS RAG_OTEL_ENDPOINT")
+        # Optional private CA bundle, checked once here; requests re-reads the
+        # path on new connections. It replaces, not extends, the bundled roots.
+        ca_file = value("CA_FILE", "")
+        if ca_file:
+            try:
+                with Path(ca_file).open("rb") as source:
+                    if len(source.read(1048577)) > 1048576:
+                        raise ValueError
+                ssl.create_default_context(cafile=ca_file)
+            except (OSError, ValueError, TypeError):
+                raise TelemetryConfigError("Invalid RAG_OTEL_CA_FILE") from None
+            if url.scheme != "https":
+                raise TelemetryConfigError("RAG_OTEL_CA_FILE requires HTTPS RAG_OTEL_ENDPOINT")
         queue = number("QUEUE_SIZE", 256, 1, 4096)
         batch = number("BATCH_SIZE", 64, 1, 512)
         if batch > queue:
@@ -122,7 +137,7 @@ class Config:
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
                    number("TIMEOUT_MS", 1000, 100, 10000),
                    number("INTERVAL_MS", 5000, 1000, 60000),
-                   number("SHUTDOWN_MS", 3000, 100, 30000))
+                   number("SHUTDOWN_MS", 3000, 100, 30000), ca_file=ca_file)
 
 
 # Finite value vocabularies prevent sensitive values hidden under approved keys.
@@ -259,12 +274,13 @@ def _session(signal, config):
             result._content = b"telemetry export failed"
             try:
                 payload = sanitize_wire(data, signal, config)
-                # Explicit arguments override ambient OTEL_* TLS/header options.
+                # Explicit arguments override ambient OTEL_* TLS/header options;
+                # a configured CA file is the only trust store when set.
                 self.cookies.clear()
                 self.headers.clear()
                 self.headers.update({"Content-Type": "application/x-protobuf", **config.headers})
                 with super().post(config.endpoint + "/v1/" + signal, data=payload,
-                                  timeout=config.timeout_ms / 1000, verify=True,
+                                  timeout=config.timeout_ms / 1000, verify=config.ca_file or True,
                                   allow_redirects=False, stream=True) as response:
                     if 200 <= response.status_code < 300:
                         result.status_code = 200

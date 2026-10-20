@@ -44,6 +44,41 @@ def receiver(status=200):
         server.server_close()
         thread.join()
 
+@contextlib.contextmanager
+def private_ca():
+    """A throwaway CA and a 127.0.0.1 server certificate it signed, as PEM files."""
+    import datetime, ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    now = datetime.datetime.now(datetime.timezone.utc)
+    def certificate(subject, issuer, public_key, signing_key, ca):
+        builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+                   .public_key(public_key).serial_number(x509.random_serial_number())
+                   .not_valid_before(now - datetime.timedelta(minutes=5))
+                   .not_valid_after(now + datetime.timedelta(days=1))
+                   .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+                   .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
+                   .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(signing_key.public_key()), critical=False))
+        if ca:
+            builder = builder.add_extension(x509.KeyUsage(False, False, False, False, False, True, True, False, False), critical=True)
+        else:
+            builder = builder.add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
+        return builder.sign(signing_key, hashes.SHA256())
+    ca_key, server_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'rag-test-private-ca')])
+    ca_cert = certificate(ca_name, ca_name, ca_key.public_key(), ca_key, True)
+    server_cert = certificate(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, '127.0.0.1')]),
+                              ca_name, server_key.public_key(), ca_key, False)
+    with tempfile.TemporaryDirectory() as directory:
+        paths = {name: os.path.join(directory, name+'.pem') for name in ('ca', 'server', 'key')}
+        Path(paths['ca']).write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+        Path(paths['server']).write_bytes(server_cert.public_bytes(serialization.Encoding.PEM))
+        Path(paths['key']).write_bytes(server_key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        yield paths
+
 class TelemetryTests(unittest.TestCase):
     def test_disabled_never_constructs_transport_or_reads_secrets(self):
         with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
@@ -739,5 +774,188 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(provider.closed,1)
         self.assertTrue(runtime.shutdown())
         self.assertEqual(provider.closed,1)
+
+    def test_reviewer_configuration_bounds_accept_edges_and_reject_neighbours(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318/'}
+        cfg = Config.from_env(base)
+        self.assertEqual(cfg.endpoint, 'http://localhost:4318')
+        self.assertEqual((cfg.queue_size, cfg.batch_size, cfg.timeout_ms, cfg.interval_ms, cfg.shutdown_ms, cfg.sample_ratio),
+                         (256, 64, 1000, 5000, 3000, 1.0))
+        bounds = {'QUEUE_SIZE':(1, 4096), 'BATCH_SIZE':(1, 512), 'TIMEOUT_MS':(100, 10000),
+                  'INTERVAL_MS':(1000, 60000), 'SHUTDOWN_MS':(100, 30000)}
+        for key, (low, high) in bounds.items():
+            extra = {'RAG_OTEL_QUEUE_SIZE':'4096'} if key == 'BATCH_SIZE' else {'RAG_OTEL_BATCH_SIZE':'1'} if key == 'QUEUE_SIZE' else {}
+            for value in (low, high):
+                with self.subTest(key=key, value=value):
+                    Config.from_env({**base, **extra, 'RAG_OTEL_'+key:str(value)})
+            for value in (str(low-1), str(high+1), '1.5', ''):
+                with self.subTest(key=key, value=value), self.assertRaises(TelemetryConfigError) as raised:
+                    Config.from_env({**base, **extra, 'RAG_OTEL_'+key:value})
+                self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_'+key)
+        for value in ('0', '1', '0.5'):
+            Config.from_env({**base, 'RAG_OTEL_SAMPLE_RATIO':value})
+        for value in ('-0.01', '1.01', 'inf', '-inf'):
+            with self.subTest(sample=value), self.assertRaises(TelemetryConfigError):
+                Config.from_env({**base, 'RAG_OTEL_SAMPLE_RATIO':value})
+        with self.assertRaises(TelemetryConfigError) as raised:
+            Config.from_env({**base, 'RAG_OTEL_QUEUE_SIZE':'4', 'RAG_OTEL_BATCH_SIZE':'5'})
+        self.assertEqual(str(raised.exception), 'RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE')
+        Config.from_env({**base, 'RAG_OTEL_QUEUE_SIZE':'4', 'RAG_OTEL_BATCH_SIZE':'4'})
+        for key in ('SERVICE_NAME', 'SERVICE_VERSION', 'ENVIRONMENT'):
+            self.assertEqual(getattr(Config.from_env({**base, 'RAG_OTEL_'+key:'a'*64}),
+                                     {'SERVICE_NAME':'service','SERVICE_VERSION':'version','ENVIRONMENT':'environment'}[key]), 'a'*64)
+            for value in ('a'*65, '-lead', 'has space', ''):
+                with self.subTest(key=key, value=value), self.assertRaises(TelemetryConfigError):
+                    Config.from_env({**base, 'RAG_OTEL_'+key:value})
+        for endpoint in ('http://localhost:0', 'http://:4318', 'http://local host', 'http://localhost#'+SECRET, ''):
+            with self.subTest(endpoint=endpoint), self.assertRaises(TelemetryConfigError) as raised:
+                Config.from_env({**base, 'RAG_OTEL_ENDPOINT':endpoint})
+            self.assertNotIn(SECRET, str(raised.exception))
+        for key in ('ENABLED', 'TRACES', 'LOGS', 'METRICS'):
+            for value in ('True', '1', ''):
+                with self.subTest(key=key, value=value), self.assertRaises(TelemetryConfigError):
+                    Config.from_env({**base, 'RAG_OTEL_'+key:value})
+
+    def test_reviewer_header_file_limits_are_value_free(self):
+        cases = ('{"Authorization":"'+'a'*8200+'"}', '{"Authorization":""}', '{"Authorization":"'+'a'*2049+'"}',
+                 '{"Authorization":"x\\n'+SECRET+'"}', '{"Authorization":1}', '{"Cookie":"'+SECRET+'"}',
+                 '["Authorization","'+SECRET+'"]', 'not json '+SECRET)
+        for text in cases:
+            with self.subTest(size=len(text)), tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write(text); f.flush()
+                with self.assertRaises(TelemetryConfigError) as raised:
+                    Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+                self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_HEADERS_FILE')
+        with tempfile.NamedTemporaryFile(mode='w') as f:
+            f.write('{"Authorization":"'+'a'*2048+'","X-Api-Key":"k"}'); f.flush()
+            cfg = Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+            self.assertEqual(set(cfg.headers), {'Authorization', 'X-Api-Key'})
+
+    def test_reviewer_unreachable_or_hanging_collector_is_bounded(self):
+        import socket
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0)); closed_port = probe.getsockname()[1]
+        release = threading.Event(); hits = []
+        class Hang(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path); release.wait(5)
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Hang)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            for port in (closed_port, server.server_port):
+                with self.subTest(port='closed' if port == closed_port else 'hanging'):
+                    stream = io.StringIO(); handler = logging.StreamHandler(stream)
+                    logger = logging.getLogger('opentelemetry'); logger.addHandler(handler)
+                    try:
+                        endpoint = f'http://127.0.0.1:{port}'
+                        runtime = bootstrap({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':endpoint,
+                                             'RAG_OTEL_TIMEOUT_MS':'100', 'RAG_OTEL_SHUTDOWN_MS':'500'})
+                        started = time.monotonic()
+                        for _ in range(50):
+                            with runtime.tracer.start_as_current_span('rag.query'):
+                                runtime.logger.emit(body=SECRET, attributes={'rag.outcome':'error'})
+                            runtime.meter.create_counter('rag.telemetry.check').add(1)
+                        runtime.force_flush(); runtime.shutdown()
+                        self.assertLess(time.monotonic()-started, 2.5)
+                        self.assertNotIn(SECRET, stream.getvalue())
+                        self.assertNotIn(endpoint, stream.getvalue())
+                    finally:
+                        logger.removeHandler(handler)
+            self.assertTrue(hits)
+        finally:
+            release.set(); server.shutdown(); server.server_close(); thread.join()
+
+    def test_reviewer_bootstrap_leaves_global_providers_and_root_logging_unchanged(self):
+        from opentelemetry import trace, metrics, _logs
+        root = logging.getLogger()
+        before = (list(root.handlers), root.level, type(trace.get_tracer_provider()),
+                  type(metrics.get_meter_provider()), type(_logs.get_logger_provider()))
+        with receiver() as (env, records):
+            runtime = bootstrap(env)
+            try:
+                with runtime.tracer.start_as_current_span('rag.query'):
+                    logging.getLogger('rag.reviewer').warning(SECRET)
+                self.assertTrue(runtime.force_flush())
+            finally:
+                self.assertTrue(runtime.shutdown())
+            after = (list(root.handlers), root.level, type(trace.get_tracer_provider()),
+                     type(metrics.get_meter_provider()), type(_logs.get_logger_provider()))
+            self.assertEqual(after, before)
+            for _, body in records:
+                self.assertNotIn(SECRET.encode(), body)
+            self.assertNotIn('/v1/logs', {path for path, _ in records})
+
+    def test_ca_file_disabled_invalid_and_https_rule(self):
+        with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError), \
+                patch('ssl.create_default_context', side_effect=AssertionError):
+            runtime = bootstrap({'RAG_OTEL_CA_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
+            self.assertFalse(runtime.config.enabled)
+            self.assertEqual(runtime._providers, [])
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            def write(name, data):
+                path = os.path.join(directory, SECRET.replace('/', '_')+name)
+                Path(path).write_bytes(data)
+                return path
+            invalid = {'missing': os.path.join(directory, SECRET.replace('/', '_')+'-missing'),
+                       'directory': directory, 'empty': write('-empty', b''),
+                       'not a certificate': write('-text', SECRET.encode()+b'\n'),
+                       'over 1 MiB': write('-large', b'\n'*(1048576+1))}
+            for case, path in invalid.items():
+                with self.subTest(case=case), self.assertRaises(TelemetryConfigError) as raised:
+                    Config.from_env({**base, 'RAG_OTEL_CA_FILE':path})
+                self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_CA_FILE')
+                self.assertNotIn(SECRET, str(raised.exception))
+                self.assertNotIn(path, str(raised.exception))
+            with private_ca() as paths:
+                pem = Path(paths['ca']).read_bytes()
+                largest = write('-largest', pem + b'\n'*(1048576-len(pem)))
+                self.assertEqual(os.path.getsize(largest), 1048576)
+                for path in (paths['ca'], largest):
+                    cfg = Config.from_env({**base, 'RAG_OTEL_CA_FILE':path})
+                    self.assertEqual(cfg.ca_file, path)
+                    self.assertNotIn(path, repr(cfg))
+                    with self.assertRaises(TelemetryConfigError) as raised:
+                        Config.from_env({**base, 'RAG_OTEL_ENDPOINT':'http://localhost:4318', 'RAG_OTEL_CA_FILE':path})
+                    self.assertEqual(str(raised.exception), 'RAG_OTEL_CA_FILE requires HTTPS RAG_OTEL_ENDPOINT')
+        self.assertEqual(Config.from_env(base).ca_file, '')
+
+    def test_ca_file_trusts_private_ca_for_https_export(self):
+        import ssl
+        records = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                records.append((self.path, self.rfile.read(int(self.headers['Content-Length']))))
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        with private_ca() as paths:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(paths['server'], paths['key'])
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':f'https://127.0.0.1:{server.server_port}',
+                       'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false'}
+                for ca_file in (None, paths['ca']):
+                    with self.subTest(ca_file='private CA' if ca_file else 'bundled roots'):
+                        records.clear()
+                        runtime = bootstrap({**env, 'RAG_OTEL_CA_FILE':ca_file} if ca_file else env)
+                        try:
+                            with runtime.tracer.start_as_current_span('rag.query'):
+                                pass
+                            runtime.force_flush()
+                        finally:
+                            runtime.shutdown()
+                        self.assertEqual([path for path, _ in records], ['/v1/traces'] if ca_file else [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 if __name__ == '__main__':unittest.main()
