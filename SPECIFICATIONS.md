@@ -2039,8 +2039,8 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_ENABLED` | `false` | Exact `true` or `false` |
 | `RAG_OTEL_ENDPOINT` | none (required when enabled) | HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
 | `RAG_OTEL_PROTOCOL` | `http/protobuf` | `http/protobuf` only |
-| `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
-| `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle; at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
+| `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON regular file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
+| `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle (a regular file); at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
 | `RAG_OTEL_SERVICE_VERSION` | `1.1.0` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |

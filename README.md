@@ -739,8 +739,8 @@ host variables through. No destination or secret is supplied by this repository.
 | `RAG_OTEL_ENABLED` | `false`; exact `true` or `false` |
 | `RAG_OTEL_ENDPOINT` | Required when enabled; HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
 | `RAG_OTEL_PROTOCOL` | `http/protobuf` only; gRPC is rejected |
-| `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
-| `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
+| `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON regular file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
+| `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle (a regular file) for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` |
 | `RAG_OTEL_SERVICE_VERSION` | `1.1.0` |
 | `RAG_OTEL_ENVIRONMENT` | `development` |
@@ -762,8 +762,8 @@ duplicate names (including repeated JSON keys) are rejected. Exporter transport 
 verification; redirects are refused. TLS verification trusts the bundled roots,
 or, when `RAG_OTEL_CA_FILE` is set, only the certificates in that file, for a
 collector behind a private CA; to trust both, put both in the file. The file is
-checked once at startup (it must exist, be readable, be at most 1 MiB and load
-as a CA bundle) and requests re-reads it on new connections. It requires an
+checked once at startup (it must exist, be a regular file, be readable, be at
+most 1 MiB and load as a CA bundle) and requests re-reads it on new connections. It requires an
 HTTPS endpoint. An enabled runtime rejects a process-level
 `OTEL_SDK_DISABLED` value that the SDK recognizes as true (case-insensitive,
 ignoring surrounding whitespace), before reading secrets or creating exporters.
