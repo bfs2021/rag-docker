@@ -654,6 +654,28 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Gold Standard page details
+
+`browser/goldstandard_page.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+answers every `/api/` call from the Gold Standard page by request interception
+(#393). It checks that the export filename is pre-filled as
+`{collection}_{YYYYMMDD_HHMMSS}.json` after a generation and after a lookup, made
+safe and shortened to 128 characters as the API's default is; that Export opens the
+download URL with the filename encoded; that a review row expands to the first 300
+characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
+an empty field disables Generate with a message and sends no request. A second
+Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
+real: a save answered in 1 s opens the download tab, and a control answered after
+6 s (past Chromium's user-activation window) opens none. That tab sends one
+read-only download request for the fixture name to the stack under test, which
+refuses it as an invalid export name. It runs on its own too, like
+`query_config.js`:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/goldstandard_page.js
+```
+
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).

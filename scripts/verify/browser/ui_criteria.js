@@ -17,6 +17,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
+  await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
+
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
   {
