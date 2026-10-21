@@ -154,11 +154,14 @@ class ImplementationCopyTests(unittest.TestCase):
         document = (ROOT / "IMPLEMENTATION.md").read_text()
         for name in ("api/services/weaviate_client.py", "api/services/rag_pipeline.py",
                      "api/models/schemas.py", "ui/src/api/client.ts",
-                     "ui/src/components/CitationsPanel.tsx"):
+                     "ui/src/components/CitationsPanel.tsx", "scripts/verify/03_query.sh",
+                     "scripts/verify/citation_score.py", "scripts/verify/browser/query_config.js",
+                     "scripts/verify/README.md"):
             with self.subTest(name=name):
-                header = "### " + name + "\n\n```"
+                fence = "````" if name.endswith(".md") else "```"
+                header = "### " + name + "\n\n" + fence
                 start = document.index("\n", document.index(header) + len(header)) + 1
-                end = document.index("\n```\n", start)
+                end = document.index("\n" + fence + "\n", start)
                 self.assertEqual(document[start:end], (ROOT / name).read_text().rstrip("\n"))
 
 
