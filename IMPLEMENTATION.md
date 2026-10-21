@@ -13324,7 +13324,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -16914,7 +16914,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E32)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E33)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -17358,6 +17358,58 @@ for mode in abs trav mismatch; do
   rm -f "$EXPORTS/$P"
 done
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# ── manifest files keys never hash outside the package (E33, #371) ──────────
+# An otherwise valid package lists the outside sentinel in manifest.json's
+# files map, by absolute path and by ../ path, with its real digest and with a
+# wrong one. Import must refuse it naming manifest.json, never report the
+# sentinel's digest, and create no collection.
+E371_HEX=$(python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$E29_TEXT")
+make_files_pkg() {   # make_files_pkg <abs|trav> <real|wrong> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$3" "$E29_SENT" "$E371_HEX" <<'ENDPY'
+import json, pathlib, sys, tarfile, tempfile
+src, mode, dig, suffix, sent, hexd = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    key = sent if mode == "abs" else "../" * 12 + sent.lstrip("/")
+    manifest["files"][key] = "sha256:" + (hexd if dig == "real" else "0" * 64)
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+}
+for mode in abs trav; do
+  for dig in wrong real; do
+    names_before=$(collection_names)
+    P=$(make_files_pkg "$mode" "$dig" "files$mode$dig")
+    run_import "$P" rename
+    check_eq "E33: a $mode manifest files key ($dig digest) is refused as PACKAGE_CORRUPT" \
+      "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+    check_eq "E33: ... naming manifest.json ($mode, $dig)" \
+      "$(jfield "['error_detail']" < /tmp/vfy_e29job.json)" "{'file': 'manifest.json'}"
+    python3 -c "
+import json,sys; d=json.dumps(json.load(open('/tmp/vfy_e29job.json')))
+sys.exit(1 if '$E371_HEX' in d or '$E29_SENT' in d else 0)"
+    check "E33: ... with no outside digest or path in the job ($mode, $dig)" $?
+    read -r fstat fname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+    names_after=$(collection_names)
+    [ "$fstat" = "completed" ] && [ "$fname" != "-" ] && drop_collection "$fname"
+    check_eq "E33: ... and creates no collection ($mode, $dig)" "$names_after" "$names_before"
+    rm -f "$EXPORTS/$P"
+  done
+done
 
 # The valid in-directory source still round-trips after the refusals.
 api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
@@ -23277,6 +23329,23 @@ class ManifestFilesBoundaryTests(unittest.TestCase):
                     "chunks.jsonl\x00"):
             with self.subTest(key=key):
                 self.assert_refused(self.manifest(key, self.chunks_digest))
+
+    def assert_missing(self, key):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, self.manifest(key, "sha256:" + "0" * 64))
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": key}))
+        self.assertIn("listed in the manifest but missing", error.message)
+        self.assertNotIn(self.package / key, [call.args[0] for call in hashed.call_args_list])
+
+    def test_listed_missing_and_directory_keys_are_refused_as_missing(self):
+        # Both keys pass the containment check, so they are refused naming the key
+        # itself, not manifest.json, and never hashed.
+        (self.package / "sources").mkdir()
+        for key in ("sources/missing", "sources"):
+            with self.subTest(key=key):
+                self.assert_missing(key)
 
     def test_import_job_reports_no_outside_digest_and_touches_nothing(self):
         for key in (str(self.outside), "../outside.txt"):

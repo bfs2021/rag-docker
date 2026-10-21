@@ -816,6 +816,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` and its `chunks_written` kept; an import interrupted by the restart answers the same (#309); tune likewise, by `test_jobstore.py` |
 | E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
+| E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
 
 ---
 
