@@ -50,7 +50,14 @@ def _save_registry(reg: dict) -> None:
 
 @router.get("", response_model=CollectionsResponse)
 async def list_collections():
-    raw = await wc.get_collections()
+    try:
+        raw = await wc.get_collections()
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be read; the cause is logged, not sent (#373).
+        _log.exception("Could not list the collections")
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         "Cannot list the collections: Weaviate could not be read. "
+                         "Try again when Weaviate is available.")
     registry = await asyncio.to_thread(_load_registry)
     items = [
         CollectionInfo(
@@ -84,8 +91,10 @@ async def create_collection(body: CreateCollectionRequest):
             distance_metric=body.distance_metric,
             hnsw_config=body.hnsw_config.model_dump(),
         )
-    except Exception as exc:
-        return api_error(500, "CREATE_FAILED", "Failed to create collection.", str(exc))
+    except Exception:                                 # noqa: BLE001
+        # The cause is logged, not sent (#373).
+        _log.exception("Could not create collection %r", body.name)
+        return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
@@ -138,8 +147,10 @@ async def delete_collection(name: str, confirm: str | None = None):
         count = await wc.delete_collection_when_idle(name)
     except CollectionInUseError as exc:
         return _busy_error(name, exc.jobs)
-    except Exception as exc:
-        return api_error(500, "DELETE_FAILED", "Failed to delete collection.", str(exc))
+    except Exception:                                 # noqa: BLE001
+        # The cause is logged, not sent (#373).
+        _log.exception("Could not delete collection %r", name)
+        return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)

@@ -38,4 +38,10 @@ async def transfer_help():
         markdown = packager.render_help(dimensions)
     except RuntimeError as exc:
         return api_error(500, "HELP_RENDER_FAILED", str(exc))
+    except OSError:
+        # A template file missing or unreadable. Its path is logged, not sent (#373).
+        _log.exception("Could not read a help template")
+        return api_error(500, "HELP_RENDER_FAILED",
+                         "The help page could not be rendered: a help template file "
+                         "could not be read.")
     return HelpResponse(topic="transfer", markdown=markdown)

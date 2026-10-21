@@ -479,6 +479,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
@@ -640,6 +641,16 @@ writes and complement the live settings suite.
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
+Suite 01 also runs `scripts/tests/test_error_envelope.py` in the built API image with
+`--network none` and the repository mounted read-only (#373). It sends each request through
+the app with Weaviate and Ollama mocked, and checks that an unknown route answers 404
+`NOT_FOUND`, a wrong method 405 `METHOD_NOT_ALLOWED` with its `Allow` header and an unhandled
+error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, and `POST /query` when an Ollama call (connect
+error, timeout or error status) or a Weaviate query fails after the existence check, with no
+metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
+`CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a

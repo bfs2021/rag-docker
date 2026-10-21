@@ -25,15 +25,24 @@ async def run_query(body: QueryRequest):
     if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await rag_pipeline.run_query(
-        question=body.question,
-        collection=body.collection,
-        retrieval_mode=body.retrieval_mode,
-        top_k=body.top_k,
-        alpha=body.alpha,
-        include_citations=body.include_citations,
-        response_format=body.response_format,
-    )
+    try:
+        result = await rag_pipeline.run_query(
+            question=body.question,
+            collection=body.collection,
+            retrieval_mode=body.retrieval_mode,
+            top_k=body.top_k,
+            alpha=body.alpha,
+            include_citations=body.include_citations,
+            response_format=body.response_format,
+        )
+    except rag_pipeline.ServiceUnavailable as exc:
+        # The cause is logged, not sent (#373).
+        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         f"The question was not answered: {exc.service} could not be reached, "
+                         f"timed out or returned an error. Try again when {exc.service} "
+                         f"is available.",
+                         detail={"collection": body.collection})
 
     await metrics.record(
         collection=body.collection,

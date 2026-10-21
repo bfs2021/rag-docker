@@ -327,6 +327,11 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to list the collections
+(unreachable, timed out or any other error) (#373): "Cannot list the collections: Weaviate
+could not be read. Try again when Weaviate is available." `detail` is `null`. The cause is
+logged, not returned.
+
 ---
 
 ```
@@ -819,6 +824,14 @@ When `include_citations` is `true`:
 collection exists (#366). No query is run; `detail` is `{"collection": "<name>"}`. The cause
 is logged, not returned.
 
+**Response 503** `SERVICE_UNAVAILABLE` when, after that check, Ollama or Weaviate fails during
+the pipeline (#373): an Ollama call (the reformulation, the query embedding or the synthesis)
+that can't connect, times out or answers an error status, or a Weaviate retrieval call that
+raises. The message names the service: "The question was not answered: Ollama could not be
+reached, timed out or returned an error. Try again when Ollama is available." (or Weaviate).
+`detail` is `{"collection": "<name>"}`, no metrics record is written, and the cause is logged,
+not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
+
 **RAG pipeline (internal steps):**
 1. Reformat user question for retrieval using Phi-3.5 Mini (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
@@ -1172,7 +1185,10 @@ objects as the aggregate stat row.
 
 ### 3.2 Error Response Format
 
-All errors use a consistent envelope:
+All errors use a consistent envelope, including the ones no route raises itself (#373): a
+path that matches no API route answers `404 NOT_FOUND`, a method the route doesn't accept
+answers `405 METHOD_NOT_ALLOWED` (with the `Allow` header), and an error no route handles
+answers `500 INTERNAL_ERROR`, its cause logged, not returned. `detail` is `null` for all three.
 
 ```json
 {
@@ -1196,6 +1212,9 @@ Standard error codes:
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
+| `NOT_FOUND` | 404 | No API route matches the path |
+| `METHOD_NOT_ALLOWED` | 405 | The route doesn't accept the request's method |
+| `INTERNAL_ERROR` | 500 | An unexpected error no route handles; the cause is logged, not returned |
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
 | `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
@@ -2441,6 +2460,8 @@ now lives once, in `api/services/ingest_config.py`.
       end_user prompt now asks for a short answer without technical detail, so
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
+- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373).
+      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call and each retrieval mode's Weaviate call; it fails on the code before #373.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
@@ -2607,6 +2628,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
+- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned.
+  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373.*
 
 ---
 
