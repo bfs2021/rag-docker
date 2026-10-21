@@ -339,6 +339,20 @@ collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of tha
 interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
 operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
+`scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
+leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
+`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+names, and only a real directory or regular file as the name says: completed packages,
+`ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
+anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
+removed directory, and sizes don't count what links point at. A failed removal is logged and
+not reported as removed, and a missing exports folder is not created. A real lifespan run in a
+child process removes both kinds and logs them by name and size. `02_ingest.sh` runs it in the
+API container. With `RAG_ALLOW_RESTART=1`, `05_transfer.sh` checks after its export restart
+that the interrupted export's build directory and temporary archive are gone, without removing
+anything itself, and that the completed package from the top of the suite is still there.
+
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
 repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member

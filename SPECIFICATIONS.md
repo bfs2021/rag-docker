@@ -656,7 +656,9 @@ kind are kept: at startup by file time, and while the API runs, starting a job p
 the finished records saved longest ago (a `queued` or `running` one never is). A removed job
 answers `404 JOB_NOT_FOUND`, as it would after a restart. A job's first record is written off
 the event loop; a start whose request is cancelled during that write leaves no record and
-releases its guards (#309).
+releases its guards (#309). An interrupted ingest's upload staging directory
+(`{UPLOAD_DIR}/ingest-*`, the upload and its extracted ZIP members) is removed at the next
+startup, before the first request; links are never followed (#377).
 
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
@@ -1377,7 +1379,9 @@ carries the reason and `filename` stays null. Export, import and tune job record
 across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
-collection's export slot is released.
+collection's export slot is released. A build interrupted by a restart leaves them in
+`EXPORTS_DIR` (`.build-*` and `.<stem>.tar.gz.partial`) until the next startup removes them,
+before the first request; completed packages are never touched (#377).
 
 `warnings` is non-fatal. It records, for example, chunks whose `source_sha256`
 could not be resolved to exactly one retained document.
