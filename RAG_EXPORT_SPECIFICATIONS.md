@@ -346,6 +346,9 @@ completion, the written filename.
 
 - Export of a collection that does not exist fails immediately with
   `COLLECTION_NOT_FOUND`, before any job is created.
+- When Weaviate can't be read to check whether the collection exists, the export
+  fails with HTTP 503 `SERVICE_UNAVAILABLE` before any job is created; `detail` is
+  `{"collection": "<name>"}`. The cause is logged, not returned (#366).
 - Only one export per collection may run at a time; a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
   concurrent exports would race on the temporary file described below. A request
@@ -755,6 +758,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
+| `SERVICE_UNAVAILABLE` | HTTP 503 from `POST /export`: Weaviate can't be read to check whether the collection exists; no job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (#366) |
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
