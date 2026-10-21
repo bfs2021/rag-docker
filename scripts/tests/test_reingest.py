@@ -742,7 +742,7 @@ class RechunkTests(unittest.TestCase):
                           AsyncMock(side_effect=ConnectionError("weaviate down"))):
             for operation, (route, body) in requests.items():
                 with self.subTest(operation=operation):
-                    with self.assertLogs(tuning_router._log, "ERROR"):
+                    with self.assertLogs(logging.getLogger("routers.tuning"), "ERROR"):
                         response = asyncio.run(route(body))
                     self.assertEqual(response.status_code, 503)
                     self.assertEqual(json.loads(response.body)["error"], {
@@ -770,7 +770,7 @@ class RechunkTests(unittest.TestCase):
         responses = {}
         with patch.object(tuning_router.wc, "collection_exists",
                           AsyncMock(side_effect=ConnectionError("weaviate down"))), \
-                self.assertLogs(tuning_router._log, "ERROR"):
+                self.assertLogs(logging.getLogger("routers.tuning"), "ERROR"):
             responses["existence check"] = asyncio.run(tuning_router.tune_options("Coll"))
         with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=True)), \
                 patch.object(wc, "get_client", return_value=SimpleNamespace(
@@ -786,6 +786,222 @@ class RechunkTests(unittest.TestCase):
                                "be read. Try again when Weaviate is available.",
                     "detail": {"collection": "Coll"}})
                 self.assertNotIn(b"weaviate down", response.body)
+
+    def test_each_tune_route_answers_the_503_over_http(self):
+        # #349, through the app as a client calls it: the JSON 503 reaches the
+        # client (not a plain 500) from each tune start and from the tuning
+        # options, for its existence check and its re-chunk check (#369).
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        sources.store("Coll", "a.txt", b"one", replace=True)
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        unreadable = patch.object(wc, "collection_exists",
+                                  AsyncMock(side_effect=ConnectionError("weaviate down")))
+        cases = [
+            (f"{operation} existence check", unreadable, "routers",
+             lambda operation=operation: client.post(f"/tune/{operation}",
+                                                     json={"collection": "Coll"}))
+            for operation in ("rechunk", "reembed", "reindex")
+        ] + [
+            ("options existence check", unreadable, "routers", lambda: client.get("/tune/Coll")),
+            ("options re-chunk check",
+             patch.object(wc, "collection_exists", AsyncMock(return_value=True)), tuning._log,
+             lambda: client.get("/tune/Coll")),
+        ]
+        before = set(tuning._jobs)
+        for case, exists, logger, send in cases:
+            with self.subTest(case=case), exists, \
+                    patch.object(wc, "get_client", return_value=SimpleNamespace(
+                        collections=SimpleNamespace(get=lambda name: coll))), \
+                    self.assertLogs(logger, "ERROR"):
+                response = send()
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertTrue(response.headers["content-type"].startswith("application/json"))
+                self.assertEqual(response.json()["error"]["code"], "SERVICE_UNAVAILABLE")
+                self.assertEqual(response.json()["error"]["detail"], {"collection": "Coll"})
+                self.assertNotIn("weaviate down", response.text)
+                self.assertEqual(set(tuning._jobs), before)
+                self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                 (set(), []))
+
+    def test_a_missing_collection_is_still_404_at_tune_starts_and_options(self):
+        # #349 (reviewer): the existence check now sits in a try; a collection
+        # Weaviate reports as missing is still COLLECTION_NOT_FOUND, with no job.
+        from routers import tuning as tuning_router
+        from services import collection_writes
+        from models.schemas import RechunkRequest, ReembedRequest, ReindexRequest
+        calls = {
+            "rechunk": lambda: tuning_router.rechunk(RechunkRequest(collection="Gone")),
+            "reembed": lambda: tuning_router.reembed(ReembedRequest(collection="Gone")),
+            "reindex": lambda: tuning_router.reindex(ReindexRequest(collection="Gone")),
+            "options": lambda: tuning_router.tune_options("Gone"),
+        }
+        before = set(tuning._jobs)
+        with patch.object(tuning_router.wc, "collection_exists", AsyncMock(return_value=False)):
+            for case, call in calls.items():
+                with self.subTest(case=case):
+                    response = asyncio.run(call())
+                    self.assertEqual(response.status_code, 404)
+                    self.assertEqual(json.loads(response.body)["error"]["code"],
+                                     "COLLECTION_NOT_FOUND")
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Gone")),
+                                     (set(), []))
+
+
+class ExistenceCheckTests(unittest.TestCase):
+    """#366: the other routers' collection existence checks, as #349 did for the tune starts."""
+
+    def setUp(self):
+        from routers import collections as collection_router
+        from services import exporter, metrics, rag_pipeline
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.upload_dir = Path(temp.name)
+        # Each route's next step, so a test can see that none of them ran.
+        self.next_steps = {
+            "run_query": AsyncMock(), "record": AsyncMock(), "start_generation": AsyncMock(),
+            "create_collection": AsyncMock(), "delete_collection_when_idle": AsyncMock(),
+            "start_export_job": AsyncMock(),
+        }
+        for change in (patch.object(settings, "upload_dir", temp.name),
+                       patch.object(collection_router, "_REGISTRY_FILE", None),
+                       patch.object(rag_pipeline, "run_query", self.next_steps["run_query"]),
+                       patch.object(metrics, "record", self.next_steps["record"]),
+                       patch.object(goldstandard, "start_generation",
+                                    self.next_steps["start_generation"]),
+                       patch.object(wc, "create_collection", self.next_steps["create_collection"]),
+                       patch.object(wc, "delete_collection_when_idle",
+                                    self.next_steps["delete_collection_when_idle"]),
+                       patch.object(exporter, "start_export_job",
+                                    self.next_steps["start_export_job"])):
+            change.start(); self.addCleanup(change.stop)
+
+    def routes(self):
+        """(case, router logger, call, what the 503 says was not done) for each route."""
+        from routers import collections as collection_router
+        from routers import goldstandard as goldstandard_router
+        from routers import query as query_router
+        from routers import transfer as transfer_router
+        from models.schemas import (CreateCollectionRequest, ExportRequest, GenerateRequest,
+                                    QueryRequest)
+        return [
+            ("query", "routers.query",
+             lambda: query_router.run_query(QueryRequest(question="q?", collection="Coll")),
+             "No query was run"),
+            ("goldstandard", "routers.goldstandard",
+             lambda: goldstandard_router.generate(GenerateRequest(collection="Coll")),
+             "No generation was started"),
+            ("create", "routers.collections",
+             lambda: collection_router.create_collection(CreateCollectionRequest(name="Coll")),
+             "No collection was created"),
+            ("delete", "routers.collections",
+             lambda: collection_router.delete_collection("Coll", confirm="true"),
+             "Nothing was deleted"),
+            ("ingest", "routers.ingest",
+             lambda: ingest.ingest_upload(
+                 collection="Coll", strategy="fixed", chunk_size="200", chunk_overlap="0",
+                 similarity_threshold="0.85", min_chunk_size="0",
+                 files=[upload("a.txt", "text")]),
+             "No job was started"),
+            ("export", "routers.transfer",
+             lambda: transfer_router.start_export(ExportRequest(collection="Coll")),
+             "No job was started"),
+        ]
+
+    def assert_nothing_created(self, jobs_before):
+        from services import collection_writes
+        for name, step in self.next_steps.items():
+            with self.subTest(step=name):
+                step.assert_not_awaited()
+        # No registry write, no saved upload, no ingest job or registration.
+        self.assertEqual(list(self.upload_dir.iterdir()), [])
+        self.assertEqual(set(ingest_pipeline._jobs), jobs_before)
+        self.assertEqual(collection_writes.active_jobs("Coll"), [])
+
+    def test_a_weaviate_error_checking_the_collection_is_a_503(self):
+        # #366: each of these checks was a bare 500 (ingest: 500 INGEST_FAILED)
+        # when Weaviate failed. It is SERVICE_UNAVAILABLE, with nothing started
+        # or changed and the cause logged but not sent.
+        jobs_before = set(ingest_pipeline._jobs)
+        with patch.object(wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))):
+            for case, logger, call, outcome in self.routes():
+                with self.subTest(case=case):
+                    with self.assertLogs(logging.getLogger(logger), "ERROR") as logs:
+                        response = asyncio.run(call())
+                    self.assertIsInstance(logs.records[0].exc_info[1], ConnectionError)
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(json.loads(response.body)["error"], {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": "Cannot check whether 'Coll' exists: Weaviate could not be "
+                                   f"read. {outcome}; try again when Weaviate is available.",
+                        "detail": {"collection": "Coll"}})
+                    self.assertNotIn(b"weaviate down", response.body)
+                    self.assert_nothing_created(jobs_before)
+
+    def test_a_collection_reported_missing_or_present_keeps_its_404_or_409(self):
+        # #366: the checks now sit in a try; what Weaviate reports is answered
+        # as before, with nothing started or changed.
+        jobs_before = set(ingest_pipeline._jobs)
+        for case, _, call, _ in self.routes():
+            present = case == "create"
+            with self.subTest(case=case), \
+                    patch.object(wc, "collection_exists", AsyncMock(return_value=present)):
+                response = asyncio.run(call())
+                if present:
+                    self.assertEqual(response.status_code, 409)
+                    self.assertEqual(json.loads(response.body)["error"], {
+                        "code": "COLLECTION_EXISTS",
+                        "message": "Collection 'Coll' already exists.", "detail": None})
+                else:
+                    self.assertEqual(response.status_code, 404)
+                    self.assertEqual(json.loads(response.body)["error"], {
+                        "code": "COLLECTION_NOT_FOUND",
+                        "message": "Collection 'Coll' not found.", "detail": None})
+                self.assert_nothing_created(jobs_before)
+
+    def test_each_route_answers_the_503_over_http(self):
+        # #366, through the app as a client calls it: the JSON 503 reaches the
+        # client (not a plain 500), for each of the six routes (#369).
+        from fastapi.testclient import TestClient
+        from main import app
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        requests = {
+            "query": lambda: client.post("/query", json={"question": "q?", "collection": "Coll"}),
+            "goldstandard": lambda: client.post("/goldstandard/generate",
+                                                json={"collection": "Coll"}),
+            "create": lambda: client.post("/collections", json={"name": "Coll"}),
+            "delete": lambda: client.delete("/collections/Coll?confirm=true"),
+            "ingest": lambda: client.post("/ingest/upload",
+                                          data={"collection": "Coll", "strategy": "fixed",
+                                                "chunk_size": "200", "chunk_overlap": "0",
+                                                "min_chunk_size": "0"},
+                                          files={"files": ("a.txt", b"text")}),
+            "export": lambda: client.post("/export", json={"collection": "Coll"}),
+        }
+        jobs_before = set(ingest_pipeline._jobs)
+        with patch.object(wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))):
+            for case, send in requests.items():
+                with self.subTest(case=case), self.assertLogs("routers", "ERROR"):
+                    response = send()
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertTrue(response.headers["content-type"].startswith(
+                        "application/json"))
+                    self.assertEqual(response.json()["error"]["code"], "SERVICE_UNAVAILABLE")
+                    self.assertEqual(response.json()["error"]["detail"], {"collection": "Coll"})
+                    self.assertNotIn("weaviate down", response.text)
+                    self.assert_nothing_created(jobs_before)
+
 
 class SchemaTests(unittest.TestCase):
     def test_a_record_written_before_the_field_reads_as_zero(self):

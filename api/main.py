@@ -1,8 +1,11 @@
 from __future__ import annotations
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -81,6 +84,35 @@ async def request_validation_error(request, exc):
     return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
 from services.telemetry import RequestTracing
+
+_log = logging.getLogger(__name__)
+
+# Routing errors answer in the envelope like every other error (#373). Other
+# statuses (FastAPI's 400 for an unparsable body) keep FastAPI's own answer.
+_ROUTING_ERRORS = {
+    404: ("NOT_FOUND", "No API route matches this path."),
+    405: ("METHOD_NOT_ALLOWED", "This API route does not accept this method."),
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def routing_error(request, exc):
+    if exc.status_code not in _ROUTING_ERRORS:
+        return await http_exception_handler(request, exc)
+    code, message = _ROUTING_ERRORS[exc.status_code]
+    response = api_error(exc.status_code, code, message)
+    response.headers.update(exc.headers or {})  # a 405 keeps its Allow header
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request, exc):
+    # The cause is logged, not sent (#373). Starlette re-raises the exception
+    # after this response is sent, so the server logs its traceback as well.
+    _log.error("Unhandled error on %s %s: %s: %s", request.method, request.url.path,
+               type(exc).__name__, exc)
+    return api_error(500, "INTERNAL_ERROR",
+                     "The API hit an unexpected error. The cause is in the API log.")
 
 app.add_middleware(
     CORSMiddleware,

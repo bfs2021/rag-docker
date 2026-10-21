@@ -14,3 +14,11 @@ def collection_deleting_error(name: str) -> JSONResponse:
     from services.collection_writes import deleting_message
     return api_error(409, "COLLECTION_DELETING", deleting_message(name),
                      detail={"collection": name})
+
+
+def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
+    """A request refused because Weaviate couldn't say whether its collection exists (#366)."""
+    return api_error(503, "SERVICE_UNAVAILABLE",
+                     f"Cannot check whether '{name}' exists: Weaviate could not be read. "
+                     f"{outcome}; try again when Weaviate is available.",
+                     detail={"collection": name})

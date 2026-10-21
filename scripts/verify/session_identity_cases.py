@@ -34,7 +34,7 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
         identities=[self.original['session_id']]+[s['session_id'] for s in imported];self.assertEqual(len(set(identities)),3);self.assertEqual(self.path.read_bytes(),before)
         for i,sid in enumerate(identities):
-            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/result['filename']).read_text())
+            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/result['filename']).read_text())
             self.assertEqual(rows[0]['answer'],'Newer human review' if i==0 else 'Original answer');self.assertEqual(set(rows[0]),{'question','answer','contexts','ground_truth'})
         gs._sessions={};gs.load_sessions_from_disk();self.assertEqual({gs.get_session(sid)['collection'] for sid in identities},{'OwnedOriginal','OwnedRenamedOne','OwnedRenamedTwo'})
 

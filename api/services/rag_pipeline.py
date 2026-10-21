@@ -2,6 +2,8 @@ from __future__ import annotations
 from services import telemetry
 import time
 
+import httpx
+
 from models.schemas import QueryRequest
 from services import ollama_client as ollama
 from services import weaviate_client as wc
@@ -26,6 +28,30 @@ SYNTHESIS_ENGINEER_SYSTEM = (
     "based on how directly the context addresses the question. "
     "If the context is insufficient, state this explicitly."
 )
+
+
+class ServiceUnavailable(Exception):
+    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+
+    def __init__(self, service: str):
+        super().__init__(f"{service} failed during the query")
+        self.service = service
+
+
+async def _from_ollama(call):
+    """Await an Ollama call; a connect error, timeout or error status is ServiceUnavailable."""
+    try:
+        return await call
+    except httpx.HTTPError as exc:
+        raise ServiceUnavailable("Ollama") from exc
+
+
+async def _from_weaviate(call):
+    """Await a Weaviate query; any error from it is ServiceUnavailable."""
+    try:
+        return await call
+    except Exception as exc:                          # noqa: BLE001
+        raise ServiceUnavailable("Weaviate") from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -58,28 +84,31 @@ async def run_query(
     retrieval_mode, top_k, alpha, response_format = (
         config.retrieval_mode, config.top_k, config.alpha, config.response_format)
     with telemetry.span("rag.reformulate"):
-        reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
+        reformulated = await _from_ollama(
+            ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}"))
         reformulated = reformulated.strip()
 
     t0 = time.monotonic()
     with telemetry.span("rag.retrieval"):
         if retrieval_mode in ("hnsw", "flat"):
-            vector = await ollama.embed(reformulated)
-            chunks = await wc.near_vector_query(collection, vector, top_k)
+            vector = await _from_ollama(ollama.embed(reformulated))
+            chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
         elif retrieval_mode == "hybrid":
-            chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
+            chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
         elif retrieval_mode == "semantic":
-            chunks = await wc.near_text_query(collection, reformulated, top_k)
+            chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
     with telemetry.span("rag.synthesis"):
         if response_format == "engineer":
             context = _build_context_engineer(chunks)
-            answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+            answer = await _from_ollama(ollama.chat(
+                SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}"))
         else:
             context = _build_context_end_user(chunks)
-            answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+            answer = await _from_ollama(ollama.chat(
+                SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}"))
     llm_ms = int((time.monotonic() - t1) * 1000)
 
     citations = None

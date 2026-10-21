@@ -365,6 +365,14 @@ also when the connection itself fails and for a re-embed with chunking parameter
 route, while a re-embed without them still starts. A Weaviate error checking that the
 collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
 answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
+The same existence check in `POST /query`, `POST /goldstandard/generate`, `POST /collections`,
+`DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, naming the collection, with the cause logged, not
+sent, and nothing run, created or saved; a collection Weaviate reports missing is still 404
+`COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
+create (#366).
+Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
+the JSON 503 reaches the client (#369).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
@@ -471,13 +479,17 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -502,6 +514,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 `session_validity.py` inside the disposable API, using an owned real collection,
 synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
 It checks warning metadata, actual deletion marking and explicit historical export.
+It then runs `../tests/test_goldstandard_exports.py` in the API container and checks
+through the proxy that download refuses other upload state with 400 (#370).
 
 ## Environment
 
@@ -629,6 +643,41 @@ writes and complement the live settings suite.
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
+Suite 01 also runs `scripts/tests/test_error_envelope.py` in the built API image with
+`--network none` and the repository mounted read-only (#373). It sends each request through
+the app with Weaviate and Ollama mocked, and checks that an unknown route answers 404
+`NOT_FOUND`, a wrong method 405 `METHOD_NOT_ALLOWED` with its `Allow` header and an unhandled
+error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, and `POST /query` when an Ollama call (connect
+error, timeout or error status) or a Weaviate query fails after the existence check, with no
+metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
+`CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
+client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
+from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
+`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
+names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+service red and the others green, that a proxy 502, a refused connection and a 503 without a
+health body each show "Service health could not be read:" with the reason and remove the
+earlier cards, that the next good load clears it, and that the latency metrics load on every
+refresh whatever health answers.
+
+Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
+`--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
+It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
+app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
+record can't be written (an unusable file, a full volume), with the failure logged; that a
+line left unfinished by a failed write doesn't cost the next record; that `metrics.jsonl`
+never holds more than 1,000 lines and keeps the newest records; that a compaction whose
+temporary write or replace fails leaves the old file whole and no temporary file, and is
+tried again; that 1,100 concurrent records all land; and that a restart restores the last 500
+records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
+files a crash left, and starts when the file can't be read or compacted. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a

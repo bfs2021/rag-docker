@@ -327,6 +327,11 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to list the collections
+(unreachable, timed out or any other error) (#373): "Cannot list the collections: Weaviate
+could not be read. Try again when Weaviate is available." `detail` is `null`. The cause is
+logged, not returned.
+
 ---
 
 ```
@@ -365,6 +370,10 @@ ignore valid HNSW settings.
 
 **Response 409** if collection already exists.
 
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check whether the
+collection exists (#366). No collection is created; `detail` is `{"collection": "<name>"}`.
+The cause is logged, not returned.
+
 ---
 
 ```
@@ -389,6 +398,10 @@ Before deletion, resolves the backend's canonical collection name. After success
 ```json
 { "error": { "code": "COLLECTION_NOT_FOUND", "message": "Collection 'Documents' does not exist.", "detail": null } }
 ```
+
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
+collection exists (#366). Nothing is deleted; `detail` is `{"collection": "<name>"}`. The
+cause is logged, not returned. Confirmation is still checked first.
 
 **Response 400** if `confirm=true` is not supplied:
 ```json
@@ -507,6 +520,7 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
 | 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
 | 409 | `COLLECTION_DELETING` | a delete of the collection is in progress (§3.1.2; #302); nothing is saved or queued |
+| 503 | `SERVICE_UNAVAILABLE` | Weaviate can't be read to check that the collection exists (#366); nothing is saved or queued, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned |
 | 500 | `INGEST_FAILED` | anything unexpected; the message says so and the API log holds the traceback, collection and filenames |
 
 The ZIP messages name the upload, say nothing from it was imported, name the unreadable
@@ -806,6 +820,18 @@ When `include_citations` is `true`:
 
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
+**Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
+collection exists (#366). No query is run; `detail` is `{"collection": "<name>"}`. The cause
+is logged, not returned.
+
+**Response 503** `SERVICE_UNAVAILABLE` when, after that check, Ollama or Weaviate fails during
+the pipeline (#373): an Ollama call (the reformulation, the query embedding or the synthesis)
+that can't connect, times out or answers an error status, or a Weaviate retrieval call that
+raises. The message names the service: "The question was not answered: Ollama could not be
+reached, timed out or returned an error. Try again when Ollama is available." (or Weaviate).
+`detail` is `{"collection": "<name>"}`, no metrics record is written, and the cause is logged,
+not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
+
 **RAG pipeline (internal steps):**
 1. Reformat user question for retrieval using Phi-3.5 Mini (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
@@ -899,6 +925,10 @@ deletion removed the collection before sampling, it returns
 `404 COLLECTION_NOT_FOUND`. Retry a busy request after the writer finishes. A delete in
 progress is checked before that wait and answers `409 COLLECTION_DELETING` at once (§3.1.2;
 #302).
+
+When Weaviate can't be read to check that the collection exists, generation answers
+`503 SERVICE_UNAVAILABLE` without creating a session or model task (#366); `detail` is
+`{"collection": "<name>"}`. The cause is logged, not returned.
 
 If the request that started a generation is cancelled while the session is being prepared,
 the preparation still finishes; a session it published is then settled as a cancelled
@@ -1047,7 +1077,13 @@ Stale/orphaned sessions return **409 `HISTORICAL_SESSION`** before writing unles
 }
 ```
 
-`filename`: if null, defaults to `{collection}_{YYYYMMDD_HHMMSS}.json` where `collection` is taken from the session's own collection name.
+`filename`: if null or empty, defaults to `{collection}_{YYYYMMDD_HHMMSS}.json` where `collection` is taken from the session's own collection name (spaces become `_`, other characters outside `A-Z`, `a-z`, `0-9` and `_` are dropped). If that name would be longer than 128 characters, the collection part is shortened so the name is exactly 128 characters.
+
+Exports are written to `{UPLOAD_DIR}/goldstandard_exports/{filename}`, a folder of their own, and nowhere else (#370). A supplied `filename` must be 1-128 characters, each an ASCII letter (`A-Z`, `a-z`), a digit, `_`, `-`, `.` or a space, and must end in `.json` (any letter case). It is checked as given: a path is refused, not stripped, and a missing `.json` is refused, not appended. Saving under the name of an existing export overwrites that export. The export is written to a new temporary file in the exports folder and then renamed onto its name, so a reader never sees a partly written export, and a symbolic link that appears at the name is replaced, not followed (#402).
+
+**Response 400** (`INVALID_PATH`) if `filename` breaks that rule (for example `.`, `..`, `metrics.jsonl`, `report.txt`, `a/b.json`), or if something other than a regular file (a directory or a symbolic link) already has that name in the exports folder. Nothing is written. The session check (404) and the historical check (409) come first.
+
+**Response 409** (`EXPORTS_FOLDER_INVALID`) if `goldstandard_exports` in `UPLOAD_DIR` is not a directory: a file saved under that name before #370, or a symbolic link (#402). Nothing is written; move or rename that entry, then retry. The name check (400) comes first.
 
 **Response 404** if the session does not exist (uses `SESSION_NOT_FOUND` error code).
 
@@ -1088,9 +1124,13 @@ The file is a JSON array of these objects.
 GET /goldstandard/download/{filename}
 ```
 
-Returns the saved file as a JSON download (`Content-Disposition: attachment`).
+Returns the saved file from `{UPLOAD_DIR}/goldstandard_exports/` as a JSON download (`Content-Disposition: attachment`). Only that folder is served: no other file in `UPLOAD_DIR` is. Exports saved at the top level of `UPLOAD_DIR` before #370 stay on disk but are not served.
 
-**Response 404** if the file does not exist:
+**Response 400** (`INVALID_PATH`) if `filename` breaks the save name rule, or if the name in the exports folder is not a regular file (a directory or a symbolic link).
+
+**Response 409** (`EXPORTS_FOLDER_INVALID`) if `goldstandard_exports` in `UPLOAD_DIR` is not a directory (a file or a symbolic link has its name), as on save (#402). The name check (400) comes first.
+
+**Response 404** if `filename` is valid and no export has that name:
 ```json
 { "error": { "code": "FILE_NOT_FOUND", "message": "File 'Documents_20260910_143022.json' not found.", "detail": null } }
 ```
@@ -1104,6 +1144,18 @@ GET /metrics/latency
 ```
 
 Returns rolling aggregate statistics AND a time-series history for charting. The API service maintains an in-memory ring buffer of the last 500 query records, persisted to `{UPLOAD_DIR}/metrics.jsonl` for survival across restarts.
+
+The file is bounded (#374). Each query appends one line; when that brings the file to 1,000
+lines, it is compacted to its last 500 records by writing them to a temporary file in the same
+folder, fsyncing it and replacing `metrics.jsonl` atomically, so a crash leaves either the old
+file or the compacted one, never a mix. At startup the API reads at most the last 1 MiB of the
+file, loads its last 500 records into the ring, and compacts the file to them at once if it
+held anything more (an older unbounded file, or lines that aren't records); it also removes
+temporary files left by a compaction a crash interrupted. A record whose write fails (for
+example on a full `ingest_uploads` volume), a failed compaction, or a metrics file that can't
+be read at startup is logged and changes nothing else: the query still answers 200 with its
+answer, the record still counts in the ring, and the API still starts. A line left unfinished
+by a failed write doesn't cost the next record, which starts a line of its own.
 
 **Query parameters:** `collection`, `retrieval_mode` (both optional filters), and
 `history_limit` (integer, 0-500, default 100).
@@ -1145,7 +1197,10 @@ objects as the aggregate stat row.
 
 ### 3.2 Error Response Format
 
-All errors use a consistent envelope:
+All errors use a consistent envelope, including the ones no route raises itself (#373): a
+path that matches no API route answers `404 NOT_FOUND`, a method the route doesn't accept
+answers `405 METHOD_NOT_ALLOWED` (with the `Allow` header), and an error no route handles
+answers `500 INTERNAL_ERROR`, its cause logged, not returned. `detail` is `null` for all three.
 
 ```json
 {
@@ -1169,6 +1224,9 @@ Standard error codes:
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
+| `NOT_FOUND` | 404 | No API route matches the path |
+| `METHOD_NOT_ALLOWED` | 405 | The route doesn't accept the request's method |
+| `INTERNAL_ERROR` | 500 | An unexpected error no route handles; the cause is logged, not returned |
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
 | `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
@@ -1177,7 +1235,9 @@ Standard error codes:
 | `PAIR_GENERATION_TIMEOUT` | 504 | Regeneration model deadline exceeded; existing pair unchanged |
 | `SESSION_DURABILITY_UNCERTAIN` | 503 | Replacement published but directory durability uncertain; refresh before retry |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
+| `INVALID_PATH` | 400 | Gold-standard export name breaks the name rule (1-128 ASCII letters, digits, `_`, `-`, `.` or spaces, ending in `.json`), or the name in the exports folder is not a regular file |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
+| `EXPORTS_FOLDER_INVALID` | 409 | Gold-standard save or download refused: `goldstandard_exports` in `UPLOAD_DIR` is a file or a symbolic link, not a directory; move or rename it |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
 | `HISTORICAL_SESSION` | 409 | Explicit historical export choice required for stale/orphaned session |
@@ -1268,6 +1328,9 @@ The job reports `models_bundled` — what the package actually carries, which is
 
 - **404 `COLLECTION_NOT_FOUND`** if the collection does not exist. Checked
   before a job is created, so a typo does not leave a failed job behind.
+- **503 `SERVICE_UNAVAILABLE`** when Weaviate can't be read for that check
+  (#366). No job is created; `detail` is `{"collection": "<name>"}`. The cause
+  is logged, not returned.
 - **409 `EXPORT_IN_PROGRESS`** if an export of the same collection is already
   running; `detail.job_id` names it. Two concurrent exports of one collection
   would race on the staging directory and the temporary archive. Exports of
@@ -1959,8 +2022,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/health`  
 **Roles:** Engineer only
 
-- Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms).
+- Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
+- When health can't be read (no answer from the API, a proxy error page, or any other error without a health body), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
 - Latency trend charts (from the `history` field of `GET /metrics/latency`, bounded by `history_limit`, default 100): line chart of `total_ms` over time alongside `retrieval_ms` and `llm_ms`. Summary stat row shows P50/P95/P99 for each component from the `retrieval_latency`, `llm_latency` and `total_latency` objects.
+- Health and latency metrics load separately: a degraded or failed health call doesn't stop the charts from loading. A failed metrics call keeps the charts last shown.
 - Auto-refreshes every 30 seconds.
 
 ---
@@ -2031,6 +2096,26 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `maxConnections` | 64 | 16 | 128 | HNSW build param |
 | Gold standard `sample_size` | 20 | 1 | 100 | |
 | `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
+
+Optional telemetry (#282) is configured by API container environment settings, not request parameters. They are read only when `RAG_OTEL_ENABLED` is `true`; an invalid value fails API startup with an error naming the field only. See "Optional telemetry foundation (#282)" below and README "Optional backend telemetry".
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_OTEL_ENABLED` | `false` | Exact `true` or `false` |
+| `RAG_OTEL_ENDPOINT` | none (required when enabled) | HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
+| `RAG_OTEL_PROTOCOL` | `http/protobuf` | `http/protobuf` only |
+| `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON regular file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
+| `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle (a regular file); at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
+| `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
+| `RAG_OTEL_SERVICE_VERSION` | `1.1.0` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | `true` | Exact `true` or `false` |
+| `RAG_OTEL_SAMPLE_RATIO` | `1.0` | Finite 0–1 |
+| `RAG_OTEL_QUEUE_SIZE` | `256` | Integer 1–4096 |
+| `RAG_OTEL_BATCH_SIZE` | `64` | Integer 1–512, no larger than `RAG_OTEL_QUEUE_SIZE` |
+| `RAG_OTEL_TIMEOUT_MS` | `1000` | Integer 100–10000 |
+| `RAG_OTEL_INTERVAL_MS` | `5000` | Integer 1000–60000 |
+| `RAG_OTEL_SHUTDOWN_MS` | `3000` | Integer 100–30000 |
 
 ---
 
@@ -2311,6 +2396,8 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_delete_busy.py` sends no value, `false`, `1`, `yes`, an empty value and `truee` (400, no lookup, nothing deleted), a missing collection without it (400, not 404) and `TRUE`/`True` (200). `02_ingest.sh` repeats the 400 cases and a `confirm=TRUE` delete on the live verify stack, and `test_mcp_delete.py` checks the MCP tool sends `confirm=true` with `name` still its only input.*
 - [x] While a delete of a collection is in progress, a new ingest, export, tune or generation job for it answers `409 COLLECTION_DELETING` and leaves nothing behind, and an import of it ends `failed` with that code; a delete still waiting for the writer guard keeps #40's ordering (#302).
       *`test_delete_busy.py` holds a real `DELETE` inside its backend delete and drives each route and the import worker against it, under both spellings, and checks generation answers without its one-second wait. `ui_criteria.js` checks the Import page shows the message for an upload refused this way. An `abort` import whose target is still present also ends `COLLECTION_DELETING` (#324).*
+- [x] When Weaviate can't be read to check whether the collection exists, `POST /query`, `POST /goldstandard/generate`, `POST /collections`, `DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` (#366) and the tune starts `POST /tune/rechunk`, `/tune/reembed` and `/tune/reindex` (#349) answer HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and nothing run, created, saved or queued. `GET /tune/{collection}` answers the same 503 when its existence check or its re-chunk coverage check can't read Weaviate (#349).
+      *`test_reingest.py` (run by `02_ingest.sh`) calls each handler with Weaviate failing, and sends each request through the app over HTTP, checking the JSON 503 reaches the client (#369).*
 - [x] A gold-standard start cancelled while its session is being prepared ends its registration and leaves the session `cancelled`, so the collection can be deleted (#302).
       *`test_delete_busy.py` cancels a start while sampling is held, then checks the registration, the session's status, a `200` delete, and that a settle that fails is reported as a failed generation. A cancelled start whose preparation fails settles nothing (#324).*
 - [x] Ingest jobs report `chunks_submitted` and `chunks_accepted` beside `chunks_stored`, counted once per file from its final attempt; older records read them back as `null`; the Import page shows the three only when they differ (#302).
@@ -2387,6 +2474,9 @@ now lives once, in `api/services/ingest_config.py`.
       end_user prompt now asks for a short answer without technical detail, so
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
+- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373).
+- [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged; the file never holds more than 1,000 lines, is compacted atomically to its last 500 records, and those reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
+      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call and each retrieval mode's Weaviate call; it fails on the code before #373.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
@@ -2464,6 +2554,24 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Download endpoint returns 404 for a non-existent filename.
       *Traversal attempts (`..%2F`, absolute paths, sub-directories) are rejected
       at the routing layer before reaching the handler.*
+- [x] Save writes, and download serves, only files in `{UPLOAD_DIR}/goldstandard_exports/`
+      (#370). Save as `collection_registry.json` writes an export and leaves the registry
+      unchanged; `.`, `..`, `metrics.jsonl`, a directory name, a wrong extension, a path or a
+      129-character name gets 400 `INVALID_PATH` and touches no file; a directory or link
+      in the exports folder gets 400 on save and download; a top-level file is not served
+      (404); the default name, valid custom names and the UI's default form still save and
+      download; saving twice under one name overwrites.
+      *`test_goldstandard_exports.py`, run by `10_validity.sh`, which also checks
+      download refusals through the proxy; `04_goldstandard.sh` checks the save
+      refusals and that `GET /collections` still answers after a save as
+      `collection_registry.json`.*
+- [x] A file or a symbolic link named `goldstandard_exports` in `UPLOAD_DIR` gets 409
+      `EXPORTS_FOLDER_INVALID` on save and download, not a 500, and nothing changes; a
+      bad name is still 400 first. Save writes a temporary file and renames it onto the
+      name: a link that appears at the name after the check is replaced and its target
+      left unchanged, and a failed rename keeps the previous export and leaves no
+      temporary file (#402).
+      *`test_goldstandard_exports.py`, run by `10_validity.sh`.*
 
 **Also fixed here:** `pairs_completed` was incremented in a `finally`, so it
 counted *attempts*. A session that lost a pair reported "3/3 complete" while
@@ -2489,6 +2597,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Health dashboard shows per-service latency; auto-refreshes every 30 seconds.
       *Three services — Weaviate, LLM and Embed, each with its model name and
       latency. Polling measured at 30s intervals.*
+- [x] Health dashboard shows a degraded 503 body with the failing services red, loads the latency metrics while health is degraded or can't be read, and shows a message, with no stale cards, when health can't be read.
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health` with a
+      degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
+      fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
+      for a missing model and an unreachable Ollama or Weaviate.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
@@ -2533,6 +2646,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       weaviate publish nothing; ollama and ui expose container ports only.*
 - [x] Docker Engine is 28.0.0 or newer; older engines are outside the supported localhost-isolation profile. The infrastructure suite checks the daemon version.
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
+- [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
+  *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
+- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned.
+  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373.*
 
 ---
 
@@ -2659,8 +2776,11 @@ before secret access or exporter construction, because all three pinned SDK
 providers otherwise silently disable signals. Explicit configuration mappings
 cannot mask this conflict; disabled RAG telemetry still returns a no-op. The
 runtime must not mutate the process environment or global providers.
-Configuration and finite safe schema
-are specified in README.md, “Optional backend telemetry”. No global providers,
+Configuration is listed in §8 and, with the finite safe
+schema, specified in README.md, “Optional backend telemetry”. An optional
+`RAG_OTEL_CA_FILE` (#356) names a mounted CA bundle for an HTTPS collector behind
+a private CA: it is validated once at startup, replaces the bundled roots for
+export, and is re-read by requests on new connections. No global providers,
 automatic request instrumentation, application log bridge or collector deployment
 are included in this foundation. Raw SDK providers remain internal; supported
 instrumentation uses the runtime tracer, safe logger and meter, with lifecycle

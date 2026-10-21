@@ -6,6 +6,7 @@ job-polling shape so both live behind one prefix-free router.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -23,14 +24,21 @@ from models.schemas import (
 from services import exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
-from utils import api_error, collection_deleting_error
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an export", body.collection)
+        return collection_check_unavailable(body.collection, "No job was started")
+    if not exists:
         # Checked before a job exists, so a typo does not leave a failed job
         # lying around for the user to interpret.
         return api_error(404, "COLLECTION_NOT_FOUND",

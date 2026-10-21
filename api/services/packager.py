@@ -17,7 +17,7 @@ import shutil
 import tarfile
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
 from pydantic import ValidationError
@@ -601,10 +601,39 @@ def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     return pkg, manifest
 
 
+def _contained_file_key(root: Path, rel: str) -> bool:
+    """True when a manifest `files` key names a file inside the package.
+
+    The manifest is untrusted: an absolute key, a `..` key or a key through a
+    link would otherwise make check 3 hash a file outside the package and
+    report its digest (#371). `root` is the resolved package directory.
+    """
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        return False
+    if PurePosixPath(rel).as_posix() != rel:
+        return False
+    try:
+        target = (root / rel).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return root in target.parents
+
+
 @telemetry.traced("rag.validate")
 def verify_digests(pkg: Path, manifest: dict) -> None:
-    """Check 3 of spec §6.2. Names the first file that fails."""
-    for rel, expected in sorted(manifest.get("files", {}).items()):
+    """Check 3 of spec §6.2. Names the first file that fails.
+
+    Every key is checked to be inside the package before anything is hashed.
+    """
+    files = manifest.get("files", {})
+    root = pkg.resolve()
+    if not all(_contained_file_key(root, rel) for rel in files):
+        raise PackageError(
+            "PACKAGE_CORRUPT",
+            "The manifest lists a file outside the package; the package is damaged "
+            "or was modified after export.",
+            {"file": "manifest.json"})
+    for rel, expected in sorted(files.items()):
         target = pkg / rel
         if not target.is_file():
             raise PackageError("PACKAGE_CORRUPT",
