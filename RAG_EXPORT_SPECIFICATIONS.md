@@ -380,12 +380,19 @@ Checks run in this order and stop at the first failure:
 |---|---|---|
 | 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
-| 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
+| 3 | Every `files` key is a normalised relative path inside the package, and every `files` digest matches | `PACKAGE_CORRUPT`, naming the file (`manifest.json` for a key outside the package) |
 | 3a | Retained-source index names only valid digest identities and matching regular blobs | `PACKAGE_CORRUPT`, naming `sources/index.json` |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 3 checks every `files` key before it hashes anything (#371). A key that is
+empty, absolute, has a `..` component, isn't in normalised form (`./a`, `a//b`,
+`a/`) or resolves, links followed, to the package directory itself or outside it
+is refused as `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}`; the
+message and `detail` carry neither the key nor any digest, so a package can't
+make import hash, or report the digest of, a file outside it.
 
 Check 3a runs before embedding-model checks and all live mutation. Check 4b runs before model installation, collection creation/replacement, recovery
 ownership, or sidecar publication. Keep its normalized snapshot for restoration;
@@ -742,7 +749,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch, invalid retained sources (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
+| `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
