@@ -481,6 +481,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -665,6 +666,18 @@ service red and the others green, that a proxy 502, a refused connection and a 5
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
 refresh whatever health answers.
+
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
