@@ -480,6 +480,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -652,6 +653,18 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
+client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
+from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
+`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
+names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+service red and the others green, that a proxy 502, a refused connection and a 503 without a
+health body each show "Service health could not be read:" with the reason and remove the
+earlier cards, that the next good load clears it, and that the latency metrics load on every
+refresh whatever health answers.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.

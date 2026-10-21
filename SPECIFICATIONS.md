@@ -2022,8 +2022,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/health`  
 **Roles:** Engineer only
 
-- Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms).
+- Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
+- When health can't be read (no answer from the API, a proxy error page, or any other error without a health body), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
 - Latency trend charts (from the `history` field of `GET /metrics/latency`, bounded by `history_limit`, default 100): line chart of `total_ms` over time alongside `retrieval_ms` and `llm_ms`. Summary stat row shows P50/P95/P99 for each component from the `retrieval_latency`, `llm_latency` and `total_latency` objects.
+- Health and latency metrics load separately: a degraded or failed health call doesn't stop the charts from loading. A failed metrics call keeps the charts last shown.
 - Auto-refreshes every 30 seconds.
 
 ---
@@ -2595,6 +2597,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Health dashboard shows per-service latency; auto-refreshes every 30 seconds.
       *Three services — Weaviate, LLM and Embed, each with its model name and
       latency. Polling measured at 30s intervals.*
+- [x] Health dashboard shows a degraded 503 body with the failing services red, loads the latency metrics while health is degraded or can't be read, and shows a message, with no stale cards, when health can't be read.
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health` with a
+      degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
+      fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
+      for a missing model and an unreachable Ollama or Weaviate.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
