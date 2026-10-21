@@ -1080,7 +1080,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     source_file: str
     chunk_index: int
-    score: float
+    score: Optional[float]  # higher is better in every mode; null when missing (#376)
     excerpt: str
 
 
@@ -2738,11 +2738,39 @@ async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
     await asyncio.to_thread(_insert_chunks_sync, collection_name, chunks)
 
 
+# A citation's score is higher-is-better in every retrieval mode (#376), so the
+# distance-based modes turn Weaviate's distance into a similarity by the
+# collection's distance metric.
+_SIMILARITY = {
+    VectorDistances.COSINE: lambda d: 1 - d,            # cosine similarity, -1 to 1
+    VectorDistances.DOT: lambda d: -d,                  # the dot product itself
+    VectorDistances.L2_SQUARED: lambda d: 1 / (1 + d),  # 0 to 1
+}
+
+
+def _distance_to_score(coll):
+    """The distance-to-score conversion for this collection's metric.
+
+    The metric is read on every query, not cached, so a collection deleted and
+    recreated with another metric is converted by its new one. A missing
+    distance, or a metric that can't be read or has no conversion, gives None.
+    """
+    vector_config = coll.config.get().vector_index_config
+    convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
+
+    def to_score(distance: float | None) -> float | None:
+        if convert is None or distance is None:
+            return None
+        return convert(distance)
+    return to_score
+
+
 def _near_vector_query_sync(
     collection_name: str, vector: list[float], top_k: int
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_vector(
         near_vector=vector,
         limit=top_k,
@@ -2751,12 +2779,11 @@ def _near_vector_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2772,6 +2799,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_text(
         query=query,
         limit=top_k,
@@ -2780,12 +2808,11 @@ def _near_text_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2814,7 +2841,8 @@ def _hybrid_query_sync(
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": obj.metadata.score or 0.0,
+            # Weaviate's fusion score, higher is better; missing reads as None (#376).
+            "score": obj.metadata.score,
         })
     return rows
 
@@ -4550,7 +4578,7 @@ async def run_query(
             {
                 "source_file": c["source_file"],
                 "chunk_index": c["chunk_index"],
-                "score": round(c["score"], 4),
+                "score": None if c["score"] is None else round(c["score"], 4),
                 "excerpt": c["content"][:200],
             }
             for c in chunks
@@ -11111,7 +11139,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -11274,7 +11302,7 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
           <div key={i} className="text-xs bg-gray-50 border rounded p-2">
             <div className="flex justify-between mb-1">
               <span className="font-medium">{c.source_file}</span>
-              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score.toFixed(3)}</span>
+              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score === null ? 'n/a' : c.score.toFixed(3)}</span>
             </div>
             <p className="text-gray-700 italic">{c.excerpt}</p>
           </div>

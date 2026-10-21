@@ -136,7 +136,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number

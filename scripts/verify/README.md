@@ -484,6 +484,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
@@ -678,6 +680,22 @@ tried again; that 1,100 concurrent records all land; and that a restart restores
 records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
 files a crash left, and starts when the file can't be read or compacted. It also checks the
 `IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+
+Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
+`scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
+the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
+`1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
+first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
+`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+rounds numbers and passes `null` through, and `/query` returns it. It also checks the
+`IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
+project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
+vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled, and checks the
+scores against the expected similarities; then it deletes the cosine collection, recreates it
+with l2-squared, and checks the next query uses the new metric. With models, the suite checks
+that in each of the four modes the citation scores are numbers, highest first.
+`browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
+`n/a` for a `null` score.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a

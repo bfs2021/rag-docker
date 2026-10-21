@@ -818,6 +818,20 @@ When `include_citations` is `true`:
 }
 ```
 
+A citation's `score` is higher-is-better in every retrieval mode (#376). Citations are listed in
+retrieval order, best match first, so their scores don't increase down the list.
+
+| Mode | `score` |
+|---|---|
+| `hnsw`, `flat`, `semantic` | A similarity converted from Weaviate's distance by the collection's distance metric: `cosine`: `1 - distance` (the cosine similarity, -1 to 1); `dot`: `-distance` (the dot product); `l2-squared`: `1 / (1 + distance)` (0 to 1). |
+| `hybrid` | Weaviate's fusion score, unchanged. |
+
+The metric is read from Weaviate on every query, so a collection deleted and recreated with
+another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
+(or no hybrid score), or when the collection's metric can't be read or isn't one of the three
+above; it is never replaced by 0.0. Non-null scores are rounded to 4 decimals. Scores rank the
+chunks of one answer; they aren't comparable across modes or metrics.
+
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
@@ -1859,7 +1873,7 @@ Visible on all pages post-role-selection. Contents vary by role:
 - Question text input (multi-line, submit via "Ask" button or Ctrl+Enter; plain Enter inserts a newline).
 - Citations toggle (checkbox, off by default, labeled "Show source citations").
 - Answer display area (markdown-rendered).
-- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score, excerpt.
+- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score (higher is better, 3 decimals; `n/a` when the API returns `null`, #376), excerpt.
 - Latency display (small, below answer): `Retrieved in Xms · Generated in Xms`.
 - Retrieval mode selector — visible to Engineer and Developer roles only. Hidden for End User. Read-only: it displays the mode saved for the selected collection, which is changed on the Retrieval Config page. The settings are fetched from `GET /retrieval/config/{collection}` whenever the selected collection changes; if nothing is saved for that collection the API returns the defaults (`hnsw`, `top_k: 5`).
 
@@ -2467,6 +2481,12 @@ now lives once, in `api/services/ingest_config.py`.
       *hnsw, flat, hybrid and semantic each returned chunks and an answer.*
 - [x] `include_citations: true` returns citation objects with source_file and score.
       *Each citation carries source_file, chunk_index, score and excerpt.*
+- [x] A citation's score is higher-is-better in every mode, and `null` when missing (#376).
+      *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
+      dot and l2-squared collections give the documented similarities of known vectors, and a
+      collection recreated with another metric is converted by the new one. Controlled tests
+      cover a missing distance or hybrid score (`null`) and an unknown metric; the Q&A page shows
+      `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
