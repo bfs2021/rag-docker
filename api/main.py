@@ -47,6 +47,14 @@ async def lifespan(app: FastAPI):
                             len(stale_dirs), ", ".join(stale_dirs))
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted imports failed")
+        try:
+            from services import packager
+            leftovers = await asyncio.to_thread(packager.sweep_build_leftovers)
+            if leftovers:
+                log.warning("Removed %d leftover(s) of an interrupted export from the "
+                            "exports folder: %s", len(leftovers), ", ".join(leftovers))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted exports failed")
         # Job records survive a restart (#23). After the sweeps, so a job interrupted
         # mid-import is reported failed and its half-built collection already swept.
         # No worker from the previous process is alive, so any job still queued or

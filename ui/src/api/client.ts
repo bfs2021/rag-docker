@@ -180,7 +180,7 @@ export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface ImportBody { filename: string; on_conflict: string }
 export interface ImportStart { job_id: string; status: string; filename: string }

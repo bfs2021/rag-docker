@@ -339,6 +339,20 @@ collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of tha
 interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
 operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
+`scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
+leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
+`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+names, and only a real directory or regular file as the name says: completed packages,
+`ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
+anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
+removed directory, and sizes don't count what links point at. A failed removal is logged and
+not reported as removed, and a missing exports folder is not created. A real lifespan run in a
+child process removes both kinds and logs them by name and size. `02_ingest.sh` runs it in the
+API container. With `RAG_ALLOW_RESTART=1`, `05_transfer.sh` checks after its export restart
+that the interrupted export's build directory and temporary archive are gone, without removing
+anything itself, and that the completed package from the top of the suite is still there.
+
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
 repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
@@ -489,7 +503,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
@@ -641,6 +656,24 @@ edits and errors, the saved notice on a collection change, a configuration
 returned for another collection, and a failed collections list. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
 
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
