@@ -1,12 +1,10 @@
 from __future__ import annotations
 import asyncio
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
-from config import settings
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -111,11 +109,14 @@ async def save(body: SaveRequest):
 
 @router.get("/download/{filename}")
 async def download(filename: str):
-    base = Path(settings.upload_dir).resolve()
-    target = (base / filename).resolve()
-    if not str(target).startswith(str(base) + "/"):
-        return api_error(400, "INVALID_PATH", "Invalid filename.")
-    if not target.exists():
+    # Only files in the exports folder are served, never other upload state (#370).
+    try:
+        target = gs.export_path(filename)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
+    if gs.export_entry_is_other(target):
+        return api_error(400, "INVALID_PATH", f"'{filename}' is not an export file.")
+    if not target.is_file():
         return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
     return FileResponse(
         path=str(target),

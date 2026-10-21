@@ -4,6 +4,7 @@ import json
 import logging
 import copy
 import os
+import stat
 import tempfile
 import threading
 
@@ -990,6 +991,33 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     return None
 
 
+# Exports have their own folder so that a caller-chosen name can never reach the
+# registry, the metrics file or the session store beside them (#370).
+EXPORT_DIRNAME = "goldstandard_exports"
+_EXPORT_NAME_MAX = 128
+_EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9_. -]{1,%d}" % _EXPORT_NAME_MAX)
+
+
+def export_path(filename) -> Path:
+    """The path of export `filename`, or INVALID_PATH when the name breaks the rule."""
+    if (not isinstance(filename, str) or not _EXPORT_NAME_RE.fullmatch(filename)
+            or not filename.lower().endswith(".json")):
+        raise GoldStandardError(
+            "INVALID_PATH",
+            "Invalid filename. Use 1-128 letters, digits, '_', '-', '.' or spaces, "
+            "ending in .json, with no path.", 400)
+    return Path(settings.upload_dir).resolve() / EXPORT_DIRNAME / filename
+
+
+def export_entry_is_other(path: Path) -> bool:
+    """True when something other than a regular file (a directory, a link) has the name."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    return not stat.S_ISREG(mode)
+
+
 # Published cache snapshots are immutable. Export captures one stable reference
 # and never mutates or exposes it; later commits publish a different object.
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
@@ -1020,15 +1048,15 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if not filename:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe = re.sub(r"[^a-zA-Z0-9_]", "", collection.replace(" ", "_"))
-        filename = f"{safe}_{ts}.json"
+        suffix = f"_{ts}.json"
+        filename = safe[:_EXPORT_NAME_MAX - len(suffix)] + suffix
 
-    # Sanitize: only the basename; no path traversal
-    filename = Path(filename).name
-    out_dir = Path(settings.upload_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / filename).resolve()
-    if not str(out_path).startswith(str(out_dir) + "/"):
-        raise ValueError("Invalid filename.")
+    # The name is checked as given; a path is refused, not stripped (#370).
+    out_path = export_path(filename)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if export_entry_is_other(out_path):
+        raise GoldStandardError(
+            "INVALID_PATH", f"'{filename}' is not an export file.", 400)
 
     ragas = [
         {

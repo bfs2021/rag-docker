@@ -4590,6 +4590,7 @@ import json
 import logging
 import copy
 import os
+import stat
 import tempfile
 import threading
 
@@ -5576,6 +5577,33 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     return None
 
 
+# Exports have their own folder so that a caller-chosen name can never reach the
+# registry, the metrics file or the session store beside them (#370).
+EXPORT_DIRNAME = "goldstandard_exports"
+_EXPORT_NAME_MAX = 128
+_EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9_. -]{1,%d}" % _EXPORT_NAME_MAX)
+
+
+def export_path(filename) -> Path:
+    """The path of export `filename`, or INVALID_PATH when the name breaks the rule."""
+    if (not isinstance(filename, str) or not _EXPORT_NAME_RE.fullmatch(filename)
+            or not filename.lower().endswith(".json")):
+        raise GoldStandardError(
+            "INVALID_PATH",
+            "Invalid filename. Use 1-128 letters, digits, '_', '-', '.' or spaces, "
+            "ending in .json, with no path.", 400)
+    return Path(settings.upload_dir).resolve() / EXPORT_DIRNAME / filename
+
+
+def export_entry_is_other(path: Path) -> bool:
+    """True when something other than a regular file (a directory, a link) has the name."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    return not stat.S_ISREG(mode)
+
+
 # Published cache snapshots are immutable. Export captures one stable reference
 # and never mutates or exposes it; later commits publish a different object.
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
@@ -5606,15 +5634,15 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if not filename:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe = re.sub(r"[^a-zA-Z0-9_]", "", collection.replace(" ", "_"))
-        filename = f"{safe}_{ts}.json"
+        suffix = f"_{ts}.json"
+        filename = safe[:_EXPORT_NAME_MAX - len(suffix)] + suffix
 
-    # Sanitize: only the basename; no path traversal
-    filename = Path(filename).name
-    out_dir = Path(settings.upload_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / filename).resolve()
-    if not str(out_path).startswith(str(out_dir) + "/"):
-        raise ValueError("Invalid filename.")
+    # The name is checked as given; a path is refused, not stripped (#370).
+    out_path = export_path(filename)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if export_entry_is_other(out_path):
+        raise GoldStandardError(
+            "INVALID_PATH", f"'{filename}' is not an export file.", 400)
 
     ragas = [
         {
@@ -9388,12 +9416,10 @@ async def tune_options(collection: str):
 from __future__ import annotations
 import asyncio
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
-from config import settings
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -9498,11 +9524,14 @@ async def save(body: SaveRequest):
 
 @router.get("/download/{filename}")
 async def download(filename: str):
-    base = Path(settings.upload_dir).resolve()
-    target = (base / filename).resolve()
-    if not str(target).startswith(str(base) + "/"):
-        return api_error(400, "INVALID_PATH", "Invalid filename.")
-    if not target.exists():
+    # Only files in the exports folder are served, never other upload state (#370).
+    try:
+        target = gs.export_path(filename)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
+    if gs.export_entry_is_other(target):
+        return api_error(400, "INVALID_PATH", f"'{filename}' is not an export file.")
+    if not target.is_file():
         return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
     return FileResponse(
         path=str(target),
@@ -13241,7 +13270,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), registered by `10_validity.sh` |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
@@ -13267,6 +13297,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 `session_validity.py` inside the disposable API, using an owned real collection,
 synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
 It checks warning metadata, actual deletion marking and explicit historical export.
+It then runs `../tests/test_goldstandard_exports.py` in the API container and checks
+through the proxy that download refuses other upload state with 400 (#370).
 
 ## Environment
 
@@ -16713,6 +16745,16 @@ check "exported file is valid JSON in the RAGAS schema" $?
 code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
+# A caller-chosen name reaches only the exports folder (#370).
+for name in metrics.jsonl . .. goldstandard_sessions; do
+  api_post "/goldstandard/save" "{\"session_id\":\"$SID\",\"filename\":\"$name\"}" > /tmp/vfy_badsave.json
+  check_eq "save as '$name' is refused with INVALID_PATH" \
+    "$(jfield "['error']['code']" < /tmp/vfy_badsave.json)" "INVALID_PATH"
+done
+code=$(api_post_code "/goldstandard/save" "{\"session_id\":\"$SID\",\"filename\":\"collection_registry.json\"}")
+check_eq "save as 'collection_registry.json' writes an export" "$code" "200"
+check_eq "collections still list after that save" "$(api_code "$API/collections")" "200"
+
 # ── sessions survive a restart ───────────────────────────────────────────────
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
@@ -16802,6 +16844,17 @@ require_stack
 section "Retained evaluation validity and historical export"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_validity.py)
 check "legacy defaults, real stale/orphan markers, export guard and historical file" $?
+
+section "Gold-standard export files (#370)"
+# Controlled: save and download reach only UPLOAD_DIR/goldstandard_exports; bad
+# names get 400 INVALID_PATH and touch nothing.
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_exports.py)
+check "export names, folder, overwrite and refusals" $?
+# Through the proxy: other upload state is never served.
+for name in metrics.jsonl goldstandard_sessions report.txt; do
+  check_eq "download of '$name' is refused with 400" "$(api_code "$API/goldstandard/download/$name")" "400"
+done
+check_eq "download of a valid unknown name is 404" "$(api_code "$API/goldstandard/download/definitely_not_here.json")" "404"
 summary
 ```
 
@@ -20306,7 +20359,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 result=await task;self.assertEqual(result['pairs_saved'],1)
         asyncio.run(run())
-        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'snapshot.json').read_text())[0]['answer'],'Original')
         self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
 
     def test_scan_of_missing_storage_does_not_create_directory(self):
@@ -20381,7 +20434,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
         self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
-        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
+        self.assertFalse((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'owned-review.json').exists())
 
     def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
         async def run():
@@ -21002,7 +21055,7 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
         identities=[self.original['session_id']]+[s['session_id'] for s in imported];self.assertEqual(len(set(identities)),3);self.assertEqual(self.path.read_bytes(),before)
         for i,sid in enumerate(identities):
-            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/result['filename']).read_text())
+            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/result['filename']).read_text())
             self.assertEqual(rows[0]['answer'],'Newer human review' if i==0 else 'Original answer');self.assertEqual(set(rows[0]),{'question','answer','contexts','ground_truth'})
         gs._sessions={};gs.load_sessions_from_disk();self.assertEqual({gs.get_session(sid)['collection'] for sid in identities},{'OwnedOriginal','OwnedRenamedOne','OwnedRenamedTwo'})
 

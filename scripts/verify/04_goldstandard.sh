@@ -181,6 +181,16 @@ check "exported file is valid JSON in the RAGAS schema" $?
 code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
+# A caller-chosen name reaches only the exports folder (#370).
+for name in metrics.jsonl . .. goldstandard_sessions; do
+  api_post "/goldstandard/save" "{\"session_id\":\"$SID\",\"filename\":\"$name\"}" > /tmp/vfy_badsave.json
+  check_eq "save as '$name' is refused with INVALID_PATH" \
+    "$(jfield "['error']['code']" < /tmp/vfy_badsave.json)" "INVALID_PATH"
+done
+code=$(api_post_code "/goldstandard/save" "{\"session_id\":\"$SID\",\"filename\":\"collection_registry.json\"}")
+check_eq "save as 'collection_registry.json' writes an export" "$code" "200"
+check_eq "collections still list after that save" "$(api_code "$API/collections")" "200"
+
 # ── sessions survive a restart ───────────────────────────────────────────────
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
