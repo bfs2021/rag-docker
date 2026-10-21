@@ -201,6 +201,10 @@ in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
 (suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
 failing status poll, and that a new ingest and the next successful poll clear that error.
+Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
+queued panel show as soon as an upload is accepted, before the first poll, and stay through a
+failed poll; that the first answered poll replaces the panel while the job ID stays; and that
+"Start Ingest" with no collection selected says so and sends nothing.
 
 `scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
 upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it

@@ -1901,7 +1901,7 @@ settings, regardless of when a prior collection's save completes.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
-- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
+- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
 - Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):

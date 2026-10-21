@@ -11683,6 +11683,9 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The status the upload was accepted with, shown with the job ID until the
+  // first poll answers, so the page responds at once rather than 3 s later (#394).
+  const [queuedStatus, setQueuedStatus] = useState('')
   const [error, setError] = useState('')
   // A failed status poll, shown instead of ignored (#290). Polling carries on,
   // and the next successful poll clears it.
@@ -11772,9 +11775,15 @@ export default function ImportPage() {
   }
 
   async function startIngest() {
-    if (!files.length || !collection) return
+    if (!files.length) return
     setError('')
     setPollError('')
+    // With no collection selected (none exist, or the list failed to load),
+    // say so instead of doing nothing (#394).
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -11795,6 +11804,7 @@ export default function ImportPage() {
     try {
       const res = await api.uploadFiles(form)
       setJobId(res.job_id)
+      setQueuedStatus(res.status)
       setJob(null)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -11874,6 +11884,13 @@ export default function ImportPage() {
         Start Ingest
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {jobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{jobId}</span></p>}
+      {jobId && !job && (
+        <div className="mt-4 p-4 border rounded bg-gray-50 flex justify-between text-sm">
+          <span>Waiting for the first progress update</span>
+          <span className="text-blue-600">{queuedStatus}</span>
+        </div>
+      )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
@@ -13389,6 +13406,10 @@ in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
 (suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
 failing status poll, and that a new ingest and the next successful poll clear that error.
+Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
+queued panel show as soon as an upload is accepted, before the first poll, and stay through a
+failed poll; that the first answered poll replaces the panel while the job ID stays; and that
+"Start Ingest" with no collection selected says so and sends nothing.
 
 `scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
 upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
@@ -20046,6 +20067,92 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();
+    }
+  }
+
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
     }
   }
 
