@@ -1859,7 +1859,7 @@ Visible on all pages post-role-selection. Contents vary by role:
 
 **Elements:**
 
-- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection.
+- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Question text input (multi-line, submit via "Ask" button or Ctrl+Enter; plain Enter inserts a newline).
 - Citations toggle (checkbox, off by default, labeled "Show source citations").
 - Answer display area (markdown-rendered).
@@ -1896,7 +1896,7 @@ settings, regardless of when a prior collection's save completes.
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
 - File list showing queued files with remove buttons.
-- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest.
+- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list.
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
@@ -1988,7 +1988,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Roles:** Engineer, Developer
 
 **Phase 1 — Generate:**
-- Collection selector.
+- Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Sample size input (1–100, default 20).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
 - Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review table as they complete (partial display during generation).
@@ -2016,8 +2016,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/collections`  
 **Roles:** Engineer only
 
-- Table of collections: name, object count, index type, distance metric, created date.
+- Table of collections: name, object count, index type, distance metric, created date. If the list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, and keeps any rows already shown; the next successful load (after a create or delete) clears it (#379).
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
+- A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
@@ -2615,6 +2616,18 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       with a synthetic `409 COLLECTION_BUSY` by request interception, so no collection is
       touched, and checks one `DELETE` was sent, the alert inside the dialog, the row and
       the cleared message after Cancel.*
+- [x] A refused collection create is shown inside the New Collection modal on the Collections page and in the Import page's "+ New" modal: the modal stays open with the API's message as an alert, and Cancel or a successful create clears it (#379).
+      *Before, the error went to the page-level line behind the modal's overlay. `ui_criteria.js`
+      answers the `POST /collections` with a synthetic `409 COLLECTION_EXISTS`, then a `201`, by
+      request interception, so no collection is created, and checks one `POST`, the alert inside
+      the open modal, and no alert after Cancel or a success. On the Import page, a create whose
+      list reload fails closes the modal and shows a failed list. The checks fail on the code
+      before #379.*
+- [x] A failed collection list is shown as an alert, "Could not load the collections:" with the reason, on the Collections, Import, Q&A and Gold Standard pages (#379).
+      *Before, the error was swallowed, so an outage looked like "no collections". `ui_criteria.js`
+      answers `GET /collections` with a synthetic `503` on each page, and checks the Collections
+      page clears the message on its next successful load. The checks fail on the code before
+      #379.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
