@@ -18,12 +18,15 @@ export default function QAPage() {
   const [showCitations, setShowCitations] = useState(false)
   const [latency, setLatency] = useState<{ ret: number; llm: number } | null>(null)
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
 
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
     // Runs once; a collection already chosen on the Retrieval page is kept.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -75,6 +78,7 @@ export default function QAPage() {
           </select>
         )}
       </div>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-3">{listError}</p>}
       <textarea
         value={question}
         onChange={e => setQuestion(e.target.value)}

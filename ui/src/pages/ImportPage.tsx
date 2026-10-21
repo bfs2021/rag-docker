@@ -25,15 +25,33 @@ export default function ImportPage() {
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
+  // A refused create is shown inside the "+ New" modal, where the page-level
+  // line was hidden behind its overlay, and a failed list is shown, not
+  // swallowed (#379).
+  const [newColError, setNewColError] = useState('')
+  const [listError, setListError] = useState('')
 
   const showOverlap = strategy !== 'semantic' && strategy !== 'context_aware'
   const showSimilarity = strategy === 'semantic' && role === 'engineer'
 
-  useEffect(() => {
-    api.getCollections().then(r => {
+  // Resolves to the list, or null when it could not be read; a failure keeps
+  // the options already shown.
+  async function loadCollections(): Promise<CollectionInfo[] | null> {
+    try {
+      const r = await api.getCollections()
       setCollections(r.collections)
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      setListError('')
+      return r.collections
+    } catch (e: unknown) {
+      setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadCollections().then(list => {
+      if (list && list.length > 0) setCollection(list[0].name)
+    })
   }, [])
 
   useEffect(() => {
@@ -65,14 +83,27 @@ export default function ImportPage() {
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
       })
-      const r = await api.getCollections()
-      setCollections(r.collections)
-      setCollection(newColName)
-      setShowNewColModal(false)
-      setNewColName('')
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setNewColError(e instanceof Error ? e.message : String(e))
+      return
     }
+    // The create succeeded, so a failed reload is a list error, not a refusal.
+    const created = newColName
+    setShowNewColModal(false)
+    setNewColName('')
+    setNewColError('')
+    await loadCollections()
+    setCollection(created)
+  }
+
+  function openNewCol() {
+    setNewColError('')
+    setShowNewColModal(true)
+  }
+
+  function closeNewCol() {
+    setShowNewColModal(false)
+    setNewColError('')
   }
 
   async function startIngest() {
@@ -138,8 +169,9 @@ export default function ImportPage() {
           <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
             {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
           </select>
-          <button onClick={() => setShowNewColModal(true)} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
+          <button onClick={openNewCol} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-2">{listError}</p>}
       </div>
 
       <div className="mb-2">
@@ -189,8 +221,9 @@ export default function ImportPage() {
               <option value="hnsw">HNSW (Approximate)</option>
               <option value="flat">Flat (Exact KNN)</option>
             </select>
+            {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowNewColModal(false)} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+              <button onClick={closeNewCol} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
               <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>

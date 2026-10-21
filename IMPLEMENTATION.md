@@ -11491,12 +11491,15 @@ export default function QAPage() {
   const [showCitations, setShowCitations] = useState(false)
   const [latency, setLatency] = useState<{ ret: number; llm: number } | null>(null)
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
 
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
     // Runs once; a collection already chosen on the Retrieval page is kept.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -11548,6 +11551,7 @@ export default function QAPage() {
           </select>
         )}
       </div>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-3">{listError}</p>}
       <textarea
         value={question}
         onChange={e => setQuestion(e.target.value)}
@@ -11618,15 +11622,33 @@ export default function ImportPage() {
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
+  // A refused create is shown inside the "+ New" modal, where the page-level
+  // line was hidden behind its overlay, and a failed list is shown, not
+  // swallowed (#379).
+  const [newColError, setNewColError] = useState('')
+  const [listError, setListError] = useState('')
 
   const showOverlap = strategy !== 'semantic' && strategy !== 'context_aware'
   const showSimilarity = strategy === 'semantic' && role === 'engineer'
 
-  useEffect(() => {
-    api.getCollections().then(r => {
+  // Resolves to the list, or null when it could not be read; a failure keeps
+  // the options already shown.
+  async function loadCollections(): Promise<CollectionInfo[] | null> {
+    try {
+      const r = await api.getCollections()
       setCollections(r.collections)
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      setListError('')
+      return r.collections
+    } catch (e: unknown) {
+      setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadCollections().then(list => {
+      if (list && list.length > 0) setCollection(list[0].name)
+    })
   }, [])
 
   useEffect(() => {
@@ -11658,14 +11680,27 @@ export default function ImportPage() {
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
       })
-      const r = await api.getCollections()
-      setCollections(r.collections)
-      setCollection(newColName)
-      setShowNewColModal(false)
-      setNewColName('')
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setNewColError(e instanceof Error ? e.message : String(e))
+      return
     }
+    // The create succeeded, so a failed reload is a list error, not a refusal.
+    const created = newColName
+    setShowNewColModal(false)
+    setNewColName('')
+    setNewColError('')
+    await loadCollections()
+    setCollection(created)
+  }
+
+  function openNewCol() {
+    setNewColError('')
+    setShowNewColModal(true)
+  }
+
+  function closeNewCol() {
+    setShowNewColModal(false)
+    setNewColError('')
   }
 
   async function startIngest() {
@@ -11731,8 +11766,9 @@ export default function ImportPage() {
           <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
             {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
           </select>
-          <button onClick={() => setShowNewColModal(true)} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
+          <button onClick={openNewCol} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-2">{listError}</p>}
       </div>
 
       <div className="mb-2">
@@ -11782,8 +11818,9 @@ export default function ImportPage() {
               <option value="hnsw">HNSW (Approximate)</option>
               <option value="flat">Flat (Exact KNN)</option>
             </select>
+            {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowNewColModal(false)} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+              <button onClick={closeNewCol} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
               <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -12150,6 +12187,8 @@ export default function GoldStandardPage() {
   const exportPendingRef = useRef(false)
   const activeSessionRef = useRef('')
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
   const [editingPair, setEditingPair] = useState<GoldPair | null>(null)
@@ -12161,8 +12200,9 @@ export default function GoldStandardPage() {
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }, [])
 
   useEffect(() => {
@@ -12299,6 +12339,7 @@ export default function GoldStandardPage() {
             Generate Pairs
           </button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
         {session && session.status === 'generating' && (
           <div className="mt-3">
@@ -12412,7 +12453,10 @@ import { api, CollectionInfo } from '../api/client'
 
 export default function CollectionsPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [error, setError] = useState('')
+  // A refused create is shown inside the New Collection modal, and a failed
+  // list on the page; both were hidden or swallowed before (#379).
+  const [createError, setCreateError] = useState('')
+  const [listError, setListError] = useState('')
   const [showModal, setShowModal] = useState(false)
   const [name, setName] = useState('')
   const [indexType, setIndexType] = useState('hnsw')
@@ -12427,7 +12471,10 @@ export default function CollectionsPage() {
   const [deleteError, setDeleteError] = useState('')
 
   async function load() {
-    api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
+    api.getCollections().then(r => {
+      setCollections(r.collections)
+      setListError('')
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }
 
   useEffect(() => { load() }, [])
@@ -12437,10 +12484,21 @@ export default function CollectionsPage() {
       await api.createCollection({ name, index_type: indexType, distance_metric: distanceMetric, hnsw_config: { efConstruction, maxConnections, ef } })
       setShowModal(false)
       setName('')
+      setCreateError('')
       load()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setCreateError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function openCreate() {
+    setCreateError('')
+    setShowModal(true)
+  }
+
+  function closeCreate() {
+    setShowModal(false)
+    setCreateError('')
   }
 
   async function deleteCollection() {
@@ -12466,9 +12524,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={() => setShowModal(true)} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
       </div>
-      {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
         <thead>
           <tr className="border-b text-left text-gray-500">
@@ -12534,8 +12592,9 @@ export default function CollectionsPage() {
                 </div>
               </div>
             )}
+            {createError && <p role="alert" className="text-red-600 text-sm mb-4">{createError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowModal(false)} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={closeCreate} className="text-sm text-gray-500">Cancel</button>
               <button onClick={create} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -19270,7 +19329,7 @@ if (require.main === module) {
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -19609,6 +19668,123 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
               await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
+  }
+
+  // ── refused creates and failed collection lists (#379) ───────────────────
+  // A refused create went to the page-level error line behind the modal's
+  // overlay, so it looked like nothing happened, and a failed GET /collections
+  // was swallowed, so an outage looked like "no collections". The POSTs and the
+  // failing lists are answered here, so no collection is created.
+  r.section('refused creates and failed collection lists (#379)');
+  {
+    const LIST_FAIL = 'Synthetic list failure (#379).';
+    const LIST_MESSAGE = 'Could not load the collections: ' + LIST_FAIL;
+    const EXISTS = "Collection 'VfyRefused379' already exists.";
+    const listFailure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: LIST_FAIL, detail: null } }) };
+    const refusal = { status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_EXISTS', message: EXISTS, detail: null } }) };
+    const accepted = { status: 201, contentType: 'application/json', body: JSON.stringify({ name: 'VfyRefused379', status: 'created' }) };
+    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => a.textContent.trim()));
+    // The New Collection modal, and the alert inside it, if any.
+    const modal = page => page.evaluate(() => {
+      const h = [...document.querySelectorAll('h2')].find(x => x.textContent.trim() === 'New Collection');
+      const box = h && h.parentElement;
+      const alert = box && box.querySelector('[role=alert]');
+      return { open: !!h, alert: alert ? alert.textContent.trim() : null };
+    });
+    // Answers GET and POST /api/collections as the test's current modes say.
+    async function stub(s) {
+      const mode = { list: 'pass', post: 'refuse' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'GET' && mode.list === 'fail') return request.respond(listFailure);
+        if (request.method() === 'POST') return request.respond(mode.post === 'refuse' ? refusal : accepted);
+        return request.continue();
+      });
+      return mode;
+    }
+    const posts = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/collections').length;
+
+    // A failed list on each page that loads one.
+    for (const path of ['/collections', '/import', '/qa', '/goldstandard']) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const shown = await alerts(s.page);
+        r.check(`${path}: a failed collection list is shown as an alert`, shown.includes(LIST_MESSAGE), JSON.stringify(shown));
+        r.check(`${path}: a failed collection list causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Collections page: a refused create, then a successful one, which also
+    // reloads the list and clears the failed-list message.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=Name]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Collections: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Collections: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Collections: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'pass';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        r.check('Collections: a successful create closes the modal', !done.open, JSON.stringify(done));
+        const after = await alerts(s.page);
+        r.check('Collections: the next successful list clears the failed-list message', !after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Collections: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Collections create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Import page "+ New": a refused create, then a successful one whose list
+    // reload fails, which is a list error, not a refused create.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Import: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Import: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Import: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'fail';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        const after = await alerts(s.page);
+        r.check('Import: a successful create closes the modal even when the list reload fails', !done.open, JSON.stringify(done));
+        r.check('Import: a failed reload after a create is shown as a failed list', after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
   }
 
   // ── upload size limit ──────────────────────────────────────────────────────
