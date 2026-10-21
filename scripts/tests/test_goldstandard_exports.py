@@ -1,4 +1,4 @@
-"""Gold-standard save and download touch only export files (#370).
+"""Gold-standard save and download touch only export files (#370, #402).
 
 Runs with the API's dependencies, inside the verify project's API container:
 
@@ -82,6 +82,10 @@ class ExportFileTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["error"]["code"], "INVALID_PATH")
 
+    def assert_folder_invalid(self, response):
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["error"]["code"], "EXPORTS_FOLDER_INVALID")
+
     # ---- save -------------------------------------------------------------
 
     def test_refused_names_get_400_and_touch_nothing(self):
@@ -151,6 +155,69 @@ class ExportFileTests(unittest.TestCase):
         rows = json.loads((self.exports / "same.json").read_text())
         self.assertEqual(rows[0]["question"], "Changed question")
 
+    def test_name_rule_message_says_ascii_letters(self):
+        response = self.save("caf\u00e9.json")
+        self.assert_invalid(response)
+        self.assertIn("ASCII letters", response.json()["error"]["message"])
+
+    def test_link_appearing_at_the_name_is_replaced_not_followed(self):
+        # The link turns up after the entry check (#402): the write replaces it.
+        self.exports.mkdir()
+        (self.exports / "race.json").symlink_to(self.root / "collection_registry.json")
+        with patch.object(gs, "export_entry_is_other", return_value=False):
+            response = self.save("race.json")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((self.root / "collection_registry.json").read_bytes(), REGISTRY)
+        self.assertFalse((self.exports / "race.json").is_symlink())
+        rows = json.loads((self.exports / "race.json").read_text())
+        self.assertEqual(rows[0]["question"], "Inert question")
+
+    def test_failed_replace_keeps_the_previous_export(self):
+        self.assertEqual(self.save("same.json").status_code, 200)
+        self.assertEqual(sorted(os.listdir(self.exports)), ["same.json"])
+        first = (self.exports / "same.json").read_bytes()
+        changed = session()
+        changed["pairs"][0]["question"] = "Changed question"
+        gs.store_session(changed)
+        with patch.object(os, "replace", side_effect=OSError("replace refused")):
+            with self.assertRaises(OSError):
+                self.save("same.json")
+        self.assertEqual((self.exports / "same.json").read_bytes(), first)
+        self.assertEqual(sorted(os.listdir(self.exports)), ["same.json"])
+
+    # ---- exports folder (#402) --------------------------------------------
+
+    def test_stray_file_named_like_the_exports_folder_is_refused(self):
+        # A pre-#370 save could create a file with the folder's name.
+        self.exports.write_text("[]")
+        before = self.snapshot()
+        self.assert_folder_invalid(self.save("a.json"))
+        self.assert_folder_invalid(self.client.get("/goldstandard/download/a.json"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.exports.read_text(), "[]")
+
+    def test_linked_exports_folder_is_refused(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "kept.json").write_text("[]")
+        self.exports.symlink_to(elsewhere, target_is_directory=True)
+        before = self.snapshot()
+        self.assert_folder_invalid(self.save("a.json"))
+        self.assert_folder_invalid(self.client.get("/goldstandard/download/kept.json"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(sorted(os.listdir(elsewhere)), ["kept.json"])
+        self.exports.unlink()
+        self.exports.symlink_to(self.root / "missing")
+        before = self.snapshot()
+        self.assert_folder_invalid(self.save("a.json"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / "missing").exists())
+
+    def test_invalid_name_is_refused_before_the_folder_check(self):
+        self.exports.write_text("[]")
+        self.assert_invalid(self.save("report.txt"))
+        self.assert_invalid(self.client.get("/goldstandard/download/report.txt"))
+
     def test_unknown_session_still_404_before_the_name_check(self):
         response = self.client.post("/goldstandard/save", json={"session_id": "gs_00000000", "filename": ".."})
         self.assertEqual(response.status_code, 404)
@@ -173,6 +240,19 @@ class ExportFileTests(unittest.TestCase):
         for name in ("metrics.jsonl", "goldstandard_sessions", "report.txt", "name", "dir.json", "link.json"):
             with self.subTest(name=name):
                 self.assert_invalid(self.client.get("/goldstandard/download/" + name))
+
+    def test_download_applies_the_name_rule_at_its_boundaries(self):
+        # Reviewer addition: the download route's own 128/129 and letter-case edges.
+        from urllib.parse import quote
+        for name in ("UPPER.JSON", "my export-1.json", "x" * 123 + ".json"):
+            with self.subTest(name=name):
+                self.assertEqual(self.save(name).status_code, 200)
+                response = self.client.get("/goldstandard/download/" + quote(name))
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()[0]["question"], "Inert question")
+        for name in ("x" * 124 + ".json", "caf\u00e9.json", "name.json "):
+            with self.subTest(name=name):
+                self.assert_invalid(self.client.get("/goldstandard/download/" + quote(name)))
 
     def test_download_does_not_serve_top_level_files(self):
         (self.root / "old_export.json").write_text("[]")
