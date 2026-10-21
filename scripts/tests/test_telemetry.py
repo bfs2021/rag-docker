@@ -747,6 +747,7 @@ class TelemetryTests(unittest.TestCase):
             importer.sweep_interrupted_imports=lambda:[]
             importer.sweep_stale_workdirs=lambda:[]
             service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
+                                    packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
