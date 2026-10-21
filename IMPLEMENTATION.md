@@ -4439,6 +4439,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
 from __future__ import annotations
 import time
 
+import httpx
+
 from models.schemas import QueryRequest
 from services import ollama_client as ollama
 from services import weaviate_client as wc
@@ -4463,6 +4465,30 @@ SYNTHESIS_ENGINEER_SYSTEM = (
     "based on how directly the context addresses the question. "
     "If the context is insufficient, state this explicitly."
 )
+
+
+class ServiceUnavailable(Exception):
+    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+
+    def __init__(self, service: str):
+        super().__init__(f"{service} failed during the query")
+        self.service = service
+
+
+async def _from_ollama(call):
+    """Await an Ollama call; a connect error, timeout or error status is ServiceUnavailable."""
+    try:
+        return await call
+    except httpx.HTTPError as exc:
+        raise ServiceUnavailable("Ollama") from exc
+
+
+async def _from_weaviate(call):
+    """Await a Weaviate query; any error from it is ServiceUnavailable."""
+    try:
+        return await call
+    except Exception as exc:                          # noqa: BLE001
+        raise ServiceUnavailable("Weaviate") from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -4493,26 +4519,29 @@ async def run_query(
                           response_format=response_format)
     retrieval_mode, top_k, alpha, response_format = (
         config.retrieval_mode, config.top_k, config.alpha, config.response_format)
-    reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
+    reformulated = await _from_ollama(
+        ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}"))
     reformulated = reformulated.strip()
 
     t0 = time.monotonic()
     if retrieval_mode in ("hnsw", "flat"):
-        vector = await ollama.embed(reformulated)
-        chunks = await wc.near_vector_query(collection, vector, top_k)
+        vector = await _from_ollama(ollama.embed(reformulated))
+        chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
     elif retrieval_mode == "hybrid":
-        chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
+        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
     elif retrieval_mode == "semantic":
-        chunks = await wc.near_text_query(collection, reformulated, top_k)
+        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
     if response_format == "engineer":
         context = _build_context_engineer(chunks)
-        answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+        answer = await _from_ollama(ollama.chat(
+            SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}"))
     else:
         context = _build_context_end_user(chunks)
-        answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+        answer = await _from_ollama(ollama.chat(
+            SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}"))
     llm_ms = int((time.monotonic() - t1) * 1000)
 
     citations = None
@@ -8818,6 +8847,12 @@ async def transfer_help():
         markdown = packager.render_help(dimensions)
     except RuntimeError as exc:
         return api_error(500, "HELP_RENDER_FAILED", str(exc))
+    except OSError:
+        # A template file missing or unreadable. Its path is logged, not sent (#373).
+        _log.exception("Could not read a help template")
+        return api_error(500, "HELP_RENDER_FAILED",
+                         "The help page could not be rendered: a help template file "
+                         "could not be read.")
     return HelpResponse(topic="transfer", markdown=markdown)
 ```
 
@@ -8876,7 +8911,14 @@ def _save_registry(reg: dict) -> None:
 
 @router.get("", response_model=CollectionsResponse)
 async def list_collections():
-    raw = await wc.get_collections()
+    try:
+        raw = await wc.get_collections()
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be read; the cause is logged, not sent (#373).
+        _log.exception("Could not list the collections")
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         "Cannot list the collections: Weaviate could not be read. "
+                         "Try again when Weaviate is available.")
     registry = await asyncio.to_thread(_load_registry)
     items = [
         CollectionInfo(
@@ -8910,8 +8952,10 @@ async def create_collection(body: CreateCollectionRequest):
             distance_metric=body.distance_metric,
             hnsw_config=body.hnsw_config.model_dump(),
         )
-    except Exception as exc:
-        return api_error(500, "CREATE_FAILED", "Failed to create collection.", str(exc))
+    except Exception:                                 # noqa: BLE001
+        # The cause is logged, not sent (#373).
+        _log.exception("Could not create collection %r", body.name)
+        return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
@@ -8964,8 +9008,10 @@ async def delete_collection(name: str, confirm: str | None = None):
         count = await wc.delete_collection_when_idle(name)
     except CollectionInUseError as exc:
         return _busy_error(name, exc.jobs)
-    except Exception as exc:
-        return api_error(500, "DELETE_FAILED", "Failed to delete collection.", str(exc))
+    except Exception:                                 # noqa: BLE001
+        # The cause is logged, not sent (#373).
+        _log.exception("Could not delete collection %r", name)
+        return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
@@ -9123,15 +9169,24 @@ async def run_query(body: QueryRequest):
     if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await rag_pipeline.run_query(
-        question=body.question,
-        collection=body.collection,
-        retrieval_mode=body.retrieval_mode,
-        top_k=body.top_k,
-        alpha=body.alpha,
-        include_citations=body.include_citations,
-        response_format=body.response_format,
-    )
+    try:
+        result = await rag_pipeline.run_query(
+            question=body.question,
+            collection=body.collection,
+            retrieval_mode=body.retrieval_mode,
+            top_k=body.top_k,
+            alpha=body.alpha,
+            include_citations=body.include_citations,
+            response_format=body.response_format,
+        )
+    except rag_pipeline.ServiceUnavailable as exc:
+        # The cause is logged, not sent (#373).
+        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         f"The question was not answered: {exc.service} could not be reached, "
+                         f"timed out or returned an error. Try again when {exc.service} "
+                         f"is available.",
+                         detail={"collection": body.collection})
 
     await metrics.record(
         collection=body.collection,
@@ -10208,10 +10263,13 @@ alone.
 
 ```python
 from __future__ import annotations
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10288,6 +10346,36 @@ async def request_validation_error(request, exc):
     errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
               for error in exc.errors()]
     return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
+
+
+_log = logging.getLogger(__name__)
+
+# Routing errors answer in the envelope like every other error (#373). Other
+# statuses (FastAPI's 400 for an unparsable body) keep FastAPI's own answer.
+_ROUTING_ERRORS = {
+    404: ("NOT_FOUND", "No API route matches this path."),
+    405: ("METHOD_NOT_ALLOWED", "This API route does not accept this method."),
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def routing_error(request, exc):
+    if exc.status_code not in _ROUTING_ERRORS:
+        return await http_exception_handler(request, exc)
+    code, message = _ROUTING_ERRORS[exc.status_code]
+    response = api_error(exc.status_code, code, message)
+    response.headers.update(exc.headers or {})  # a 405 keeps its Allow header
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request, exc):
+    # The cause is logged, not sent (#373). Starlette re-raises the exception
+    # after this response is sent, so the server logs its traceback as well.
+    _log.error("Unhandled error on %s %s: %s: %s", request.method, request.url.path,
+               type(exc).__name__, exc)
+    return api_error(500, "INTERNAL_ERROR",
+                     "The API hit an unexpected error. The cause is in the API log.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -13319,6 +13407,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
@@ -13480,6 +13569,16 @@ writes and complement the live settings suite.
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
+Suite 01 also runs `scripts/tests/test_error_envelope.py` in the built API image with
+`--network none` and the repository mounted read-only (#373). It sends each request through
+the app with Weaviate and Ollama mocked, and checks that an unknown route answers 404
+`NOT_FOUND`, a wrong method 405 `METHOD_NOT_ALLOWED` with its `Allow` header and an unhandled
+error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, and `POST /query` when an Ollama call (connect
+error, timeout or error status) or a Weaviate query fails after the existence check, with no
+metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
+`CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
@@ -15072,6 +15171,9 @@ section "§10.5 Infrastructure"
 check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
+check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
