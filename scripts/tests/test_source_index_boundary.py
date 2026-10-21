@@ -362,6 +362,23 @@ class ManifestFilesBoundaryTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assert_refused(self.manifest(key, self.chunks_digest))
 
+    def assert_missing(self, key):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, self.manifest(key, "sha256:" + "0" * 64))
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": key}))
+        self.assertIn("listed in the manifest but missing", error.message)
+        self.assertNotIn(self.package / key, [call.args[0] for call in hashed.call_args_list])
+
+    def test_listed_missing_and_directory_keys_are_refused_as_missing(self):
+        # Both keys pass the containment check, so they are refused naming the key
+        # itself, not manifest.json, and never hashed.
+        (self.package / "sources").mkdir()
+        for key in ("sources/missing", "sources"):
+            with self.subTest(key=key):
+                self.assert_missing(key)
+
     def test_import_job_reports_no_outside_digest_and_touches_nothing(self):
         for key in (str(self.outside), "../outside.txt"):
             with self.subTest(key=key):
