@@ -5686,7 +5686,7 @@ import shutil
 import tarfile
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
 from pydantic import ValidationError
@@ -6268,9 +6268,38 @@ def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     return pkg, manifest
 
 
+def _contained_file_key(root: Path, rel: str) -> bool:
+    """True when a manifest `files` key names a file inside the package.
+
+    The manifest is untrusted: an absolute key, a `..` key or a key through a
+    link would otherwise make check 3 hash a file outside the package and
+    report its digest (#371). `root` is the resolved package directory.
+    """
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        return False
+    if PurePosixPath(rel).as_posix() != rel:
+        return False
+    try:
+        target = (root / rel).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return root in target.parents
+
+
 def verify_digests(pkg: Path, manifest: dict) -> None:
-    """Check 3 of spec §6.2. Names the first file that fails."""
-    for rel, expected in sorted(manifest.get("files", {}).items()):
+    """Check 3 of spec §6.2. Names the first file that fails.
+
+    Every key is checked to be inside the package before anything is hashed.
+    """
+    files = manifest.get("files", {})
+    root = pkg.resolve()
+    if not all(_contained_file_key(root, rel) for rel in files):
+        raise PackageError(
+            "PACKAGE_CORRUPT",
+            "The manifest lists a file outside the package; the package is damaged "
+            "or was modified after export.",
+            {"file": "manifest.json"})
+    for rel, expected in sorted(files.items()):
         target = pkg / rel
         if not target.is_file():
             raise PackageError("PACKAGE_CORRUPT",
@@ -23164,6 +23193,89 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         insert.assert_called_once()
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
                           job["chunks_stored"]), ("completed", 1, 0, 1))
+
+
+class ManifestFilesBoundaryTests(unittest.TestCase):
+    """Check 3 never hashes a file outside the package (#371)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.package = self.root / "package"
+        self.package.mkdir()
+        chunks = b'{"id": "chunk"}\n'
+        (self.package / "chunks.jsonl").write_bytes(chunks)
+        self.chunks_digest = "sha256:" + hashlib.sha256(chunks).hexdigest()
+        self.outside = self.root / "outside.txt"
+        self.outside.write_bytes(b"controlled outside sentinel")
+        self.outside_hex = hashlib.sha256(self.outside.read_bytes()).hexdigest()
+        (self.package / "link").symlink_to(self.root, target_is_directory=True)
+
+    def manifest(self, key, digest):
+        return {"files": {"chunks.jsonl": self.chunks_digest, key: digest}}
+
+    def assert_refused(self, manifest):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, manifest)
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": "manifest.json"}))
+        self.assertNotIn(self.outside_hex, error.message + json.dumps(error.detail))
+        self.assertNotIn("outside.txt", error.message + json.dumps(error.detail))
+        hashed.assert_not_called()
+
+    def test_valid_contained_keys_pass_and_mismatch_is_unchanged(self):
+        (self.package / "sources").mkdir()
+        (self.package / "sources" / "blob").write_bytes(b"blob")
+        manifest = {"files": {"chunks.jsonl": self.chunks_digest,
+                              "sources/blob": "sha256:" + hashlib.sha256(b"blob").hexdigest()}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+        self.assertEqual(sorted(call.args[0] for call in hashed.call_args_list),
+                         [self.package / "chunks.jsonl", self.package / "sources" / "blob"])
+        wrong = "sha256:" + "0" * 64
+        with self.assertRaises(PackageError) as raised:
+            packager.verify_digests(self.package, {"files": {"chunks.jsonl": wrong}})
+        self.assertEqual((raised.exception.code, raised.exception.detail), (
+            "PACKAGE_CORRUPT",
+            {"file": "chunks.jsonl", "expected": wrong, "actual": self.chunks_digest}))
+
+    def test_outside_keys_are_refused_before_hashing(self):
+        keys = (str(self.outside), "../outside.txt", "a/../../outside.txt", "link/outside.txt",
+                "link")
+        for key in keys:
+            for digest in ("sha256:" + self.outside_hex, "sha256:" + "0" * 64):
+                with self.subTest(key=key, digest=digest):
+                    self.assert_refused(self.manifest(key, digest))
+
+    def test_non_normalised_keys_are_refused(self):
+        for key in ("", ".", "./chunks.jsonl", "a//b", "chunks.jsonl/", "a/./b",
+                    "chunks.jsonl\x00"):
+            with self.subTest(key=key):
+                self.assert_refused(self.manifest(key, self.chunks_digest))
+
+    def test_import_job_reports_no_outside_digest_and_touches_nothing(self):
+        for key in (str(self.outside), "../outside.txt"):
+            with self.subTest(key=key):
+                job = {"status": "queued"}
+                validate, check_embedding, ensure_models, backend = Mock(), Mock(), Mock(), Mock()
+                with patch.object(settings, "upload_dir", str(self.root)), \
+                     patch.object(importer, "_jobs", {"owned": job}), \
+                     patch.object(importer, "_active", {"owned.tar.gz"}), \
+                     patch.object(importer.packager, "exports_dir", return_value=self.root), \
+                     patch.object(importer.packager, "open_package", return_value=(
+                         self.package, self.manifest(key, "sha256:" + "0" * 64))), \
+                     patch.object(importer, "_validate_package_sources", validate), \
+                     patch.object(importer, "_check_embedding", check_embedding), \
+                     patch.object(importer, "_ensure_models", ensure_models), \
+                     patch.object(importer.wc, "get_client", backend):
+                    importer._run("owned", "owned.tar.gz", "replace")
+                self.assertEqual((job["status"], job["error_code"], job["error_detail"]),
+                                 ("failed", "PACKAGE_CORRUPT", {"file": "manifest.json"}))
+                self.assertNotIn(self.outside_hex, json.dumps(job))
+                for seam in (validate, check_embedding, ensure_models, backend):
+                    seam.assert_not_called()
 
 
 if __name__ == "__main__":
