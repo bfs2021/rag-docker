@@ -42,9 +42,9 @@ from unittest.mock import patch, AsyncMock
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
-from services import goldstandard as gs, weaviate_client as wc, importer
+from services import goldstandard as gs, weaviate_client as wc, importer, packager
 async def run():
-    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]):
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
         async with lifespan(app):
             print(json.dumps(gs.get_session('gs_450abcde')))
 asyncio.run(run())
