@@ -2040,18 +2040,25 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Collection selector (from `GET /collections`).
 - **Fidelity shown before the export runs**, from `GET /tune/{collection}`:
   `with-sources` with the document count, or `chunks-only` with what that costs.
-  The choice is informed rather than discovered afterwards in the manifest.
+  The choice is informed rather than discovered afterwards in the manifest. The
+  line is never hidden: it reads "Fidelity: reading…" while the lookup runs, and
+  "Fidelity: unknown — it could not be read:" with the reason when the lookup
+  fails (409 `SOURCE_INDEX_INVALID`, 503, 404 or a proxy error). It always belongs
+  to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
 - Progress while the job runs, then the filename, size, fidelity, whether models
   were bundled and whether `retrieve.py` was generated. Warnings from the job are
-  shown in full.
+  shown in full. A failed export shows its `error_code` (for example
+  `EMBEDDING_MISMATCH`) before the error, as the import half does.
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
   chunk count, fidelity and size. Unreadable files are listed too, marked as
-  such, so nothing silently disappears.
+  such, so nothing silently disappears. A failed `GET /packages` shows "Could not
+  list the packages in ./exports:" with the reason, instead of the empty-folder
+  hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
   consequence spelled out. There is no default in the API, and the page makes the
   difference explicit because the wrong choice can delete a collection.
@@ -2060,7 +2067,14 @@ A retained session can be loaded/refreshed by its session ID, including when its
   sessions restored).
 
 Both halves poll their job endpoint every 2s and stop polling when the job
-finishes or the page unmounts.
+finishes or the page unmounts; a poll in flight at unmount, or a start answered
+after it, schedules nothing. A failed poll is shown ("Could not check the
+export's progress, retrying:" with the reason) and retried at the same interval,
+with the button still busy; the next good poll clears the message. After 30
+failed polls in a row (about a minute, enough for an API restart) the half stops
+watching the job, says so with the last error and that the job may still be
+running, and enables its button again, so the page never stays stuck until a
+reload (#382).
 
 ### 7.11 Transfer Help Page
 
@@ -2602,6 +2616,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
       for a missing model and an unreachable Ollama or Weaviate.*
+- [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, and shows a failed package list (#382).
+      *Evidence: `scripts/verify/browser/transfer_page.js` (suite 06, through `ui_criteria.js`)
+      stubs every API call in the browser: proxy 502s while polling either half, a poll in
+      flight and an export start answered after the page is left, 409, 503 and 404 from
+      `/tune`, a late fidelity answer for another collection, an `EMBEDDING_MISMATCH` export
+      and a 500 from `/packages`. 13 of its 14 checks fail on the code before #382.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
