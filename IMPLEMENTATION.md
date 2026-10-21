@@ -11244,7 +11244,7 @@ export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface ImportBody { filename: string; on_conflict: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
@@ -12732,92 +12732,166 @@ const CONFLICT = [
   { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
 ]
 
+// Both halves poll their job every 2 s. A failed poll is shown and retried;
+// after POLL_ATTEMPTS failures in a row (about a minute, long enough for an API
+// restart) the page stops watching that job and enables its button again, so
+// one transient 502 can no longer leave it stuck until a reload (#382).
+const POLL_MS = 2000
+const POLL_ATTEMPTS = 30
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 export default function TransferPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
+  const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
+  const [exportWatching, setExportWatching] = useState(false)
+  const [exportPollError, setExportPollError] = useState('')
 
   const [packages, setPackages] = useState<PackageSummary[]>([])
+  const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
+  const [importWatching, setImportWatching] = useState(false)
+  const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching.
+  // does not leave a timer running against a job nobody is watching. The job
+  // id being polled is kept too: a poll that answers after the page unmounted,
+  // or after it stopped watching that job, schedules nothing and changes nothing.
+  const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
+  const exportPoll = useRef<string | null>(null)
+  const importPoll = useRef<string | null>(null)
 
   const loadPackages = useCallback(() => {
-    api.getPackages().then(r => setPackages(r.packages)).catch(() => {})
+    api.getPackages().then(r => {
+      setPackages(r.packages)
+      setPackagesError('')
+    }, (e: unknown) => setPackagesError(`Could not list the packages in ./exports: ${message(e)}`))
   }, [])
 
   useEffect(() => {
+    alive.current = true
     api.getCollections().then(r => {
       setCollections(r.collections)
       if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch(() => {})
     loadPackages()
     return () => {
+      alive.current = false
+      exportPoll.current = null
+      importPoll.current = null
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
   }, [loadPackages])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
-  // than discovered afterwards in the manifest.
+  // than discovered afterwards in the manifest. A lookup that fails says so
+  // instead of hiding the line, and an answer for a collection that is no
+  // longer selected is ignored.
   useEffect(() => {
-    if (!collection) { setTune(null); return }
-    api.getTuneOptions(collection).then(setTune).catch(() => setTune(null))
+    setTune(null); setTuneError('')
+    if (!collection) return
+    let current = true
+    api.getTuneOptions(collection).then(t => {
+      if (current) setTune(t)
+    }, (e: unknown) => {
+      if (current) setTuneError(message(e))
+    })
+    return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string) {
+  function pollExport(jobId: string, failures = 0) {
     api.getExportJob(jobId).then(job => {
+      if (exportPoll.current !== jobId) return
       setExportJob(job)
+      setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
+        exportPoll.current = null
+        setExportWatching(false)
         loadPackages()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), 2000)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
-    }).catch((e: unknown) => setExportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (exportPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        exportPoll.current = null
+        setExportWatching(false)
+        setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
+      } else {
+        setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
-  function pollImport(jobId: string) {
+  function pollImport(jobId: string, failures = 0) {
     api.getImportJob(jobId).then(job => {
+      if (importPoll.current !== jobId) return
       setImportJob(job)
+      setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), 2000)
-      } else if (job.status === 'completed') {
+        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        return
+      }
+      importPoll.current = null
+      setImportWatching(false)
+      if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
-    }).catch((e: unknown) => setImportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (importPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        importPoll.current = null
+        setImportWatching(false)
+        setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
+      } else {
+        setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
   async function startExport() {
-    setExportError(''); setExportJob(null)
+    setExportError(''); setExportPollError(''); setExportJob(null)
     try {
       const r = await api.startExport({ collection, include_models: includeModels })
+      if (!alive.current) return
+      exportPoll.current = r.job_id
+      setExportWatching(true)
       pollExport(r.job_id)
     } catch (e: unknown) {
-      setExportError(e instanceof Error ? e.message : String(e))
+      setExportError(message(e))
     }
   }
 
   async function startImport() {
-    setImportError(''); setImportJob(null)
+    setImportError(''); setImportPollError(''); setImportJob(null)
     try {
       const r = await api.startImport({ filename, on_conflict: onConflict })
+      if (!alive.current) return
+      importPoll.current = r.job_id
+      setImportWatching(true)
       pollImport(r.job_id)
     } catch (e: unknown) {
-      setImportError(e instanceof Error ? e.message : String(e))
+      setImportError(message(e))
     }
   }
 
-  const exportBusy = exportJob !== null && exportJob.status !== 'completed' && exportJob.status !== 'failed'
-  const importBusy = importJob !== null && importJob.status !== 'completed' && importJob.status !== 'failed'
+  const exportBusy = exportWatching
+  const importBusy = importWatching
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -12847,7 +12921,7 @@ export default function TransferPage() {
           ))}
         </select>
 
-        {tune && (
+        {tune ? (
           <p className="text-xs mb-3">
             <span className={tune.fidelity === 'with-sources' ? 'text-green-700' : 'text-amber-700'}>
               Fidelity: <strong>{tune.fidelity}</strong>
@@ -12857,7 +12931,13 @@ export default function TransferPage() {
               ? `${tune.source_document_count} original document(s) will travel with the package.`
               : 'No original documents were retained, so the package cannot be re-chunked after import.'}
           </p>
-        )}
+        ) : tuneError ? (
+          <p className="text-xs mb-3 text-red-600">
+            Fidelity: <strong>unknown</strong> — it could not be read: {tuneError}
+          </p>
+        ) : collection ? (
+          <p className="text-xs mb-3 text-gray-500">Fidelity: reading…</p>
+        ) : null}
 
         <label className="flex items-start gap-2 text-sm mb-3">
           <input type="checkbox" checked={includeModels} onChange={e => setIncludeModels(e.target.checked)} className="mt-1" />
@@ -12879,6 +12959,7 @@ export default function TransferPage() {
         </button>
 
         {exportError && <p className="text-red-600 text-sm mt-3">{exportError}</p>}
+        {exportPollError && <p className="text-red-600 text-sm mt-3">{exportPollError}</p>}
         {exportJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -12896,7 +12977,12 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
-            {exportJob.status === 'failed' && <p className="text-red-600">{exportJob.error}</p>}
+            {exportJob.status === 'failed' && (
+              <p className="text-red-600">
+                {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
+                {exportJob.error}
+              </p>
+            )}
             {exportJob.warnings.map((w, i) => (
               <p key={i} className="text-amber-700 text-xs mt-1">{w}</p>
             ))}
@@ -12927,7 +13013,8 @@ export default function TransferPage() {
             </option>
           ))}
         </select>
-        {packages.length === 0 && (
+        {packagesError && <p className="text-red-600 text-xs mb-3">{packagesError}</p>}
+        {packages.length === 0 && !packagesError && (
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
@@ -12956,6 +13043,7 @@ export default function TransferPage() {
         </button>
 
         {importError && <p className="text-red-600 text-sm mt-3">{importError}</p>}
+        {importPollError && <p className="text-red-600 text-sm mt-3">{importPollError}</p>}
         {importJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -13863,6 +13951,24 @@ edits and errors, the saved notice on a collection change, a configuration
 returned for another collection, and a failed collections list. Each affected save checks
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
+
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
 
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
@@ -19484,6 +19590,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
+  await require('./transfer_page').runTransferPageTests(browser, BASE, r);
+
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
   {
@@ -24649,6 +24757,238 @@ if (require.main === module) (async () => {
   const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   const reporter = makeReporter();
   try { await runChunkingConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/transfer_page.js
+
+```javascript
+// Transfer page polling and failure display (#382), against the rendered page
+// with every API call stubbed in the browser; no backend reads or writes.
+//
+// Each case gets fresh fetch stubs. Fixed answers cover the collections, the
+// package list and the fidelity lookup unless a case holds them; every other
+// /api/ request is held until the case releases it with a status and body. The
+// page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
+// second.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue } = require('./lib');
+
+const A = 'VfyTransferA', B = 'VfyTransferB';
+const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
+const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
+const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
+const json = (status, body) => ({ status, body: JSON.stringify(body) });
+const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
+// nginx's own page when the API is down; request() turns it into this message.
+const BAD_GATEWAY = { status: 502, body: '<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>' };
+const DOWN = 'The API is not responding. It may still be starting; try again in a minute.';
+const exportJob = (status, extra = {}) => json(200, { job_id: 'vfyexp', status, collection: A, chunks_written: 1, filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null, retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null, ...extra });
+const importJob = (status, extra = {}) => json(200, { job_id: 'vfyimp', status, filename: PACKAGE, on_conflict: 'abort', collection: null, original_collection: null, chunks_written: 1, fidelity: null, renamed: false, notes: [], error: null, error_code: null, error_detail: null, ...extra });
+
+const HALVES = {
+  export: { start: '/api/export', started: json(202, { job_id: 'vfyexp', status: 'queued', collection: A }), poll: '/api/export/job/vfyexp', job: exportJob, idle: 'Export', busy: 'Exporting…', progress: "the export's progress",
+            done: exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true }) },
+  import: { start: '/api/import', started: json(202, { job_id: 'vfyimp', status: 'queued', filename: PACKAGE }), poll: '/api/import/job/vfyimp', job: importJob, idle: 'Import', busy: 'Importing…', progress: "the import's progress",
+            done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
+};
+
+async function fixture(browser, base, { hold = [] } = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  const fixed = {
+    'GET /api/collections': json(200, collectionsBody),
+    'GET /api/packages': json(200, packagesBody),
+    ['GET /api/tune/' + A]: json(200, tuneBody(A)),
+    ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+  };
+  for (const key of hold) delete fixed[key];
+  await page.evaluateOnNewDocument(answers => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
+    const realFetch = window.fetch.bind(window);
+    window.transferFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const entry = { path, method, done: false };
+      window.transferFixture.requests.push(entry);
+      const answer = answers[method + ' ' + path];
+      if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
+      return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
+    };
+  }, fixed);
+  await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
+  return { ctx, page, errors };
+}
+
+const count = (page, path, method = 'GET') => page.evaluate((p, m) => window.transferFixture.requests.filter(r => r.path === p && r.method === m).length, path, method);
+async function pending(page, path, method = 'GET') {
+  await page.waitForFunction((p, m) => window.transferFixture.requests.some(r => r.path === p && r.method === m && !r.done), { timeout: 5000 }, path, method)
+    .catch(() => { throw new Error(`no ${method} ${path} request arrived`); });
+}
+async function release(page, path, answer, method = 'GET') {
+  await pending(page, path, method);
+  await page.evaluate((p, m, status, body) => {
+    window.transferFixture.requests.find(r => r.path === p && r.method === m && !r.done).resolve(status, body);
+  }, path, method, answer.status, answer.body);
+}
+const text = page => page.evaluate(() => document.body.innerText.replace(/\s+/g, ' '));
+async function waitText(page, want, gone = false) {
+  await page.waitForFunction((w, g) => document.body.innerText.replace(/\s+/g, ' ').includes(w) !== g, { timeout: 5000 }, want, gone)
+    .catch(async () => { throw new Error(`${gone ? 'still shows' : 'never showed'} "${want}"; page: ${(await text(page)).slice(0, 600)}`); });
+}
+// The half's start button, found by either of its labels.
+const button = (page, half) => page.evaluate((idle, busy) => {
+  const b = [...document.querySelectorAll('button')].find(x => [idle, busy].includes(x.textContent.trim()));
+  return b ? { label: b.textContent.trim(), disabled: b.disabled } : null;
+}, HALVES[half].idle, HALVES[half].busy);
+async function expectButton(page, half, busy) {
+  const want = busy ? HALVES[half].busy : HALVES[half].idle;
+  await page.waitForFunction((label, disabled) => [...document.querySelectorAll('button')].some(x => x.textContent.trim() === label && x.disabled === disabled), { timeout: 5000 }, want, busy)
+    .catch(async () => { throw new Error(`expected "${want}" ${busy ? 'disabled' : 'enabled'}, got ${JSON.stringify(await button(page, half))}`); });
+}
+// Buttons only by default: the nav has an "Import" link as well as the Import button.
+const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
+  const b = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
+  if (!b) return false; b.click(); return true;
+}, label, selector);
+
+// Selects the package (import) and starts the half; leaves its start request held.
+async function start(page, half) {
+  if (half === 'import') {
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(PACKAGE)}))`, PACKAGE);
+  }
+  await expectButton(page, half, false);
+  assert.equal(await click(page, HALVES[half].idle), true, `no ${HALVES[half].idle} button`);
+  await pending(page, HALVES[half].start, 'POST');
+}
+async function startAndPoll(page, half) {
+  await start(page, half);
+  await release(page, HALVES[half].start, HALVES[half].started, 'POST');
+  await pending(page, HALVES[half].poll);
+}
+const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
+const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
+
+async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+async function runTransferPageTests(browser, base, reporter) {
+  reporter.section('Transfer page polling and failures (#382)');
+  const cases = [];
+  for (const half of ['export', 'import']) {
+    const h = HALVES[half];
+    cases.push([`${half}: a failed poll is shown and retried with the button still busy, and the next good poll clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.job('running'));
+      await waitText(page, retrying(half), true);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.done);
+      await waitText(page, 'Done.');
+      await waitText(page, retrying(half), true);
+      await expectButton(page, half, false);
+    }]);
+    cases.push([`${half}: after 30 failed polls in a row polling stops, the reason is shown and the button is usable; a new start clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      for (let i = 0; i < 30; i++) await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, stopped(half));
+      await expectButton(page, half, false);
+      const polls = await count(page, h.poll);
+      await sleep(400);
+      assert.equal(await count(page, h.poll), polls, 'polling went on after the limit');
+      assert.equal(polls, 31, 'one good poll and 30 failed ones');
+      await start(page, half);
+      await waitText(page, stopped(half), true);
+    }]);
+    cases.push([`${half}: a poll in flight when the page is left schedules no further poll`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      await pending(page, h.poll);
+      assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+      await page.waitForFunction(() => location.pathname === '/collections');
+      await release(page, h.poll, h.job('running'));
+      await sleep(400);
+      assert.equal(await count(page, h.poll), 2, 'a poll was sent after the page was left');
+    }]);
+  }
+  cases.push(['export: a start answered after the page was left starts no polling', async page => {
+    await start(page, 'export');
+    assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+    await page.waitForFunction(() => location.pathname === '/collections');
+    await release(page, HALVES.export.start, HALVES.export.started, 'POST');
+    await sleep(400);
+    assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
+                                     [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],
+                                     [404, 'COLLECTION_NOT_FOUND', `Collection '${A}' not found.`]]) {
+    cases.push([`fidelity: a ${status} ${code} from /tune is labelled, not hidden`, async page => {
+      await pending(page, '/api/tune/' + A);
+      await waitText(page, 'Fidelity: reading…');
+      await release(page, '/api/tune/' + A, apiError(status, code, msg));
+      await waitText(page, `Fidelity: unknown — it could not be read: ${msg}`);
+    }, { hold: ['GET /api/tune/' + A] }]);
+  }
+  cases.push(['fidelity: a good lookup shows the fidelity line', async page => {
+    await waitText(page, 'Fidelity: with-sources — 2 original document(s) will travel with the package.');
+  }]);
+  cases.push(['fidelity: a late answer for a collection no longer selected is ignored', async page => {
+    await pending(page, '/api/tune/' + A);
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(B)}))`, B);
+    await release(page, '/api/tune/' + B, json(200, { ...tuneBody(B), fidelity: 'chunks-only', source_document_count: 0 }));
+    await waitText(page, 'Fidelity: chunks-only');
+    await release(page, '/api/tune/' + A, apiError(503, 'SERVICE_UNAVAILABLE', 'Synthetic late failure.'));
+    await sleep(300);
+    const shown = await text(page);
+    assert.ok(shown.includes('Fidelity: chunks-only') && !shown.includes('Synthetic late failure.'), shown.slice(0, 600));
+  }, { hold: ['GET /api/tune/' + A, 'GET /api/tune/' + B] }]);
+  cases.push(['export: a refused export shows its error_code', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('failed', { error: 'PackageError: Synthetic embedding model mismatch.', error_code: 'EMBEDDING_MISMATCH', error_detail: { expected: 'a', found: 'b' } }));
+    await waitText(page, 'Failed.');
+    const codes = await page.evaluate(() => [...document.querySelectorAll('code')].map(c => c.textContent.trim()));
+    assert.ok(codes.includes('EMBEDDING_MISMATCH'), `codes shown: ${JSON.stringify(codes)}`);
+    await waitText(page, 'Synthetic embedding model mismatch.');
+    await expectButton(page, 'export', false);
+  }]);
+  cases.push(['packages: a failed list is shown without the empty-folder hint, and a good Refresh clears it', async page => {
+    await release(page, '/api/packages', apiError(500, 'INTERNAL_ERROR', 'Synthetic package list failure.'));
+    await waitText(page, 'Could not list the packages in ./exports: Synthetic package list failure.');
+    assert.ok(!(await text(page)).includes('Nothing in ./exports yet'), 'the empty-folder hint is shown for a failed list');
+    assert.equal(await click(page, 'Refresh'), true, 'no Refresh button');
+    await release(page, '/api/packages', json(200, packagesBody));
+    await waitText(page, 'Could not list the packages', true);
+    const listed = await page.evaluate(p => [...document.querySelectorAll('option')].some(o => o.value === p), PACKAGE);
+    assert.equal(listed, true, 'the package is not listed after a good Refresh');
+  }, { hold: ['GET /api/packages'] }]);
+
+  for (const [name, test, opts] of cases) {
+    let s;
+    try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+
+module.exports = { runTransferPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runTransferPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
   finally { await browser.close(); }
   process.exitCode = reporter.summary() ? 0 : 1;
 })().catch(e => { console.error(e); process.exitCode = 2; });

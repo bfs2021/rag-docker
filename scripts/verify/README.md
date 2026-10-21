@@ -655,6 +655,24 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
+
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
