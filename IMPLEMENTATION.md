@@ -6142,7 +6142,7 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
             wanted = [settings.embed_model, settings.llm_model]
             if not model_bundle.store_available():
@@ -6157,7 +6157,8 @@ def build(
                     except (OSError, ValueError) as exc:
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model.split(":")[0])
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -6203,9 +6204,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -6219,18 +6220,6 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -6254,7 +6243,6 @@ def build(
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
@@ -24127,6 +24115,66 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(result['warnings'].count(warning), 1)
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
+
+    def build_with_models(self, failing):
+        """Export with both models requested; models named in `failing` cannot bundle."""
+        blob = self.root / 'model-blob'
+        blob.write_text('inert model bytes')
+
+        def export_model(model, stage):
+            if model in failing:
+                raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
+            return [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
+            mocks.enter_context(patch.object(settings, 'llm_model', 'chat:v2'))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=True))
+            mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
+            result = packager.build('Corpus', include_models=True)
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
+                          and m.name.count('/') == 1)
+            manifest = json.load(archive.extractfile(member))
+        return result, manifest
+
+    def test_manifest_lists_only_models_actually_bundled(self):
+        for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
+                                  (set(), ['chat', 'embed']), ({'embed:v1', 'chat:v2'}, [])]:
+            with self.subTest(failing=sorted(failing)):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(failing)
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(manifest['models_bundled'], bool(expected))
+                self.assertEqual(result['models_bundled'], bool(expected))
+                for name in ('embed', 'chat'):
+                    self.assertEqual(f'models/{name}/manifest.json' in manifest['files'],
+                                     name in expected)
+                for model in sorted(failing):
+                    self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
+                                        for w in manifest['warnings']))
+
+    def test_package_readme_contents_come_from_the_partial(self):
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        partial = (packager._TEMPLATE_DIR / 'partials' / 'contents.md').read_text().rstrip('\n')
+        self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
+        self.assertNotIn('@@', readme)
 
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
