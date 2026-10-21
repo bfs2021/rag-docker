@@ -787,6 +787,50 @@ class RechunkTests(unittest.TestCase):
                     "detail": {"collection": "Coll"}})
                 self.assertNotIn(b"weaviate down", response.body)
 
+    def test_each_tune_route_answers_the_503_over_http(self):
+        # #349, through the app as a client calls it: the JSON 503 reaches the
+        # client (not a plain 500) from each tune start and from the tuning
+        # options, for its existence check and its re-chunk check (#369).
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        sources.store("Coll", "a.txt", b"one", replace=True)
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        unreadable = patch.object(wc, "collection_exists",
+                                  AsyncMock(side_effect=ConnectionError("weaviate down")))
+        cases = [
+            (f"{operation} existence check", unreadable, "routers",
+             lambda operation=operation: client.post(f"/tune/{operation}",
+                                                     json={"collection": "Coll"}))
+            for operation in ("rechunk", "reembed", "reindex")
+        ] + [
+            ("options existence check", unreadable, "routers", lambda: client.get("/tune/Coll")),
+            ("options re-chunk check",
+             patch.object(wc, "collection_exists", AsyncMock(return_value=True)), tuning._log,
+             lambda: client.get("/tune/Coll")),
+        ]
+        before = set(tuning._jobs)
+        for case, exists, logger, send in cases:
+            with self.subTest(case=case), exists, \
+                    patch.object(wc, "get_client", return_value=SimpleNamespace(
+                        collections=SimpleNamespace(get=lambda name: coll))), \
+                    self.assertLogs(logger, "ERROR"):
+                response = send()
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertTrue(response.headers["content-type"].startswith("application/json"))
+                self.assertEqual(response.json()["error"]["code"], "SERVICE_UNAVAILABLE")
+                self.assertEqual(response.json()["error"]["detail"], {"collection": "Coll"})
+                self.assertNotIn("weaviate down", response.text)
+                self.assertEqual(set(tuning._jobs), before)
+                self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                 (set(), []))
+
     def test_a_missing_collection_is_still_404_at_tune_starts_and_options(self):
         # #349 (reviewer): the existence check now sits in a try; a collection
         # Weaviate reports as missing is still COLLECTION_NOT_FOUND, with no job.
@@ -923,6 +967,40 @@ class ExistenceCheckTests(unittest.TestCase):
                         "code": "COLLECTION_NOT_FOUND",
                         "message": "Collection 'Coll' not found.", "detail": None})
                 self.assert_nothing_created(jobs_before)
+
+    def test_each_route_answers_the_503_over_http(self):
+        # #366, through the app as a client calls it: the JSON 503 reaches the
+        # client (not a plain 500), for each of the six routes (#369).
+        from fastapi.testclient import TestClient
+        from main import app
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        requests = {
+            "query": lambda: client.post("/query", json={"question": "q?", "collection": "Coll"}),
+            "goldstandard": lambda: client.post("/goldstandard/generate",
+                                                json={"collection": "Coll"}),
+            "create": lambda: client.post("/collections", json={"name": "Coll"}),
+            "delete": lambda: client.delete("/collections/Coll?confirm=true"),
+            "ingest": lambda: client.post("/ingest/upload",
+                                          data={"collection": "Coll", "strategy": "fixed",
+                                                "chunk_size": "200", "chunk_overlap": "0",
+                                                "min_chunk_size": "0"},
+                                          files={"files": ("a.txt", b"text")}),
+            "export": lambda: client.post("/export", json={"collection": "Coll"}),
+        }
+        jobs_before = set(ingest_pipeline._jobs)
+        with patch.object(wc, "collection_exists",
+                          AsyncMock(side_effect=ConnectionError("weaviate down"))):
+            for case, send in requests.items():
+                with self.subTest(case=case), self.assertLogs("routers", "ERROR"):
+                    response = send()
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertTrue(response.headers["content-type"].startswith(
+                        "application/json"))
+                    self.assertEqual(response.json()["error"]["code"], "SERVICE_UNAVAILABLE")
+                    self.assertEqual(response.json()["error"]["detail"], {"collection": "Coll"})
+                    self.assertNotIn("weaviate down", response.text)
+                    self.assert_nothing_created(jobs_before)
 
 
 class SchemaTests(unittest.TestCase):
