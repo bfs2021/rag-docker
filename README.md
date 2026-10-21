@@ -261,7 +261,7 @@ Four named Docker volumes persist data across restarts:
 |---|---|
 | `weaviate_data` | Vector index and all ingested chunks |
 | `ollama_models` | Downloaded model weights |
-| `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer |
+| `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
 
 Run `docker compose down -v` to delete all volumes and start fresh.
