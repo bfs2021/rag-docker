@@ -34,6 +34,34 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   return data as T
 }
 
+function isHealthResult(data: any): data is HealthResult {
+  const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+}
+
+// GET /health answers 503 with the same per-service body when a dependency is
+// down. request() throws on any non-2xx, so the Health page never saw which
+// service failed and could not show it red (#375). This call accepts a 503
+// that carries that body; every other error is thrown as request() would.
+async function getHealthResult(): Promise<HealthResult> {
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/health`)
+  } catch {
+    // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
+    throw new Error('The API could not be reached. Check that the stack is running.')
+  }
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if ((res.ok || res.status === 503) && isHealthResult(data)) return data
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
+  return data as HealthResult
+}
+
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
@@ -69,7 +97,7 @@ export const api = {
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
   getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
-  getHealth: () => request<HealthResult>('GET', '/health'),
+  getHealth: () => getHealthResult(),
 }
 
 // Types

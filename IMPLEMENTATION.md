@@ -11009,6 +11009,34 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   return data as T
 }
 
+function isHealthResult(data: any): data is HealthResult {
+  const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+}
+
+// GET /health answers 503 with the same per-service body when a dependency is
+// down. request() throws on any non-2xx, so the Health page never saw which
+// service failed and could not show it red (#375). This call accepts a 503
+// that carries that body; every other error is thrown as request() would.
+async function getHealthResult(): Promise<HealthResult> {
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/health`)
+  } catch {
+    // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
+    throw new Error('The API could not be reached. Check that the stack is running.')
+  }
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if ((res.ok || res.status === 503) && isHealthResult(data)) return data
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
+  return data as HealthResult
+}
+
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
@@ -11044,7 +11072,7 @@ export const api = {
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
   getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
-  getHealth: () => request<HealthResult>('GET', '/health'),
+  getHealth: () => getHealthResult(),
 }
 
 // Types
@@ -12866,6 +12894,7 @@ import LatencyCharts from '../components/LatencyCharts'
 export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
+  const [healthError, setHealthError] = useState<string | null>(null)
 
   const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
   const [diagnosticError, setDiagnosticError] = useState(false)
@@ -12873,7 +12902,7 @@ export default function HealthPage() {
   const [diagnosticPending, setDiagnosticPending] = useState(true)
   const diagnosticTicket = useRef(0)
 
-  async function load() {
+  function load() {
     const ticket = ++diagnosticTicket.current
     setDiagnosticPending(true)
     api.getSessionDiagnostics().then(result => {
@@ -12885,11 +12914,14 @@ export default function HealthPage() {
     }).finally(() => {
       if (ticket === diagnosticTicket.current) setDiagnosticPending(false)
     })
-    try {
-      const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
-      setHealth(h)
-      setMetrics(m)
-    } catch { /* ignore */ }
+    // Health and metrics load separately: a degraded or unreachable API must not
+    // stop the latency charts, and no stale green cards stay up (#375).
+    api.getHealth().then(h => {
+      setHealth(h); setHealthError(null)
+    }).catch(e => {
+      setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
+    })
+    api.getMetrics().then(setMetrics).catch(() => { /* keep the last metrics shown */ })
   }
 
   useEffect(() => {
@@ -12913,6 +12945,7 @@ export default function HealthPage() {
         <h2 className="font-semibold">{diagnosticPending ? "Previous evaluation session recovery results — refresh pending" : "Evaluation session recovery needs attention"}</h2>
         {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
       </div>}
+      {healthError && <p role="alert" className="text-red-700 mb-4">Service health could not be read: {healthError}</p>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">
@@ -13508,6 +13541,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -13680,6 +13714,18 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
+client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
+from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
+`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
+names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+service red and the others green, that a proxy 502, a refused connection and a 503 without a
+health body each show "Service health could not be read:" with the reason and remove the
+earlier cards, that the next good load clears it, and that the latency metrics load on every
+refresh whatever health answers.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -15288,6 +15334,10 @@ check "OTel embedded implementation stays synchronized" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# /health's 503 body for a missing model or an unreachable dependency, which the
+# Health page reads to show the failing services (#375).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
+check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -19873,6 +19923,101 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── degraded and unreachable health (#375) ─────────────────────────────────
+  // /health answers 503 with its per-service body when a dependency is down. The
+  // page must show that body, red for the failing service, keep loading the
+  // latency metrics, and say so when health can't be read at all. Each load is
+  // driven by hand through the captured 30s refresh, with the answers stubbed.
+  r.section('degraded and unreachable health (#375)');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45002; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
+    const healthBody = (status, embed) => ({
+      status,
+      services: {
+        weaviate: service('ok', 11),
+        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+      },
+      resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
+    });
+    const proxyPage = code => `<html><head><title>${code}</title></head><body><center><h1>${code}</h1></center><hr><center>nginx</center></body></html>`;
+    const metricsBody = n => ({
+      total_records: n,
+      retrieval_latency: { p50: 10, p95: 20, p99: 30 },
+      llm_latency: { p50: 100, p95: 200, p99: 300 },
+      total_latency: { p50: 110, p95: 220, p99: 330 },
+      history: Array.from({ length: n }, (_, i) => ({ timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString(), collection: 'OwnedFixture', retrieval_mode: 'hybrid', retrieval_ms: 10, llm_ms: 100, total_ms: 110 })),
+    });
+    let mode = 'degraded', loads = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/health') {
+        if (mode === 'refused') return request.abort('connectionrefused');
+        if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
+        if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });
+        const degraded = mode === 'degraded';
+        return request.respond({ status: degraded ? 503 : 200, contentType: 'application/json', body: JSON.stringify(healthBody(degraded ? 'degraded' : 'ok', degraded ? 'error' : 'ok')) });
+      }
+      if (path === '/api/metrics/latency') {
+        loads++;
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(metricsBody(loads)) });
+      }
+      return request.continue();
+    });
+    // Each service card's label and dot colour; the latency tiles have no dot.
+    const cards = () => s.page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')].map(dot => ({
+      label: (dot.parentElement.textContent || '').trim(),
+      red: dot.classList.contains('bg-red-500'), green: dot.classList.contains('bg-green-500'),
+    })));
+    const colours = list => list.map(c => `${c.label}=${c.red ? 'red' : c.green ? 'green' : '?'}`).join(', ');
+    const healthAlert = text => (text.match(/Service health could not be read:.{0,80}/) || [''])[0];
+    const refresh = async next => { mode = next; await s.page.evaluate(() => window.__ownedHealthRefresh()); await sleep(700); };
+    const metricsShown = (text, n) => text.includes(`Latency Trends (${n} queries in ring buffer)`);
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(700);
+      let text = await bodyText(s.page), list = await cards();
+      const by = label => list.find(c => c.label.startsWith(label)) || {};
+      r.check('a degraded 503 shows the failing service red', list.length === 3 && by('Embed').red, colours(list));
+      r.check('a degraded 503 shows the services that are ok green', by('Weaviate').green && by('LLM').green, colours(list));
+      r.check('a degraded 503 shows each service latency', ['11ms', '22ms', '33ms'].every(ms => text.includes(ms)), text.slice(0, 200));
+      r.check('a degraded 503 is not reported as unreadable', !healthAlert(text), healthAlert(text));
+      r.check('latency metrics load while health answers 503', metricsShown(text, 1), text.slice(0, 300));
+
+      await refresh('ok'); list = await cards(); text = await bodyText(s.page);
+      r.check('a 200 shows every service green', list.length === 3 && list.every(c => c.green), colours(list));
+
+      await refresh('proxy502'); list = await cards(); text = await bodyText(s.page);
+      r.check('an API down behind the proxy (502) shows a message',
+              /Service health could not be read: The API is not responding/.test(text), text.slice(0, 300));
+      r.check('a failed health load removes the earlier green cards', list.length === 0, colours(list));
+      r.check('latency metrics load while the health call fails', metricsShown(text, 3), text.slice(0, 300));
+
+      await refresh('ok'); list = await cards(); text = await bodyText(s.page);
+      r.check('the next good health load clears the message and shows the cards',
+              !healthAlert(text) && list.length === 3 && list.every(c => c.green), healthAlert(text) || colours(list));
+
+      await refresh('refused'); list = await cards(); text = await bodyText(s.page);
+      r.check('an unreachable API shows a message',
+              /Service health could not be read: The API could not be reached/.test(text), text.slice(0, 300));
+      r.check('an unreachable API shows no service cards', list.length === 0, colours(list));
+      r.check('latency metrics load while the API is unreachable for health', metricsShown(text, 5), text.slice(0, 300));
+
+      await refresh('html503'); list = await cards(); text = await bodyText(s.page);
+      r.check('a 503 without a health body shows a message, not cards',
+              /Service health could not be read: HTTP 503/.test(text) && list.length === 0, text.slice(0, 300));
+      r.check('degraded and unreachable health cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')),
+              s.errors.filter(e => e.startsWith('pageerror:')).slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
   }
 
   // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
