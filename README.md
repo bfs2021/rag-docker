@@ -118,7 +118,7 @@ A collection is a named vector index that holds chunks from one or more document
 
 Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically.
 
-Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents.
+Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
 Supported chunking strategies:
 

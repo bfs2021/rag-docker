@@ -558,6 +558,17 @@ most 512 MB decompressed, nothing decompressed written to disk). Each line becom
 as described in §5.1; chunks have `source_type` `jsonl`, and the retained original is the file
 as uploaded.
 
+**macOS metadata in ZIPs (#378).** A ZIP made with the macOS Finder holds, beside each file, an
+AppleDouble file with its resource fork and extended attributes, `__MACOSX/<folder>/._<name>`,
+which keeps the file's suffix; other macOS tools write `._<name>` beside the file. These are not
+documents. A ZIP member whose logical name (below) has `__MACOSX` as its first folder, or whose
+file name starts with `._`, is not queued, whatever its suffix, and is listed in the job's
+`skipped` as `<zip filename>:<member path> (macOS metadata (AppleDouble), not a document)`, not
+left out silently. The match is exact and case-sensitive, so names that only contain these
+strings (`_report.txt`, `notes._v2.txt`, `.hidden.txt`, `__MACOSX_notes.txt`,
+`docs/__MACOSX/readme.txt`) are queued as usual. Such members are still validated like any
+member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPPORTED_FILES`.
+
 **Logical names and re-ingesting (#22).** Every file is stored under a logical name: the
 `source_file` of its chunks and the filename in its retained-source index entry.
 
@@ -638,7 +649,8 @@ three counts change in one update (#324). Job records written before
 these two fields existed read back with both `null`, not `0`, which would be untrue (#302).
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
-ingested, each with its reason: an unsupported type, or a later input with the same name.
+ingested, each with its reason: an unsupported type, macOS metadata in a ZIP (#378), or a
+later input with the same name.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -1647,7 +1659,7 @@ Flat (KNN) index has no tunable parameters.
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -2454,6 +2466,14 @@ now lives once, in `api/services/ingest_config.py`.
       against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
       archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
       `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
+- [x] A ZIP's macOS metadata (`__MACOSX/` members and `._*` AppleDouble files) is not ingested and is listed in `skipped` with its reason; names that only look like it are ingested (#378).
+      *A Finder ZIP's `__MACOSX/._report.pdf` kept `.pdf` and was queued as a document of
+      its own. `test_reingest.py` covers a Finder-style ZIP (only the file queued, the
+      AppleDouble member in `skipped`), a `._*` file beside its file, other `__MACOSX/`
+      members whatever their suffix, look-alike names that are still queued, and a ZIP of
+      only metadata refused with `NO_SUPPORTED_FILES`. `02_ingest.sh` ingests a Finder-style
+      ZIP through the proxy: the job completes with no errors, stores only the file's
+      chunks and lists the AppleDouble member in `skipped`.*
 - [x] Two ingest jobs that replace one logical name in one collection run one at a time: afterwards exactly one job's version is stored, whole (its full chunk set, its `chunks_replaced` equal to the other job's `chunks_stored`, one retained digest naming the name, the winner's); which job runs last is not promised (#22).
       *`02_ingest.sh` sends two uploads of one name, with different content, at once
       through the proxy and checks that both jobs complete, exactly one version's text is
