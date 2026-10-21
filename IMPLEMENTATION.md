@@ -667,6 +667,14 @@ def collection_deleting_error(name: str) -> JSONResponse:
     from services.collection_writes import deleting_message
     return api_error(409, "COLLECTION_DELETING", deleting_message(name),
                      detail={"collection": name})
+
+
+def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
+    """A request refused because Weaviate couldn't say whether its collection exists (#366)."""
+    return api_error(503, "SERVICE_UNAVAILABLE",
+                     f"Cannot check whether '{name}' exists: Weaviate could not be read. "
+                     f"{outcome}; try again when Weaviate is available.",
+                     detail={"collection": name})
 ```
 
 ### api/config.py
@@ -4464,6 +4472,8 @@ from __future__ import annotations
 from services import telemetry
 import time
 
+import httpx
+
 from models.schemas import QueryRequest
 from services import ollama_client as ollama
 from services import weaviate_client as wc
@@ -4488,6 +4498,30 @@ SYNTHESIS_ENGINEER_SYSTEM = (
     "based on how directly the context addresses the question. "
     "If the context is insufficient, state this explicitly."
 )
+
+
+class ServiceUnavailable(Exception):
+    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+
+    def __init__(self, service: str):
+        super().__init__(f"{service} failed during the query")
+        self.service = service
+
+
+async def _from_ollama(call):
+    """Await an Ollama call; a connect error, timeout or error status is ServiceUnavailable."""
+    try:
+        return await call
+    except httpx.HTTPError as exc:
+        raise ServiceUnavailable("Ollama") from exc
+
+
+async def _from_weaviate(call):
+    """Await a Weaviate query; any error from it is ServiceUnavailable."""
+    try:
+        return await call
+    except Exception as exc:                          # noqa: BLE001
+        raise ServiceUnavailable("Weaviate") from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -4520,28 +4554,31 @@ async def run_query(
     retrieval_mode, top_k, alpha, response_format = (
         config.retrieval_mode, config.top_k, config.alpha, config.response_format)
     with telemetry.span("rag.reformulate"):
-        reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
+        reformulated = await _from_ollama(
+            ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}"))
         reformulated = reformulated.strip()
 
     t0 = time.monotonic()
     with telemetry.span("rag.retrieval"):
         if retrieval_mode in ("hnsw", "flat"):
-            vector = await ollama.embed(reformulated)
-            chunks = await wc.near_vector_query(collection, vector, top_k)
+            vector = await _from_ollama(ollama.embed(reformulated))
+            chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
         elif retrieval_mode == "hybrid":
-            chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
+            chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
         elif retrieval_mode == "semantic":
-            chunks = await wc.near_text_query(collection, reformulated, top_k)
+            chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
     with telemetry.span("rag.synthesis"):
         if response_format == "engineer":
             context = _build_context_engineer(chunks)
-            answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+            answer = await _from_ollama(ollama.chat(
+                SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}"))
         else:
             context = _build_context_end_user(chunks)
-            answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+            answer = await _from_ollama(ollama.chat(
+                SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}"))
     llm_ms = int((time.monotonic() - t1) * 1000)
 
     citations = None
@@ -4620,6 +4657,7 @@ import json
 import logging
 import copy
 import os
+import stat
 import tempfile
 import threading
 
@@ -4823,7 +4861,7 @@ def _replace_durably(path: Path, payload: str) -> None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
-                log.exception("Could not remove owned session temporary file %s", temporary.name)
+                log.exception("Could not remove owned temporary file %s", temporary.name)
 
 
 def _save_session_sync(session: dict) -> None:
@@ -5616,10 +5654,57 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     return None
 
 
+# Exports have their own folder so that a caller-chosen name can never reach the
+# registry, the metrics file or the session store beside them (#370).
+EXPORT_DIRNAME = "goldstandard_exports"
+_EXPORT_NAME_MAX = 128
+_EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9_. -]{1,%d}" % _EXPORT_NAME_MAX)
+
+
+def export_path(filename) -> Path:
+    """The path of export `filename`, or INVALID_PATH when the name breaks the rule."""
+    if (not isinstance(filename, str) or not _EXPORT_NAME_RE.fullmatch(filename)
+            or not filename.lower().endswith(".json")):
+        raise GoldStandardError(
+            "INVALID_PATH",
+            "Invalid filename. Use 1-128 ASCII letters, digits, '_', '-', '.' or spaces, "
+            "ending in .json, with no path.", 400)
+    return Path(settings.upload_dir).resolve() / EXPORT_DIRNAME / filename
+
+
+def export_entry_is_other(path: Path) -> bool:
+    """True when something other than a regular file (a directory, a link) has the name."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    return not stat.S_ISREG(mode)
+
+
+def export_folder_exists(folder: Path) -> bool:
+    """False when the exports folder is missing; True when it is a directory.
+
+    Anything else with its name (a file saved as `goldstandard_exports` before #370,
+    a symbolic link) is refused rather than followed or failed on (#402).
+    """
+    try:
+        mode = os.lstat(folder).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(mode):
+        raise GoldStandardError(
+            "EXPORTS_FOLDER_INVALID",
+            f"'{EXPORT_DIRNAME}' in the upload folder is not a directory (a file or a "
+            "link has its name). Move or rename it, then retry.", 409)
+    return True
+
+
 # Published cache snapshots are immutable. Export captures one stable reference
 # and never mutates or exposes it; later commits publish a different object.
+# The export goes to a new temporary file that replaces the name, so a link at
+# the name is replaced rather than followed, and no reader sees half a file (#402).
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
-    out_path.write_text(json.dumps(ragas, indent=2))
+    _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
@@ -5646,15 +5731,17 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if not filename:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe = re.sub(r"[^a-zA-Z0-9_]", "", collection.replace(" ", "_"))
-        filename = f"{safe}_{ts}.json"
+        suffix = f"_{ts}.json"
+        filename = safe[:_EXPORT_NAME_MAX - len(suffix)] + suffix
 
-    # Sanitize: only the basename; no path traversal
-    filename = Path(filename).name
-    out_dir = Path(settings.upload_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / filename).resolve()
-    if not str(out_path).startswith(str(out_dir) + "/"):
-        raise ValueError("Invalid filename.")
+    # The name is checked as given; a path is refused, not stripped (#370).
+    out_path = export_path(filename)
+    if not export_folder_exists(out_path.parent):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        export_folder_exists(out_path.parent)
+    if export_entry_is_other(out_path):
+        raise GoldStandardError(
+            "INVALID_PATH", f"'{filename}' is not an export file.", 400)
 
     ragas = [
         {
@@ -5699,7 +5786,7 @@ import shutil
 import tarfile
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
 from pydantic import ValidationError
@@ -6283,10 +6370,39 @@ def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     return pkg, manifest
 
 
+def _contained_file_key(root: Path, rel: str) -> bool:
+    """True when a manifest `files` key names a file inside the package.
+
+    The manifest is untrusted: an absolute key, a `..` key or a key through a
+    link would otherwise make check 3 hash a file outside the package and
+    report its digest (#371). `root` is the resolved package directory.
+    """
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        return False
+    if PurePosixPath(rel).as_posix() != rel:
+        return False
+    try:
+        target = (root / rel).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return root in target.parents
+
+
 @telemetry.traced("rag.validate")
 def verify_digests(pkg: Path, manifest: dict) -> None:
-    """Check 3 of spec §6.2. Names the first file that fails."""
-    for rel, expected in sorted(manifest.get("files", {}).items()):
+    """Check 3 of spec §6.2. Names the first file that fails.
+
+    Every key is checked to be inside the package before anything is hashed.
+    """
+    files = manifest.get("files", {})
+    root = pkg.resolve()
+    if not all(_contained_file_key(root, rel) for rel in files):
+        raise PackageError(
+            "PACKAGE_CORRUPT",
+            "The manifest lists a file outside the package; the package is damaged "
+            "or was modified after export.",
+            {"file": "manifest.json"})
+    for rel, expected in sorted(files.items()):
         target = pkg / rel
         if not target.is_file():
             raise PackageError("PACKAGE_CORRUPT",
@@ -8801,6 +8917,12 @@ async def transfer_help():
         markdown = packager.render_help(dimensions)
     except RuntimeError as exc:
         return api_error(500, "HELP_RENDER_FAILED", str(exc))
+    except OSError:
+        # A template file missing or unreadable. Its path is logged, not sent (#373).
+        _log.exception("Could not read a help template")
+        return api_error(500, "HELP_RENDER_FAILED",
+                         "The help page could not be rendered: a help template file "
+                         "could not be read.")
     return HelpResponse(topic="transfer", markdown=markdown)
 ```
 
@@ -8810,6 +8932,7 @@ async def transfer_help():
 from __future__ import annotations
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8824,9 +8947,10 @@ from models.schemas import (
 )
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/collections")
+_log = logging.getLogger(__name__)
 
 _REGISTRY_FILE: Path | None = None
 _registry_lock = asyncio.Lock()
@@ -8857,7 +8981,14 @@ def _save_registry(reg: dict) -> None:
 
 @router.get("", response_model=CollectionsResponse)
 async def list_collections():
-    raw = await wc.get_collections()
+    try:
+        raw = await wc.get_collections()
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be read; the cause is logged, not sent (#373).
+        _log.exception("Could not list the collections")
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         "Cannot list the collections: Weaviate could not be read. "
+                         "Try again when Weaviate is available.")
     registry = await asyncio.to_thread(_load_registry)
     items = [
         CollectionInfo(
@@ -8875,7 +9006,13 @@ async def list_collections():
 
 @router.post("", status_code=201)
 async def create_collection(body: CreateCollectionRequest):
-    if await wc.collection_exists(body.name):
+    try:
+        exists = await wc.collection_exists(body.name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists before creating it", body.name)
+        return collection_check_unavailable(body.name, "No collection was created")
+    if exists:
         return api_error(409, "COLLECTION_EXISTS", f"Collection '{body.name}' already exists.")
 
     try:
@@ -8885,8 +9022,10 @@ async def create_collection(body: CreateCollectionRequest):
             distance_metric=body.distance_metric,
             hnsw_config=body.hnsw_config.model_dump(),
         )
-    except Exception as exc:
-        return api_error(500, "CREATE_FAILED", "Failed to create collection.", str(exc))
+    except Exception:                                 # noqa: BLE001
+        # The cause is logged, not sent (#373).
+        _log.exception("Could not create collection %r", body.name)
+        return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
@@ -8923,7 +9062,13 @@ async def delete_collection(name: str, confirm: str | None = None):
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":
         return api_error(400, "CONFIRMATION_REQUIRED", "Add ?confirm=true to confirm deletion.")
-    if not await wc.collection_exists(name):
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists before deleting it", name)
+        return collection_check_unavailable(name, "Nothing was deleted")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
 
     try:
@@ -8933,8 +9078,10 @@ async def delete_collection(name: str, confirm: str | None = None):
         count = await wc.delete_collection_when_idle(name)
     except CollectionInUseError as exc:
         return _busy_error(name, exc.jobs)
-    except Exception as exc:
-        return api_error(500, "DELETE_FAILED", "Failed to delete collection.", str(exc))
+    except Exception:                                 # noqa: BLE001
+        # The cause is logged, not sent (#373).
+        _log.exception("Could not delete collection %r", name)
+        return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
@@ -8963,7 +9110,7 @@ from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
-from utils import api_error, collection_deleting_error
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -9007,7 +9154,13 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
-    if not await wc.collection_exists(collection):
+    try:
+        exists = await wc.collection_exists(collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an ingest upload", collection)
+        return collection_check_unavailable(collection, "No job was started")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
 
     try:
@@ -9061,31 +9214,49 @@ async def save_ingest_config(body: SaveIngestConfigBody):
 ```python
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter
 
 from models.schemas import QueryRequest, QueryResponse
 from services import metrics
 from services import rag_pipeline
 from services import weaviate_client as wc
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/query")
+_log = logging.getLogger(__name__)
 
 
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for a query", body.collection)
+        return collection_check_unavailable(body.collection, "No query was run")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await rag_pipeline.run_query(
-        question=body.question,
-        collection=body.collection,
-        retrieval_mode=body.retrieval_mode,
-        top_k=body.top_k,
-        alpha=body.alpha,
-        include_citations=body.include_citations,
-        response_format=body.response_format,
-    )
+    try:
+        result = await rag_pipeline.run_query(
+            question=body.question,
+            collection=body.collection,
+            retrieval_mode=body.retrieval_mode,
+            top_k=body.top_k,
+            alpha=body.alpha,
+            include_citations=body.include_citations,
+            response_format=body.response_format,
+        )
+    except rag_pipeline.ServiceUnavailable as exc:
+        # The cause is logged, not sent (#373).
+        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
+        return api_error(503, "SERVICE_UNAVAILABLE",
+                         f"The question was not answered: {exc.service} could not be reached, "
+                         f"timed out or returned an error. Try again when {exc.service} "
+                         f"is available.",
+                         detail={"collection": body.collection})
 
     await metrics.record(
         collection=body.collection,
@@ -9142,6 +9313,7 @@ job-polling shape so both live behind one prefix-free router.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -9159,14 +9331,21 @@ from models.schemas import (
 from services import exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
-from utils import api_error, collection_deleting_error
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an export", body.collection)
+        return collection_check_unavailable(body.collection, "No job was started")
+    if not exists:
         # Checked before a job exists, so a typo does not leave a failed job
         # lying around for the user to interpret.
         return api_error(404, "COLLECTION_NOT_FOUND",
@@ -9412,12 +9591,11 @@ async def tune_options(collection: str):
 ```python
 from __future__ import annotations
 import asyncio
-from pathlib import Path
+import logging
 
 from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
-from config import settings
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -9431,14 +9609,22 @@ from models.schemas import (
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
-from utils import api_error
+from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/goldstandard")
+_log = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
 async def generate(body: GenerateRequest):
-    if not await wc.collection_exists(body.collection):
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for a gold-standard generation",
+                       body.collection)
+        return collection_check_unavailable(body.collection, "No generation was started")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
     try:
@@ -9514,11 +9700,15 @@ async def save(body: SaveRequest):
 
 @router.get("/download/{filename}")
 async def download(filename: str):
-    base = Path(settings.upload_dir).resolve()
-    target = (base / filename).resolve()
-    if not str(target).startswith(str(base) + "/"):
-        return api_error(400, "INVALID_PATH", "Invalid filename.")
-    if not target.exists():
+    # Only files in the exports folder are served, never other upload state (#370).
+    try:
+        target = gs.export_path(filename)
+        gs.export_folder_exists(target.parent)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
+    if gs.export_entry_is_other(target):
+        return api_error(400, "INVALID_PATH", f"'{filename}' is not an export file.")
+    if not target.is_file():
         return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
     return FileResponse(
         path=str(target),
@@ -9564,7 +9754,11 @@ async def latency_summary(
 from __future__ import annotations
 import asyncio
 import json
+import logging
+import os
 import statistics
+import tempfile
+import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9574,7 +9768,21 @@ from config import settings
 MAX_RECORDS = 500
 _ring: deque[dict] = deque(maxlen=MAX_RECORDS)
 
+# metrics.jsonl is bounded (#374): once an append brings it to COMPACT_AT lines it
+# is compacted to its last MAX_RECORDS records, and startup reads at most its last
+# _TAIL_BYTES, which hold far more than MAX_RECORDS records.
+COMPACT_AT = 2 * MAX_RECORDS
+_TAIL_BYTES = 1024 * 1024
+_TMP_PREFIX = ".metrics.jsonl."
+_TMP_SUFFIX = ".tmp"
+
 _METRICS_FILE = None
+# Appends and compactions run in worker threads, one per query; the lock keeps
+# an append from landing in a file that is being replaced.
+_file_lock = threading.Lock()
+_file_lines = 0         # lines in the file since the last load or compaction
+
+_log = logging.getLogger(__name__)
 
 
 def _metrics_path() -> Path:
@@ -9586,21 +9794,97 @@ def _metrics_path() -> Path:
     return _METRICS_FILE
 
 
-def load_from_disk() -> None:
-    p = _metrics_path()
-    if not p.exists():
-        return
-    lines = p.read_text().splitlines()
-    for line in lines[-MAX_RECORDS:]:
+def _read_tail(path: Path) -> tuple[list[str], bool]:
+    """The last MAX_RECORDS valid lines of `path`, read from at most its last
+    _TAIL_BYTES, and whether they are all the file holds."""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        start = max(0, size - _TAIL_BYTES)
+        f.seek(start)
+        data = f.read(_TAIL_BYTES)
+    if start:
+        # The read began inside a line: drop that partial line.
+        data = data[data.find(b"\n") + 1:] if b"\n" in data else b""
+    lines, extra = [], start > 0
+    for raw in data.split(b"\n"):
+        if not raw.strip():
+            continue
         try:
-            _ring.append(json.loads(line))
-        except Exception:
+            line = raw.decode("utf-8")
+            json.loads(line)
+        except ValueError:
+            extra = True                    # not a record: compacted away
+            continue
+        lines.append(line)
+    if len(lines) > MAX_RECORDS:
+        lines, extra = lines[-MAX_RECORDS:], True
+    return lines, not extra
+
+
+def _compact_locked(path: Path, lines: list[str]) -> None:
+    """Atomically replace `path` with `lines`. Raises on failure, leaving the old
+    file whole and no temporary file. Call with _file_lock held."""
+    global _file_lines
+    fd, tmp = tempfile.mkstemp(prefix=_TMP_PREFIX, suffix=_TMP_SUFFIX, dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write("".join(line + "\n" for line in lines))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
             pass
+        raise
+    _file_lines = len(lines)
+
+
+def load_from_disk() -> None:
+    """Load the last MAX_RECORDS records into the ring. Never raises: a metrics
+    file that can't be read or compacted must not stop the API starting."""
+    global _file_lines
+    with _file_lock:
+        try:
+            p = _metrics_path()
+            for leftover in p.parent.glob(_TMP_PREFIX + "*" + _TMP_SUFFIX):
+                # A compaction interrupted by a crash; metrics.jsonl is whole.
+                leftover.unlink(missing_ok=True)
+            if not p.exists():
+                return
+            lines, whole = _read_tail(p)
+        except Exception:                                 # noqa: BLE001
+            _log.exception("Could not load the query metrics from %s", _METRICS_FILE)
+            return
+        for line in lines:
+            _ring.append(json.loads(line))
+        _file_lines = len(lines)
+        if not whole:
+            try:
+                _compact_locked(p, lines)
+            except Exception:                             # noqa: BLE001
+                _log.exception("Could not compact %s; it is tried again after later queries", p)
 
 
 def _append_sync(line: str) -> None:
-    with open(_metrics_path(), "a") as f:
-        f.write(line + "\n")
+    global _file_lines
+    with _file_lock:
+        p = _metrics_path()
+        with open(p, "a+b") as f:
+            payload = line.encode("utf-8") + b"\n"
+            if f.seek(0, os.SEEK_END):
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    # An earlier write stopped part-way: start a line of our own.
+                    payload = b"\n" + payload
+            f.write(payload)
+        _file_lines += 1
+        if _file_lines >= COMPACT_AT:
+            try:
+                _compact_locked(p, _read_tail(p)[0])
+            except Exception:                             # noqa: BLE001
+                _log.exception("Could not compact %s; it is tried again after the next query", p)
 
 
 async def record(
@@ -9610,6 +9894,8 @@ async def record(
     llm_ms: int,
     chunks_retrieved: int,
 ) -> None:
+    """Add a query's record to the ring and append it to metrics.jsonl. Never
+    raises: the query has its answer, and a failed write must not lose it (#374)."""
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "collection": collection,
@@ -9620,7 +9906,11 @@ async def record(
         "chunks_retrieved": chunks_retrieved,
     }
     _ring.append(entry)
-    await asyncio.to_thread(_append_sync, json.dumps(entry))
+    try:
+        await asyncio.to_thread(_append_sync, json.dumps(entry))
+    except Exception:                                     # noqa: BLE001
+        _log.warning("Could not write the query metrics record for %r to %s; "
+                     "the answer is still returned", collection, _METRICS_FILE, exc_info=True)
 
 
 def _percentile(data: list[float], p: int) -> float:
@@ -10143,10 +10433,13 @@ alone.
 
 ```python
 from __future__ import annotations
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10225,6 +10518,35 @@ async def request_validation_error(request, exc):
     return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
 from services.telemetry import RequestTracing
+
+_log = logging.getLogger(__name__)
+
+# Routing errors answer in the envelope like every other error (#373). Other
+# statuses (FastAPI's 400 for an unparsable body) keep FastAPI's own answer.
+_ROUTING_ERRORS = {
+    404: ("NOT_FOUND", "No API route matches this path."),
+    405: ("METHOD_NOT_ALLOWED", "This API route does not accept this method."),
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def routing_error(request, exc):
+    if exc.status_code not in _ROUTING_ERRORS:
+        return await http_exception_handler(request, exc)
+    code, message = _ROUTING_ERRORS[exc.status_code]
+    response = api_error(exc.status_code, code, message)
+    response.headers.update(exc.headers or {})  # a 405 keeps its Allow header
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request, exc):
+    # The cause is logged, not sent (#373). Starlette re-raises the exception
+    # after this response is sent, so the server logs its traceback as well.
+    _log.error("Unhandled error on %s %s: %s: %s", request.method, request.url.path,
+               type(exc).__name__, exc)
+    return api_error(500, "INTERNAL_ERROR",
+                     "The API hit an unexpected error. The cause is in the API log.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -10759,6 +11081,34 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   return data as T
 }
 
+function isHealthResult(data: any): data is HealthResult {
+  const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+}
+
+// GET /health answers 503 with the same per-service body when a dependency is
+// down. request() throws on any non-2xx, so the Health page never saw which
+// service failed and could not show it red (#375). This call accepts a 503
+// that carries that body; every other error is thrown as request() would.
+async function getHealthResult(): Promise<HealthResult> {
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/health`)
+  } catch {
+    // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
+    throw new Error('The API could not be reached. Check that the stack is running.')
+  }
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if ((res.ok || res.status === 503) && isHealthResult(data)) return data
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
+  return data as HealthResult
+}
+
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
@@ -10794,7 +11144,7 @@ export const api = {
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
   getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
-  getHealth: () => request<HealthResult>('GET', '/health'),
+  getHealth: () => getHealthResult(),
 }
 
 // Types
@@ -12616,6 +12966,7 @@ import LatencyCharts from '../components/LatencyCharts'
 export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
+  const [healthError, setHealthError] = useState<string | null>(null)
 
   const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
   const [diagnosticError, setDiagnosticError] = useState(false)
@@ -12623,7 +12974,7 @@ export default function HealthPage() {
   const [diagnosticPending, setDiagnosticPending] = useState(true)
   const diagnosticTicket = useRef(0)
 
-  async function load() {
+  function load() {
     const ticket = ++diagnosticTicket.current
     setDiagnosticPending(true)
     api.getSessionDiagnostics().then(result => {
@@ -12635,11 +12986,14 @@ export default function HealthPage() {
     }).finally(() => {
       if (ticket === diagnosticTicket.current) setDiagnosticPending(false)
     })
-    try {
-      const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
-      setHealth(h)
-      setMetrics(m)
-    } catch { /* ignore */ }
+    // Health and metrics load separately: a degraded or unreachable API must not
+    // stop the latency charts, and no stale green cards stay up (#375).
+    api.getHealth().then(h => {
+      setHealth(h); setHealthError(null)
+    }).catch(e => {
+      setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
+    })
+    api.getMetrics().then(setMetrics).catch(() => { /* keep the last metrics shown */ })
   }
 
   useEffect(() => {
@@ -12663,6 +13017,7 @@ export default function HealthPage() {
         <h2 className="font-semibold">{diagnosticPending ? "Previous evaluation session recovery results — refresh pending" : "Evaluation session recovery needs attention"}</h2>
         {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
       </div>}
+      {healthError && <p role="alert" className="text-red-700 mb-4">Service health could not be read: {healthError}</p>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">
@@ -13143,6 +13498,14 @@ also when the connection itself fails and for a re-embed with chunking parameter
 route, while a re-embed without them still starts. A Weaviate error checking that the
 collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
 answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
+The same existence check in `POST /query`, `POST /goldstandard/generate`, `POST /collections`,
+`DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, naming the collection, with the cause logged, not
+sent, and nothing run, created or saved; a collection Weaviate reports missing is still 404
+`COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
+create (#366).
+Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
+the JSON 503 reaches the client (#369).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
@@ -13249,13 +13612,17 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E31; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -13280,6 +13647,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 `session_validity.py` inside the disposable API, using an owned real collection,
 synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
 It checks warning metadata, actual deletion marking and explicit historical export.
+It then runs `../tests/test_goldstandard_exports.py` in the API container and checks
+through the proxy that download refuses other upload state with 400 (#370).
 
 ## Environment
 
@@ -13407,6 +13776,41 @@ writes and complement the live settings suite.
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
+Suite 01 also runs `scripts/tests/test_error_envelope.py` in the built API image with
+`--network none` and the repository mounted read-only (#373). It sends each request through
+the app with Weaviate and Ollama mocked, and checks that an unknown route answers 404
+`NOT_FOUND`, a wrong method 405 `METHOD_NOT_ALLOWED` with its `Allow` header and an unhandled
+error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, and `POST /query` when an Ollama call (connect
+error, timeout or error status) or a Weaviate query fails after the existence check, with no
+metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
+`CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
+client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
+from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
+`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
+names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+service red and the others green, that a proxy 502, a refused connection and a 503 without a
+health body each show "Service health could not be read:" with the reason and remove the
+earlier cards, that the next good load clears it, and that the latency metrics load on every
+refresh whatever health answers.
+
+Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
+`--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
+It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
+app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
+record can't be written (an unusable file, a full volume), with the failure logged; that a
+line left unfinished by a failed write doesn't cost the next record; that `metrics.jsonl`
+never holds more than 1,000 lines and keeps the newest records; that a compaction whose
+temporary write or replace fails leaves the old file whole and no temporary file, and is
+tried again; that 1,100 concurrent records all land; and that a restart restores the last 500
+records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
+files a crash left, and starts when the file can't be read or compacted. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
@@ -15009,6 +15413,13 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
+check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# /health's 503 body for a missing model or an unreachable dependency, which the
+# Health page reads to show the failing services (#375).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
+check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -16262,6 +16673,7 @@ print('PASS owned synthetic collections/config/files removed',flush=True)
 #!/usr/bin/env bash
 # SPECIFICATIONS.md §10.2 — Query
 cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
@@ -16270,6 +16682,10 @@ check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
+# A failed metrics write never fails a query, and metrics.jsonl is bounded (#374):
+# controlled, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
+check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -16736,6 +17152,16 @@ check "exported file is valid JSON in the RAGAS schema" $?
 code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
+# A caller-chosen name reaches only the exports folder (#370).
+for name in metrics.jsonl . .. goldstandard_sessions; do
+  api_post "/goldstandard/save" "{\"session_id\":\"$SID\",\"filename\":\"$name\"}" > /tmp/vfy_badsave.json
+  check_eq "save as '$name' is refused with INVALID_PATH" \
+    "$(jfield "['error']['code']" < /tmp/vfy_badsave.json)" "INVALID_PATH"
+done
+code=$(api_post_code "/goldstandard/save" "{\"session_id\":\"$SID\",\"filename\":\"collection_registry.json\"}")
+check_eq "save as 'collection_registry.json' writes an export" "$code" "200"
+check_eq "collections still list after that save" "$(api_code "$API/collections")" "200"
+
 # ── sessions survive a restart ───────────────────────────────────────────────
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
@@ -16825,6 +17251,17 @@ require_stack
 section "Retained evaluation validity and historical export"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_validity.py)
 check "legacy defaults, real stale/orphan markers, export guard and historical file" $?
+
+section "Gold-standard export files (#370)"
+# Controlled: save and download reach only UPLOAD_DIR/goldstandard_exports; bad
+# names get 400 INVALID_PATH and touch nothing.
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_exports.py)
+check "export names, folder, overwrite and refusals" $?
+# Through the proxy: other upload state is never served.
+for name in metrics.jsonl goldstandard_sessions report.txt; do
+  check_eq "download of '$name' is refused with 400" "$(api_code "$API/goldstandard/download/$name")" "400"
+done
+check_eq "download of a valid unknown name is 404" "$(api_code "$API/goldstandard/download/definitely_not_here.json")" "404"
 summary
 ```
 
@@ -16832,7 +17269,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E32)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E33)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -17276,6 +17713,58 @@ for mode in abs trav mismatch; do
   rm -f "$EXPORTS/$P"
 done
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# ── manifest files keys never hash outside the package (E33, #371) ──────────
+# An otherwise valid package lists the outside sentinel in manifest.json's
+# files map, by absolute path and by ../ path, with its real digest and with a
+# wrong one. Import must refuse it naming manifest.json, never report the
+# sentinel's digest, and create no collection.
+E371_HEX=$(python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$E29_TEXT")
+make_files_pkg() {   # make_files_pkg <abs|trav> <real|wrong> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$3" "$E29_SENT" "$E371_HEX" <<'ENDPY'
+import json, pathlib, sys, tarfile, tempfile
+src, mode, dig, suffix, sent, hexd = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    key = sent if mode == "abs" else "../" * 12 + sent.lstrip("/")
+    manifest["files"][key] = "sha256:" + (hexd if dig == "real" else "0" * 64)
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+}
+for mode in abs trav; do
+  for dig in wrong real; do
+    names_before=$(collection_names)
+    P=$(make_files_pkg "$mode" "$dig" "files$mode$dig")
+    run_import "$P" rename
+    check_eq "E33: a $mode manifest files key ($dig digest) is refused as PACKAGE_CORRUPT" \
+      "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+    check_eq "E33: ... naming manifest.json ($mode, $dig)" \
+      "$(jfield "['error_detail']" < /tmp/vfy_e29job.json)" "{'file': 'manifest.json'}"
+    python3 -c "
+import json,sys; d=json.dumps(json.load(open('/tmp/vfy_e29job.json')))
+sys.exit(1 if '$E371_HEX' in d or '$E29_SENT' in d else 0)"
+    check "E33: ... with no outside digest or path in the job ($mode, $dig)" $?
+    read -r fstat fname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+    names_after=$(collection_names)
+    [ "$fstat" = "completed" ] && [ "$fname" != "-" ] && drop_collection "$fname"
+    check_eq "E33: ... and creates no collection ($mode, $dig)" "$names_after" "$names_before"
+    rm -f "$EXPORTS/$P"
+  done
+done
 
 # The valid in-directory source still round-trips after the refusals.
 api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
@@ -19518,6 +20007,101 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── degraded and unreachable health (#375) ─────────────────────────────────
+  // /health answers 503 with its per-service body when a dependency is down. The
+  // page must show that body, red for the failing service, keep loading the
+  // latency metrics, and say so when health can't be read at all. Each load is
+  // driven by hand through the captured 30s refresh, with the answers stubbed.
+  r.section('degraded and unreachable health (#375)');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45002; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
+    const healthBody = (status, embed) => ({
+      status,
+      services: {
+        weaviate: service('ok', 11),
+        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+      },
+      resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
+    });
+    const proxyPage = code => `<html><head><title>${code}</title></head><body><center><h1>${code}</h1></center><hr><center>nginx</center></body></html>`;
+    const metricsBody = n => ({
+      total_records: n,
+      retrieval_latency: { p50: 10, p95: 20, p99: 30 },
+      llm_latency: { p50: 100, p95: 200, p99: 300 },
+      total_latency: { p50: 110, p95: 220, p99: 330 },
+      history: Array.from({ length: n }, (_, i) => ({ timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString(), collection: 'OwnedFixture', retrieval_mode: 'hybrid', retrieval_ms: 10, llm_ms: 100, total_ms: 110 })),
+    });
+    let mode = 'degraded', loads = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/health') {
+        if (mode === 'refused') return request.abort('connectionrefused');
+        if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
+        if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });
+        const degraded = mode === 'degraded';
+        return request.respond({ status: degraded ? 503 : 200, contentType: 'application/json', body: JSON.stringify(healthBody(degraded ? 'degraded' : 'ok', degraded ? 'error' : 'ok')) });
+      }
+      if (path === '/api/metrics/latency') {
+        loads++;
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(metricsBody(loads)) });
+      }
+      return request.continue();
+    });
+    // Each service card's label and dot colour; the latency tiles have no dot.
+    const cards = () => s.page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')].map(dot => ({
+      label: (dot.parentElement.textContent || '').trim(),
+      red: dot.classList.contains('bg-red-500'), green: dot.classList.contains('bg-green-500'),
+    })));
+    const colours = list => list.map(c => `${c.label}=${c.red ? 'red' : c.green ? 'green' : '?'}`).join(', ');
+    const healthAlert = text => (text.match(/Service health could not be read:.{0,80}/) || [''])[0];
+    const refresh = async next => { mode = next; await s.page.evaluate(() => window.__ownedHealthRefresh()); await sleep(700); };
+    const metricsShown = (text, n) => text.includes(`Latency Trends (${n} queries in ring buffer)`);
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(700);
+      let text = await bodyText(s.page), list = await cards();
+      const by = label => list.find(c => c.label.startsWith(label)) || {};
+      r.check('a degraded 503 shows the failing service red', list.length === 3 && by('Embed').red, colours(list));
+      r.check('a degraded 503 shows the services that are ok green', by('Weaviate').green && by('LLM').green, colours(list));
+      r.check('a degraded 503 shows each service latency', ['11ms', '22ms', '33ms'].every(ms => text.includes(ms)), text.slice(0, 200));
+      r.check('a degraded 503 is not reported as unreadable', !healthAlert(text), healthAlert(text));
+      r.check('latency metrics load while health answers 503', metricsShown(text, 1), text.slice(0, 300));
+
+      await refresh('ok'); list = await cards(); text = await bodyText(s.page);
+      r.check('a 200 shows every service green', list.length === 3 && list.every(c => c.green), colours(list));
+
+      await refresh('proxy502'); list = await cards(); text = await bodyText(s.page);
+      r.check('an API down behind the proxy (502) shows a message',
+              /Service health could not be read: The API is not responding/.test(text), text.slice(0, 300));
+      r.check('a failed health load removes the earlier green cards', list.length === 0, colours(list));
+      r.check('latency metrics load while the health call fails', metricsShown(text, 3), text.slice(0, 300));
+
+      await refresh('ok'); list = await cards(); text = await bodyText(s.page);
+      r.check('the next good health load clears the message and shows the cards',
+              !healthAlert(text) && list.length === 3 && list.every(c => c.green), healthAlert(text) || colours(list));
+
+      await refresh('refused'); list = await cards(); text = await bodyText(s.page);
+      r.check('an unreachable API shows a message',
+              /Service health could not be read: The API could not be reached/.test(text), text.slice(0, 300));
+      r.check('an unreachable API shows no service cards', list.length === 0, colours(list));
+      r.check('latency metrics load while the API is unreachable for health', metricsShown(text, 5), text.slice(0, 300));
+
+      await refresh('html503'); list = await cards(); text = await bodyText(s.page);
+      r.check('a 503 without a health body shows a message, not cards',
+              /Service health could not be read: HTTP 503/.test(text) && list.length === 0, text.slice(0, 300));
+      r.check('degraded and unreachable health cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')),
+              s.errors.filter(e => e.startsWith('pageerror:')).slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
   r.section('session recovery diagnostics');
   for (const failure of [false, true]) {
@@ -20329,7 +20913,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 result=await task;self.assertEqual(result['pairs_saved'],1)
         asyncio.run(run())
-        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'snapshot.json').read_text())[0]['answer'],'Original')
         self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
 
     def test_scan_of_missing_storage_does_not_create_directory(self):
@@ -20404,7 +20988,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
         self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
-        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
+        self.assertFalse((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'owned-review.json').exists())
 
     def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
         async def run():
@@ -21025,7 +21609,7 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
         identities=[self.original['session_id']]+[s['session_id'] for s in imported];self.assertEqual(len(set(identities)),3);self.assertEqual(self.path.read_bytes(),before)
         for i,sid in enumerate(identities):
-            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/result['filename']).read_text())
+            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/result['filename']).read_text())
             self.assertEqual(rows[0]['answer'],'Newer human review' if i==0 else 'Original answer');self.assertEqual(set(rows[0]),{'question','answer','contexts','ground_truth'})
         gs._sessions={};gs.load_sessions_from_disk();self.assertEqual({gs.get_session(sid)['collection'] for sid in identities},{'OwnedOriginal','OwnedRenamedOne','OwnedRenamedTwo'})
 
@@ -23136,6 +23720,106 @@ class SourceIndexBoundaryTests(unittest.TestCase):
                           job["chunks_stored"]), ("completed", 1, 0, 1))
 
 
+class ManifestFilesBoundaryTests(unittest.TestCase):
+    """Check 3 never hashes a file outside the package (#371)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.package = self.root / "package"
+        self.package.mkdir()
+        chunks = b'{"id": "chunk"}\n'
+        (self.package / "chunks.jsonl").write_bytes(chunks)
+        self.chunks_digest = "sha256:" + hashlib.sha256(chunks).hexdigest()
+        self.outside = self.root / "outside.txt"
+        self.outside.write_bytes(b"controlled outside sentinel")
+        self.outside_hex = hashlib.sha256(self.outside.read_bytes()).hexdigest()
+        (self.package / "link").symlink_to(self.root, target_is_directory=True)
+
+    def manifest(self, key, digest):
+        return {"files": {"chunks.jsonl": self.chunks_digest, key: digest}}
+
+    def assert_refused(self, manifest):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, manifest)
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": "manifest.json"}))
+        self.assertNotIn(self.outside_hex, error.message + json.dumps(error.detail))
+        self.assertNotIn("outside.txt", error.message + json.dumps(error.detail))
+        hashed.assert_not_called()
+
+    def test_valid_contained_keys_pass_and_mismatch_is_unchanged(self):
+        (self.package / "sources").mkdir()
+        (self.package / "sources" / "blob").write_bytes(b"blob")
+        manifest = {"files": {"chunks.jsonl": self.chunks_digest,
+                              "sources/blob": "sha256:" + hashlib.sha256(b"blob").hexdigest()}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+        self.assertEqual(sorted(call.args[0] for call in hashed.call_args_list),
+                         [self.package / "chunks.jsonl", self.package / "sources" / "blob"])
+        wrong = "sha256:" + "0" * 64
+        with self.assertRaises(PackageError) as raised:
+            packager.verify_digests(self.package, {"files": {"chunks.jsonl": wrong}})
+        self.assertEqual((raised.exception.code, raised.exception.detail), (
+            "PACKAGE_CORRUPT",
+            {"file": "chunks.jsonl", "expected": wrong, "actual": self.chunks_digest}))
+
+    def test_outside_keys_are_refused_before_hashing(self):
+        keys = (str(self.outside), "../outside.txt", "a/../../outside.txt", "link/outside.txt",
+                "link")
+        for key in keys:
+            for digest in ("sha256:" + self.outside_hex, "sha256:" + "0" * 64):
+                with self.subTest(key=key, digest=digest):
+                    self.assert_refused(self.manifest(key, digest))
+
+    def test_non_normalised_keys_are_refused(self):
+        for key in ("", ".", "./chunks.jsonl", "a//b", "chunks.jsonl/", "a/./b",
+                    "chunks.jsonl\x00"):
+            with self.subTest(key=key):
+                self.assert_refused(self.manifest(key, self.chunks_digest))
+
+    def assert_missing(self, key):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, self.manifest(key, "sha256:" + "0" * 64))
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": key}))
+        self.assertIn("listed in the manifest but missing", error.message)
+        self.assertNotIn(self.package / key, [call.args[0] for call in hashed.call_args_list])
+
+    def test_listed_missing_and_directory_keys_are_refused_as_missing(self):
+        # Both keys pass the containment check, so they are refused naming the key
+        # itself, not manifest.json, and never hashed.
+        (self.package / "sources").mkdir()
+        for key in ("sources/missing", "sources"):
+            with self.subTest(key=key):
+                self.assert_missing(key)
+
+    def test_import_job_reports_no_outside_digest_and_touches_nothing(self):
+        for key in (str(self.outside), "../outside.txt"):
+            with self.subTest(key=key):
+                job = {"status": "queued"}
+                validate, check_embedding, ensure_models, backend = Mock(), Mock(), Mock(), Mock()
+                with patch.object(settings, "upload_dir", str(self.root)), \
+                     patch.object(importer, "_jobs", {"owned": job}), \
+                     patch.object(importer, "_active", {"owned.tar.gz"}), \
+                     patch.object(importer.packager, "exports_dir", return_value=self.root), \
+                     patch.object(importer.packager, "open_package", return_value=(
+                         self.package, self.manifest(key, "sha256:" + "0" * 64))), \
+                     patch.object(importer, "_validate_package_sources", validate), \
+                     patch.object(importer, "_check_embedding", check_embedding), \
+                     patch.object(importer, "_ensure_models", ensure_models), \
+                     patch.object(importer.wc, "get_client", backend):
+                    importer._run("owned", "owned.tar.gz", "replace")
+                self.assertEqual((job["status"], job["error_code"], job["error_detail"]),
+                                 ("failed", "PACKAGE_CORRUPT", {"file": "manifest.json"}))
+                self.assertNotIn(self.outside_hex, json.dumps(job))
+                for seam in (validate, check_embedding, ensure_models, backend):
+                    seam.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -23966,6 +24650,8 @@ import math
 import os
 from pathlib import Path
 import re
+import ssl
+import stat
 import threading
 import time
 from urllib.parse import urlsplit
@@ -23973,6 +24659,28 @@ from urllib.parse import urlsplit
 
 class TelemetryConfigError(ValueError):
     """Messages contain field names only, never configuration values."""
+
+
+def _read_regular_file(path, limit):
+    """Return at most limit + 1 bytes of a regular file, never blocking.
+
+    The path is checked before it is opened, so a FIFO, device or directory is
+    never opened, and the open descriptor is checked again before any read, so
+    a path swapped after the first check is refused too. O_NONBLOCK keeps that
+    open from waiting for a FIFO writer.
+    """
+    if not stat.S_ISREG(Path(path).stat().st_mode):
+        raise ValueError
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with source:
+        return source.read(limit + 1)
 
 
 @dataclass(frozen=True)
@@ -23992,6 +24700,7 @@ class Config:
     timeout_ms: int = 1000
     interval_ms: int = 5000
     shutdown_ms: int = 3000
+    ca_file: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls, env=None):
@@ -24041,8 +24750,7 @@ class Config:
         secret_file = value("HEADERS_FILE", "")
         if secret_file:
             try:
-                with Path(secret_file).open("rb") as source:
-                    raw = source.read(8193)
+                raw = _read_regular_file(secret_file, 8192)
                 if len(raw) > 8192:
                     raise ValueError
                 def header_pairs(pairs):
@@ -24065,6 +24773,18 @@ class Config:
                 raise TelemetryConfigError("Invalid RAG_OTEL_HEADERS_FILE") from None
         if headers and url.scheme != "https":
             raise TelemetryConfigError("RAG_OTEL_HEADERS_FILE requires HTTPS RAG_OTEL_ENDPOINT")
+        # Optional private CA bundle, checked once here; requests re-reads the
+        # path on new connections. It replaces, not extends, the bundled roots.
+        ca_file = value("CA_FILE", "")
+        if ca_file:
+            try:
+                if len(_read_regular_file(ca_file, 1048576)) > 1048576:
+                    raise ValueError
+                ssl.create_default_context(cafile=ca_file)
+            except (OSError, ValueError, TypeError):
+                raise TelemetryConfigError("Invalid RAG_OTEL_CA_FILE") from None
+            if url.scheme != "https":
+                raise TelemetryConfigError("RAG_OTEL_CA_FILE requires HTTPS RAG_OTEL_ENDPOINT")
         queue = number("QUEUE_SIZE", 256, 1, 4096)
         batch = number("BATCH_SIZE", 64, 1, 512)
         if batch > queue:
@@ -24076,7 +24796,7 @@ class Config:
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
                    number("TIMEOUT_MS", 1000, 100, 10000),
                    number("INTERVAL_MS", 5000, 1000, 60000),
-                   number("SHUTDOWN_MS", 3000, 100, 30000))
+                   number("SHUTDOWN_MS", 3000, 100, 30000), ca_file=ca_file)
 
 
 # Finite value vocabularies prevent sensitive values hidden under approved keys.
@@ -24230,12 +24950,13 @@ def _session(signal, config):
             result._content = b"telemetry export failed"
             try:
                 payload = sanitize_wire(data, signal, config)
-                # Explicit arguments override ambient OTEL_* TLS/header options.
+                # Explicit arguments override ambient OTEL_* TLS/header options;
+                # a configured CA file is the only trust store when set.
                 self.cookies.clear()
                 self.headers.clear()
                 self.headers.update({"Content-Type": "application/x-protobuf", **config.headers})
                 with super().post(config.endpoint + "/v1/" + signal, data=payload,
-                                  timeout=config.timeout_ms / 1000, verify=True,
+                                  timeout=config.timeout_ms / 1000, verify=config.ca_file or True,
                                   allow_redirects=False, stream=True) as response:
                     if 200 <= response.status_code < 300:
                         result.status_code = 200
@@ -24748,9 +25469,52 @@ def receiver(status=200):
         server.server_close()
         thread.join()
 
+@contextlib.contextmanager
+def private_ca():
+    """A throwaway CA and a 127.0.0.1 server certificate it signed, as PEM files."""
+    import datetime, ipaddress
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    now = datetime.datetime.now(datetime.timezone.utc)
+    def certificate(subject, issuer, public_key, signing_key, ca):
+        builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+                   .public_key(public_key).serial_number(x509.random_serial_number())
+                   .not_valid_before(now - datetime.timedelta(minutes=5))
+                   .not_valid_after(now + datetime.timedelta(days=1))
+                   .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+                   .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
+                   .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(signing_key.public_key()), critical=False))
+        if ca:
+            builder = builder.add_extension(x509.KeyUsage(False, False, False, False, False, True, True, False, False), critical=True)
+        else:
+            builder = builder.add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
+        return builder.sign(signing_key, hashes.SHA256())
+    ca_key, server_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'rag-test-private-ca')])
+    ca_cert = certificate(ca_name, ca_name, ca_key.public_key(), ca_key, True)
+    server_cert = certificate(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, '127.0.0.1')]),
+                              ca_name, server_key.public_key(), ca_key, False)
+    with tempfile.TemporaryDirectory() as directory:
+        paths = {name: os.path.join(directory, name+'.pem') for name in ('ca', 'server', 'key')}
+        Path(paths['ca']).write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+        Path(paths['server']).write_bytes(server_cert.public_bytes(serialization.Encoding.PEM))
+        Path(paths['key']).write_bytes(server_key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        yield paths
+
+@contextlib.contextmanager
+def no_file_reads():
+    """Fail the test on a file read by os.open, Path.read_bytes, Path.open or builtin open."""
+    with contextlib.ExitStack() as stack:
+        for target in ('os.open', 'pathlib.Path.read_bytes', 'pathlib.Path.open', 'builtins.open'):
+            stack.enter_context(patch(target, side_effect=AssertionError('read '+target)))
+        yield
+
 class TelemetryTests(unittest.TestCase):
     def test_disabled_never_constructs_transport_or_reads_secrets(self):
-        with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+        with patch('services.telemetry._session', side_effect=AssertionError), no_file_reads():
             runtime = bootstrap({'RAG_OTEL_HEADERS_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
             self.assertFalse(runtime.config.enabled)
             self.assertEqual(runtime._providers, [])
@@ -24763,7 +25527,7 @@ class TelemetryTests(unittest.TestCase):
                 before = dict(os.environ)
                 env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318',
                        'RAG_OTEL_HEADERS_FILE':SECRET, 'OTEL_SDK_DISABLED':'false'}
-                with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+                with patch('services.telemetry._session', side_effect=AssertionError), no_file_reads():
                     for signals in ({}, {'RAG_OTEL_TRACES':'false'}, {'RAG_OTEL_LOGS':'false'}, {'RAG_OTEL_METRICS':'false'}):
                         with self.assertRaises(TelemetryConfigError) as error:
                             bootstrap({**env, **signals})
@@ -25443,6 +26207,384 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(provider.closed,1)
         self.assertTrue(runtime.shutdown())
         self.assertEqual(provider.closed,1)
+
+    def test_reviewer_configuration_bounds_accept_edges_and_reject_neighbours(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318/'}
+        cfg = Config.from_env(base)
+        self.assertEqual(cfg.endpoint, 'http://localhost:4318')
+        self.assertEqual((cfg.queue_size, cfg.batch_size, cfg.timeout_ms, cfg.interval_ms, cfg.shutdown_ms, cfg.sample_ratio),
+                         (256, 64, 1000, 5000, 3000, 1.0))
+        bounds = {'QUEUE_SIZE':(1, 4096), 'BATCH_SIZE':(1, 512), 'TIMEOUT_MS':(100, 10000),
+                  'INTERVAL_MS':(1000, 60000), 'SHUTDOWN_MS':(100, 30000)}
+        for key, (low, high) in bounds.items():
+            extra = {'RAG_OTEL_QUEUE_SIZE':'4096'} if key == 'BATCH_SIZE' else {'RAG_OTEL_BATCH_SIZE':'1'} if key == 'QUEUE_SIZE' else {}
+            for value in (low, high):
+                with self.subTest(key=key, value=value):
+                    Config.from_env({**base, **extra, 'RAG_OTEL_'+key:str(value)})
+            for value in (str(low-1), str(high+1), '1.5', ''):
+                with self.subTest(key=key, value=value), self.assertRaises(TelemetryConfigError) as raised:
+                    Config.from_env({**base, **extra, 'RAG_OTEL_'+key:value})
+                self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_'+key)
+        for value in ('0', '1', '0.5'):
+            Config.from_env({**base, 'RAG_OTEL_SAMPLE_RATIO':value})
+        for value in ('-0.01', '1.01', 'inf', '-inf'):
+            with self.subTest(sample=value), self.assertRaises(TelemetryConfigError):
+                Config.from_env({**base, 'RAG_OTEL_SAMPLE_RATIO':value})
+        with self.assertRaises(TelemetryConfigError) as raised:
+            Config.from_env({**base, 'RAG_OTEL_QUEUE_SIZE':'4', 'RAG_OTEL_BATCH_SIZE':'5'})
+        self.assertEqual(str(raised.exception), 'RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE')
+        Config.from_env({**base, 'RAG_OTEL_QUEUE_SIZE':'4', 'RAG_OTEL_BATCH_SIZE':'4'})
+        for key in ('SERVICE_NAME', 'SERVICE_VERSION', 'ENVIRONMENT'):
+            self.assertEqual(getattr(Config.from_env({**base, 'RAG_OTEL_'+key:'a'*64}),
+                                     {'SERVICE_NAME':'service','SERVICE_VERSION':'version','ENVIRONMENT':'environment'}[key]), 'a'*64)
+            for value in ('a'*65, '-lead', 'has space', ''):
+                with self.subTest(key=key, value=value), self.assertRaises(TelemetryConfigError):
+                    Config.from_env({**base, 'RAG_OTEL_'+key:value})
+        for endpoint in ('http://localhost:0', 'http://:4318', 'http://local host', 'http://localhost#'+SECRET, ''):
+            with self.subTest(endpoint=endpoint), self.assertRaises(TelemetryConfigError) as raised:
+                Config.from_env({**base, 'RAG_OTEL_ENDPOINT':endpoint})
+            self.assertNotIn(SECRET, str(raised.exception))
+        for key in ('ENABLED', 'TRACES', 'LOGS', 'METRICS'):
+            for value in ('True', '1', ''):
+                with self.subTest(key=key, value=value), self.assertRaises(TelemetryConfigError):
+                    Config.from_env({**base, 'RAG_OTEL_'+key:value})
+
+    def test_reviewer_header_file_limits_are_value_free(self):
+        cases = ('{"Authorization":"'+'a'*8200+'"}', '{"Authorization":""}', '{"Authorization":"'+'a'*2049+'"}',
+                 '{"Authorization":"x\\n'+SECRET+'"}', '{"Authorization":1}', '{"Cookie":"'+SECRET+'"}',
+                 '["Authorization","'+SECRET+'"]', 'not json '+SECRET)
+        for text in cases:
+            with self.subTest(size=len(text)), tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write(text); f.flush()
+                with self.assertRaises(TelemetryConfigError) as raised:
+                    Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+                self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_HEADERS_FILE')
+        with tempfile.NamedTemporaryFile(mode='w') as f:
+            f.write('{"Authorization":"'+'a'*2048+'","X-Api-Key":"k"}'); f.flush()
+            cfg = Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+            self.assertEqual(set(cfg.headers), {'Authorization', 'X-Api-Key'})
+
+    def test_reviewer_unreachable_or_hanging_collector_is_bounded(self):
+        import socket
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0)); closed_port = probe.getsockname()[1]
+        release = threading.Event(); hits = []
+        class Hang(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path); release.wait(5)
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Hang)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            for port in (closed_port, server.server_port):
+                with self.subTest(port='closed' if port == closed_port else 'hanging'):
+                    stream = io.StringIO(); handler = logging.StreamHandler(stream)
+                    logger = logging.getLogger('opentelemetry'); logger.addHandler(handler)
+                    try:
+                        endpoint = f'http://127.0.0.1:{port}'
+                        runtime = bootstrap({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':endpoint,
+                                             'RAG_OTEL_TIMEOUT_MS':'100', 'RAG_OTEL_SHUTDOWN_MS':'500'})
+                        started = time.monotonic()
+                        for _ in range(50):
+                            with runtime.tracer.start_as_current_span('rag.query'):
+                                runtime.logger.emit(body=SECRET, attributes={'rag.outcome':'error'})
+                            runtime.meter.create_counter('rag.telemetry.check').add(1)
+                        runtime.force_flush(); runtime.shutdown()
+                        self.assertLess(time.monotonic()-started, 2.5)
+                        self.assertNotIn(SECRET, stream.getvalue())
+                        self.assertNotIn(endpoint, stream.getvalue())
+                    finally:
+                        logger.removeHandler(handler)
+            self.assertTrue(hits)
+        finally:
+            release.set(); server.shutdown(); server.server_close(); thread.join()
+
+    def test_reviewer_bootstrap_leaves_global_providers_and_root_logging_unchanged(self):
+        from opentelemetry import trace, metrics, _logs
+        root = logging.getLogger()
+        before = (list(root.handlers), root.level, type(trace.get_tracer_provider()),
+                  type(metrics.get_meter_provider()), type(_logs.get_logger_provider()))
+        with receiver() as (env, records):
+            runtime = bootstrap(env)
+            try:
+                with runtime.tracer.start_as_current_span('rag.query'):
+                    logging.getLogger('rag.reviewer').warning(SECRET)
+                self.assertTrue(runtime.force_flush())
+            finally:
+                self.assertTrue(runtime.shutdown())
+            after = (list(root.handlers), root.level, type(trace.get_tracer_provider()),
+                     type(metrics.get_meter_provider()), type(_logs.get_logger_provider()))
+            self.assertEqual(after, before)
+            for _, body in records:
+                self.assertNotIn(SECRET.encode(), body)
+            self.assertNotIn('/v1/logs', {path for path, _ in records})
+
+    def test_ca_file_disabled_invalid_and_https_rule(self):
+        with patch('services.telemetry._session', side_effect=AssertionError), no_file_reads(), \
+                patch('ssl.create_default_context', side_effect=AssertionError):
+            runtime = bootstrap({'RAG_OTEL_CA_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
+            self.assertFalse(runtime.config.enabled)
+            self.assertEqual(runtime._providers, [])
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            def write(name, data):
+                path = os.path.join(directory, SECRET.replace('/', '_')+name)
+                Path(path).write_bytes(data)
+                return path
+            invalid = {'missing': os.path.join(directory, SECRET.replace('/', '_')+'-missing'),
+                       'directory': directory, 'empty': write('-empty', b''),
+                       'not a certificate': write('-text', SECRET.encode()+b'\n'),
+                       'over 1 MiB': write('-large', b'\n'*(1048576+1))}
+            for case, path in invalid.items():
+                with self.subTest(case=case), self.assertRaises(TelemetryConfigError) as raised:
+                    Config.from_env({**base, 'RAG_OTEL_CA_FILE':path})
+                self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_CA_FILE')
+                self.assertNotIn(SECRET, str(raised.exception))
+                self.assertNotIn(path, str(raised.exception))
+            with private_ca() as paths:
+                pem = Path(paths['ca']).read_bytes()
+                largest = write('-largest', pem + b'\n'*(1048576-len(pem)))
+                self.assertEqual(os.path.getsize(largest), 1048576)
+                for path in (paths['ca'], largest):
+                    cfg = Config.from_env({**base, 'RAG_OTEL_CA_FILE':path})
+                    self.assertEqual(cfg.ca_file, path)
+                    self.assertNotIn(path, repr(cfg))
+                    with self.assertRaises(TelemetryConfigError) as raised:
+                        Config.from_env({**base, 'RAG_OTEL_ENDPOINT':'http://localhost:4318', 'RAG_OTEL_CA_FILE':path})
+                    self.assertEqual(str(raised.exception), 'RAG_OTEL_CA_FILE requires HTTPS RAG_OTEL_ENDPOINT')
+        self.assertEqual(Config.from_env(base).ca_file, '')
+
+    def test_ca_file_trusts_private_ca_for_https_export(self):
+        import ssl
+        records = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                records.append((self.path, self.rfile.read(int(self.headers['Content-Length']))))
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        with private_ca() as paths:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(paths['server'], paths['key'])
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':f'https://127.0.0.1:{server.server_port}',
+                       'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false'}
+                for ca_file in (None, paths['ca']):
+                    with self.subTest(ca_file='private CA' if ca_file else 'bundled roots'):
+                        records.clear()
+                        runtime = bootstrap({**env, 'RAG_OTEL_CA_FILE':ca_file} if ca_file else env)
+                        try:
+                            with runtime.tracer.start_as_current_span('rag.query'):
+                                pass
+                            runtime.force_flush()
+                        finally:
+                            runtime.shutdown()
+                        self.assertEqual([path for path, _ in records], ['/v1/traces'] if ca_file else [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def test_reviewer_ca_file_is_the_only_trust_store(self):
+        import ssl
+        import requests
+        records = []; verify = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                records.append(self.path); self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(200); self.end_headers()
+            def log_message(self, *args):
+                pass
+        post = requests.Session.post
+        def spy(session, url, *args, **kwargs):
+            verify.append(kwargs.get('verify'))
+            return post(session, url, *args, **kwargs)
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            unreadable = os.path.join(directory, 'unreadable-'+SECRET.replace('/', '_'))
+            Path(unreadable).write_bytes(b'')
+            with patch('os.open', side_effect=PermissionError) as opened, self.assertRaises(TelemetryConfigError) as raised:
+                Config.from_env({**base, 'RAG_OTEL_CA_FILE':unreadable})
+            opened.assert_called()
+        self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_CA_FILE')
+        with private_ca() as paths, private_ca() as other, tempfile.TemporaryDirectory() as directory:
+            both = os.path.join(directory, 'both.pem')
+            Path(both).write_bytes(Path(other['ca']).read_bytes() + Path(paths['ca']).read_bytes())
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(paths['server'], paths['key'])
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':f'https://127.0.0.1:{server.server_port}',
+                       'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false'}
+                for name, ca_file, delivered in (('unset', None, False), ('other CA only', other['ca'], False),
+                                                 ('bundle with both CAs', both, True)):
+                    with self.subTest(case=name), patch.object(requests.Session, 'post', spy):
+                        records.clear(); verify.clear()
+                        runtime = bootstrap({**env, 'RAG_OTEL_CA_FILE':ca_file} if ca_file else env)
+                        try:
+                            with runtime.tracer.start_as_current_span('rag.query'):
+                                pass
+                            runtime.force_flush()
+                        finally:
+                            runtime.shutdown()
+                        self.assertEqual(records, ['/v1/traces'] if delivered else [])
+                        self.assertTrue(verify)
+                        self.assertEqual(set(verify), {ca_file or True})
+            finally:
+                server.shutdown(); server.server_close(); thread.join()
+
+    def test_non_regular_files_are_refused_without_blocking(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = os.path.join(directory, SECRET.replace('/', '_')+'-fifo')
+            os.mkfifo(fifo)
+            for key, path in (('RAG_OTEL_HEADERS_FILE', fifo), ('RAG_OTEL_HEADERS_FILE', directory),
+                              ('RAG_OTEL_CA_FILE', fifo)):
+                with self.subTest(key=key, kind='fifo' if path == fifo else 'directory'):
+                    outcome = []
+                    def load():
+                        try:
+                            Config.from_env({**base, key:path})
+                        except Exception as error:
+                            outcome.append(error)
+                    worker = threading.Thread(target=load, daemon=True); worker.start()
+                    worker.join(5)
+                    if worker.is_alive():
+                        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                        worker.join(5)
+                        self.fail(key+' blocked on a non-regular file')
+                    self.assertEqual(len(outcome), 1)
+                    self.assertIsInstance(outcome[0], TelemetryConfigError)
+                    self.assertEqual(str(outcome[0]), 'Invalid '+key)
+                    self.assertNotIn(SECRET, str(outcome[0]))
+                    self.assertNotIn(path, str(outcome[0]))
+
+    def test_reviewer_non_regular_paths_are_never_opened(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = os.path.join(directory, SECRET.replace('/', '_')+'-fifo')
+            os.mkfifo(fifo)
+            for key in ('RAG_OTEL_HEADERS_FILE', 'RAG_OTEL_CA_FILE'):
+                for kind, path in (('character device', os.devnull), ('fifo', fifo), ('directory', directory)):
+                    with self.subTest(key=key, kind=kind):
+                        with patch('os.open', side_effect=AssertionError('opened')) as opened, \
+                                patch('ssl.create_default_context', side_effect=AssertionError('loaded')), \
+                                self.assertRaises(TelemetryConfigError) as raised:
+                            Config.from_env({**base, key:path})
+                        opened.assert_not_called()
+                        self.assertEqual(str(raised.exception), 'Invalid '+key)
+                        self.assertNotIn(path, str(raised.exception))
+
+    def test_path_swapped_for_fifo_after_check_is_refused_without_blocking(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        real_open = os.open
+        for key in ('RAG_OTEL_HEADERS_FILE', 'RAG_OTEL_CA_FILE'):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, SECRET.replace('/', '_')+'-swapped')
+                Path(path).write_bytes(b'{}')
+                swapped, fired, done = [], [], threading.Event()
+                def swap_then_open(name, flags, *args, **kwargs):
+                    if name == path and not swapped:
+                        os.remove(path)
+                        os.mkfifo(path)
+                        swapped.append(True)
+                    return real_open(name, flags, *args, **kwargs)
+                def watchdog():
+                    if not done.wait(5):
+                        fired.append(True)
+                        os.close(real_open(path, os.O_WRONLY))
+                threading.Thread(target=watchdog, daemon=True).start()
+                try:
+                    with patch('os.open', side_effect=swap_then_open), \
+                            patch('os.fdopen', side_effect=AssertionError('read')), \
+                            patch('ssl.create_default_context', side_effect=AssertionError('loaded')), \
+                            self.assertRaises(TelemetryConfigError) as raised:
+                        Config.from_env({**base, key:path})
+                finally:
+                    done.set()
+                self.assertEqual(swapped, [True])
+                self.assertEqual(fired, [], key+' blocked on a path swapped for a FIFO')
+                self.assertEqual(str(raised.exception), 'Invalid '+key)
+                self.assertNotIn(path, str(raised.exception))
+
+    def test_header_and_ca_file_descriptors_are_closed_on_failure_and_success(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        real_open = os.open
+        def closed(descriptor):
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                return True
+            return False
+        for key in ('RAG_OTEL_HEADERS_FILE', 'RAG_OTEL_CA_FILE'):
+            for case in ('read fails', 'swapped for a fifo'):
+                with self.subTest(key=key, case=case), tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, SECRET.replace('/', '_')+'-fd')
+                    Path(path).write_bytes(b'{}')
+                    opened, fired, done = [], [], threading.Event()
+                    def recording_open(name, flags, *args, **kwargs):
+                        if name == path and case == 'swapped for a fifo':
+                            os.remove(path); os.mkfifo(path)
+                        descriptor = real_open(name, flags, *args, **kwargs)
+                        if name == path:
+                            opened.append(descriptor)
+                        return descriptor
+                    def watchdog():
+                        if not done.wait(5):
+                            fired.append(True)
+                            os.close(real_open(path, os.O_WRONLY))
+                    if case == 'swapped for a fifo':
+                        threading.Thread(target=watchdog, daemon=True).start()
+                    try:
+                        with patch('os.open', side_effect=recording_open), \
+                                patch('os.fdopen', side_effect=OSError('read')), \
+                                patch('ssl.create_default_context', side_effect=AssertionError('loaded')), \
+                                self.assertRaises(TelemetryConfigError) as raised:
+                            Config.from_env({**base, key:path})
+                    finally:
+                        done.set()
+                    self.assertEqual(fired, [], key+' blocked on a path swapped for a FIFO')
+                    self.assertEqual(len(opened), 1)
+                    self.assertTrue(closed(opened[0]), key+' leaked its descriptor when '+case)
+                    self.assertEqual(str(raised.exception), 'Invalid '+key)
+                    self.assertNotIn(path, str(raised.exception))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'headers')
+            Path(path).write_text('{"Authorization":"a"}')
+            opened = []
+            def recording_open(name, flags, *args, **kwargs):
+                descriptor = real_open(name, flags, *args, **kwargs)
+                if name == path:
+                    opened.append(descriptor)
+                return descriptor
+            with patch('os.open', side_effect=recording_open):
+                cfg = Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path})
+            self.assertEqual(set(cfg.headers), {'Authorization'})
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(closed(opened[0]), 'RAG_OTEL_HEADERS_FILE leaked its descriptor after a successful read')
+
+    def test_header_file_accepts_8192_bytes_and_rejects_8193(self):
+        base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
+        body = '{"Authorization":"a"}'
+        for size, accepted in ((8192, True), (8193, False)):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, 'headers')
+                Path(path).write_text(body + ' '*(size-len(body)))
+                self.assertEqual(os.path.getsize(path), size)
+                if accepted:
+                    self.assertEqual(set(Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path}).headers), {'Authorization'})
+                else:
+                    with self.assertRaises(TelemetryConfigError) as raised:
+                        Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path})
+                    self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_HEADERS_FILE')
 
 if __name__ == '__main__':unittest.main()
 ```

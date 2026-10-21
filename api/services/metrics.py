@@ -1,7 +1,11 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
+import os
 import statistics
+import tempfile
+import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +15,21 @@ from config import settings
 MAX_RECORDS = 500
 _ring: deque[dict] = deque(maxlen=MAX_RECORDS)
 
+# metrics.jsonl is bounded (#374): once an append brings it to COMPACT_AT lines it
+# is compacted to its last MAX_RECORDS records, and startup reads at most its last
+# _TAIL_BYTES, which hold far more than MAX_RECORDS records.
+COMPACT_AT = 2 * MAX_RECORDS
+_TAIL_BYTES = 1024 * 1024
+_TMP_PREFIX = ".metrics.jsonl."
+_TMP_SUFFIX = ".tmp"
+
 _METRICS_FILE = None
+# Appends and compactions run in worker threads, one per query; the lock keeps
+# an append from landing in a file that is being replaced.
+_file_lock = threading.Lock()
+_file_lines = 0         # lines in the file since the last load or compaction
+
+_log = logging.getLogger(__name__)
 
 
 def _metrics_path() -> Path:
@@ -23,21 +41,97 @@ def _metrics_path() -> Path:
     return _METRICS_FILE
 
 
-def load_from_disk() -> None:
-    p = _metrics_path()
-    if not p.exists():
-        return
-    lines = p.read_text().splitlines()
-    for line in lines[-MAX_RECORDS:]:
+def _read_tail(path: Path) -> tuple[list[str], bool]:
+    """The last MAX_RECORDS valid lines of `path`, read from at most its last
+    _TAIL_BYTES, and whether they are all the file holds."""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        start = max(0, size - _TAIL_BYTES)
+        f.seek(start)
+        data = f.read(_TAIL_BYTES)
+    if start:
+        # The read began inside a line: drop that partial line.
+        data = data[data.find(b"\n") + 1:] if b"\n" in data else b""
+    lines, extra = [], start > 0
+    for raw in data.split(b"\n"):
+        if not raw.strip():
+            continue
         try:
-            _ring.append(json.loads(line))
-        except Exception:
+            line = raw.decode("utf-8")
+            json.loads(line)
+        except ValueError:
+            extra = True                    # not a record: compacted away
+            continue
+        lines.append(line)
+    if len(lines) > MAX_RECORDS:
+        lines, extra = lines[-MAX_RECORDS:], True
+    return lines, not extra
+
+
+def _compact_locked(path: Path, lines: list[str]) -> None:
+    """Atomically replace `path` with `lines`. Raises on failure, leaving the old
+    file whole and no temporary file. Call with _file_lock held."""
+    global _file_lines
+    fd, tmp = tempfile.mkstemp(prefix=_TMP_PREFIX, suffix=_TMP_SUFFIX, dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write("".join(line + "\n" for line in lines))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
             pass
+        raise
+    _file_lines = len(lines)
+
+
+def load_from_disk() -> None:
+    """Load the last MAX_RECORDS records into the ring. Never raises: a metrics
+    file that can't be read or compacted must not stop the API starting."""
+    global _file_lines
+    with _file_lock:
+        try:
+            p = _metrics_path()
+            for leftover in p.parent.glob(_TMP_PREFIX + "*" + _TMP_SUFFIX):
+                # A compaction interrupted by a crash; metrics.jsonl is whole.
+                leftover.unlink(missing_ok=True)
+            if not p.exists():
+                return
+            lines, whole = _read_tail(p)
+        except Exception:                                 # noqa: BLE001
+            _log.exception("Could not load the query metrics from %s", _METRICS_FILE)
+            return
+        for line in lines:
+            _ring.append(json.loads(line))
+        _file_lines = len(lines)
+        if not whole:
+            try:
+                _compact_locked(p, lines)
+            except Exception:                             # noqa: BLE001
+                _log.exception("Could not compact %s; it is tried again after later queries", p)
 
 
 def _append_sync(line: str) -> None:
-    with open(_metrics_path(), "a") as f:
-        f.write(line + "\n")
+    global _file_lines
+    with _file_lock:
+        p = _metrics_path()
+        with open(p, "a+b") as f:
+            payload = line.encode("utf-8") + b"\n"
+            if f.seek(0, os.SEEK_END):
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    # An earlier write stopped part-way: start a line of our own.
+                    payload = b"\n" + payload
+            f.write(payload)
+        _file_lines += 1
+        if _file_lines >= COMPACT_AT:
+            try:
+                _compact_locked(p, _read_tail(p)[0])
+            except Exception:                             # noqa: BLE001
+                _log.exception("Could not compact %s; it is tried again after the next query", p)
 
 
 async def record(
@@ -47,6 +141,8 @@ async def record(
     llm_ms: int,
     chunks_retrieved: int,
 ) -> None:
+    """Add a query's record to the ring and append it to metrics.jsonl. Never
+    raises: the query has its answer, and a failed write must not lose it (#374)."""
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "collection": collection,
@@ -57,7 +153,11 @@ async def record(
         "chunks_retrieved": chunks_retrieved,
     }
     _ring.append(entry)
-    await asyncio.to_thread(_append_sync, json.dumps(entry))
+    try:
+        await asyncio.to_thread(_append_sync, json.dumps(entry))
+    except Exception:                                     # noqa: BLE001
+        _log.warning("Could not write the query metrics record for %r to %s; "
+                     "the answer is still returned", collection, _METRICS_FILE, exc_info=True)
 
 
 def _percentile(data: list[float], p: int) -> float:

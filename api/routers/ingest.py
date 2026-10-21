@@ -13,7 +13,7 @@ from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
-from utils import api_error, collection_deleting_error
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -57,7 +57,13 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
-    if not await wc.collection_exists(collection):
+    try:
+        exists = await wc.collection_exists(collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an ingest upload", collection)
+        return collection_check_unavailable(collection, "No job was started")
+    if not exists:
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
 
     try:

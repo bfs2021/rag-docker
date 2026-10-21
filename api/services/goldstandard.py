@@ -5,6 +5,7 @@ import json
 import logging
 import copy
 import os
+import stat
 import tempfile
 import threading
 
@@ -208,7 +209,7 @@ def _replace_durably(path: Path, payload: str) -> None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
-                log.exception("Could not remove owned session temporary file %s", temporary.name)
+                log.exception("Could not remove owned temporary file %s", temporary.name)
 
 
 def _save_session_sync(session: dict) -> None:
@@ -1001,10 +1002,57 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     return None
 
 
+# Exports have their own folder so that a caller-chosen name can never reach the
+# registry, the metrics file or the session store beside them (#370).
+EXPORT_DIRNAME = "goldstandard_exports"
+_EXPORT_NAME_MAX = 128
+_EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9_. -]{1,%d}" % _EXPORT_NAME_MAX)
+
+
+def export_path(filename) -> Path:
+    """The path of export `filename`, or INVALID_PATH when the name breaks the rule."""
+    if (not isinstance(filename, str) or not _EXPORT_NAME_RE.fullmatch(filename)
+            or not filename.lower().endswith(".json")):
+        raise GoldStandardError(
+            "INVALID_PATH",
+            "Invalid filename. Use 1-128 ASCII letters, digits, '_', '-', '.' or spaces, "
+            "ending in .json, with no path.", 400)
+    return Path(settings.upload_dir).resolve() / EXPORT_DIRNAME / filename
+
+
+def export_entry_is_other(path: Path) -> bool:
+    """True when something other than a regular file (a directory, a link) has the name."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    return not stat.S_ISREG(mode)
+
+
+def export_folder_exists(folder: Path) -> bool:
+    """False when the exports folder is missing; True when it is a directory.
+
+    Anything else with its name (a file saved as `goldstandard_exports` before #370,
+    a symbolic link) is refused rather than followed or failed on (#402).
+    """
+    try:
+        mode = os.lstat(folder).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(mode):
+        raise GoldStandardError(
+            "EXPORTS_FOLDER_INVALID",
+            f"'{EXPORT_DIRNAME}' in the upload folder is not a directory (a file or a "
+            "link has its name). Move or rename it, then retry.", 409)
+    return True
+
+
 # Published cache snapshots are immutable. Export captures one stable reference
 # and never mutates or exposes it; later commits publish a different object.
+# The export goes to a new temporary file that replaces the name, so a link at
+# the name is replaced rather than followed, and no reader sees half a file (#402).
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
-    out_path.write_text(json.dumps(ragas, indent=2))
+    _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
@@ -1031,15 +1079,17 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if not filename:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe = re.sub(r"[^a-zA-Z0-9_]", "", collection.replace(" ", "_"))
-        filename = f"{safe}_{ts}.json"
+        suffix = f"_{ts}.json"
+        filename = safe[:_EXPORT_NAME_MAX - len(suffix)] + suffix
 
-    # Sanitize: only the basename; no path traversal
-    filename = Path(filename).name
-    out_dir = Path(settings.upload_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / filename).resolve()
-    if not str(out_path).startswith(str(out_dir) + "/"):
-        raise ValueError("Invalid filename.")
+    # The name is checked as given; a path is refused, not stripped (#370).
+    out_path = export_path(filename)
+    if not export_folder_exists(out_path.parent):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        export_folder_exists(out_path.parent)
+    if export_entry_is_other(out_path):
+        raise GoldStandardError(
+            "INVALID_PATH", f"'{filename}' is not an export file.", 400)
 
     ragas = [
         {
