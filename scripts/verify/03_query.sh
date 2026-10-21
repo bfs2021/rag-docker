@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPECIFICATIONS.md §10.2 — Query
 cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
@@ -9,6 +10,10 @@ check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
+# A failed metrics write never fails a query, and metrics.jsonl is bounded (#374):
+# controlled, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
+check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \

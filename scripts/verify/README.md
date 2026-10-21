@@ -482,6 +482,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
+| `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
@@ -651,6 +652,19 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+
+Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
+`--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
+It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
+app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
+record can't be written (an unusable file, a full volume), with the failure logged; that a
+line left unfinished by a failed write doesn't cost the next record; that `metrics.jsonl`
+never holds more than 1,000 lines and keeps the newest records; that a compaction whose
+temporary write or replace fails leaves the old file whole and no temporary file, and is
+tried again; that 1,100 concurrent records all land; and that a restart restores the last 500
+records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
+files a crash left, and starts when the file can't be read or compacted. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a

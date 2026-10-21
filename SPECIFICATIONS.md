@@ -1145,6 +1145,18 @@ GET /metrics/latency
 
 Returns rolling aggregate statistics AND a time-series history for charting. The API service maintains an in-memory ring buffer of the last 500 query records, persisted to `{UPLOAD_DIR}/metrics.jsonl` for survival across restarts.
 
+The file is bounded (#374). Each query appends one line; when that brings the file to 1,000
+lines, it is compacted to its last 500 records by writing them to a temporary file in the same
+folder, fsyncing it and replacing `metrics.jsonl` atomically, so a crash leaves either the old
+file or the compacted one, never a mix. At startup the API reads at most the last 1 MiB of the
+file, loads its last 500 records into the ring, and compacts the file to them at once if it
+held anything more (an older unbounded file, or lines that aren't records); it also removes
+temporary files left by a compaction a crash interrupted. A record whose write fails (for
+example on a full `ingest_uploads` volume), a failed compaction, or a metrics file that can't
+be read at startup is logged and changes nothing else: the query still answers 200 with its
+answer, the record still counts in the ring, and the API still starts. A line left unfinished
+by a failed write doesn't cost the next record, which starts a line of its own.
+
 **Query parameters:** `collection`, `retrieval_mode` (both optional filters), and
 `history_limit` (integer, 0-500, default 100).
 
@@ -2461,6 +2473,7 @@ now lives once, in `api/services/ingest_config.py`.
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 - [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373).
+- [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged; the file never holds more than 1,000 lines, is compacted atomically to its last 500 records, and those reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
       *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call and each retrieval mode's Weaviate call; it fails on the code before #373.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
