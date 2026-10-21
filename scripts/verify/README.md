@@ -494,7 +494,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -654,6 +654,20 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Health page refresh checks
+
+`browser/health_page.js` (#415), registered in `06_ui.sh` through `ui_criteria.js`,
+stubs every API call the Health page makes and holds each health and metrics answer
+until the check releases it, driving each refresh through the captured 30 s timer. Ten
+cases cover a failed metrics call (an API error, and no answer) keeping the charts last
+shown; a 200 without a health body (JSON of another shape, an empty body, text) and a 503
+carrying the API's error envelope, each shown as "Service health could not be read:" with
+no cards; and late responses from an older refresh, which never replace a newer health
+result (success or failure) or newer charts, while a late metrics result after a newer
+failed one is still shown. Every case also fails on a React page error. These fixtures
+make no backend calls; like the other modules, the file runs standalone with
+`RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
@@ -672,8 +686,10 @@ Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends 
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
-`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
-names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+`error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
+together (all three `error`), each with its latency, model names and `resources`; and 200
+`ok` when everything is up, also with memory below the recommendation or unreadable
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
 stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
