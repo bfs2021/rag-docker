@@ -112,6 +112,7 @@ async def download(filename: str):
     # Only files in the exports folder are served, never other upload state (#370).
     try:
         target = gs.export_path(filename)
+        gs.export_folder_exists(target.parent)
     except gs.GoldStandardError as exc:
         return api_error(exc.status, exc.code, exc.message)
     if gs.export_entry_is_other(target):

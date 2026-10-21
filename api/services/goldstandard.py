@@ -208,7 +208,7 @@ def _replace_durably(path: Path, payload: str) -> None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
-                log.exception("Could not remove owned session temporary file %s", temporary.name)
+                log.exception("Could not remove owned temporary file %s", temporary.name)
 
 
 def _save_session_sync(session: dict) -> None:
@@ -1004,7 +1004,7 @@ def export_path(filename) -> Path:
             or not filename.lower().endswith(".json")):
         raise GoldStandardError(
             "INVALID_PATH",
-            "Invalid filename. Use 1-128 letters, digits, '_', '-', '.' or spaces, "
+            "Invalid filename. Use 1-128 ASCII letters, digits, '_', '-', '.' or spaces, "
             "ending in .json, with no path.", 400)
     return Path(settings.upload_dir).resolve() / EXPORT_DIRNAME / filename
 
@@ -1018,10 +1018,30 @@ def export_entry_is_other(path: Path) -> bool:
     return not stat.S_ISREG(mode)
 
 
+def export_folder_exists(folder: Path) -> bool:
+    """False when the exports folder is missing; True when it is a directory.
+
+    Anything else with its name (a file saved as `goldstandard_exports` before #370,
+    a symbolic link) is refused rather than followed or failed on (#402).
+    """
+    try:
+        mode = os.lstat(folder).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(mode):
+        raise GoldStandardError(
+            "EXPORTS_FOLDER_INVALID",
+            f"'{EXPORT_DIRNAME}' in the upload folder is not a directory (a file or a "
+            "link has its name). Move or rename it, then retry.", 409)
+    return True
+
+
 # Published cache snapshots are immutable. Export captures one stable reference
 # and never mutates or exposes it; later commits publish a different object.
+# The export goes to a new temporary file that replaces the name, so a link at
+# the name is replaced rather than followed, and no reader sees half a file (#402).
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
-    out_path.write_text(json.dumps(ragas, indent=2))
+    _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
@@ -1053,7 +1073,9 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
 
     # The name is checked as given; a path is refused, not stripped (#370).
     out_path = export_path(filename)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not export_folder_exists(out_path.parent):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        export_folder_exists(out_path.parent)
     if export_entry_is_other(out_path):
         raise GoldStandardError(
             "INVALID_PATH", f"'{filename}' is not an export file.", 400)
