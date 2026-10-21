@@ -319,7 +319,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 result=await task;self.assertEqual(result['pairs_saved'],1)
         asyncio.run(run())
-        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'snapshot.json').read_text())[0]['answer'],'Original')
         self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
 
     def test_scan_of_missing_storage_does_not_create_directory(self):
@@ -394,7 +394,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
         self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
-        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
+        self.assertFalse((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'owned-review.json').exists())
 
     def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
         async def run():

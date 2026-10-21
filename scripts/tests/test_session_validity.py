@@ -91,7 +91,7 @@ class ValidityServiceTests(unittest.TestCase):
         result=asyncio.run(gs.save_session(self.data['session_id'],'historical.json',True))
         self.assertTrue(result['historical']);self.assertEqual((result['pairs_saved'],result['pairs_excluded']),(2,2))
         self.assertEqual(before,self.data)
-        rows=json.loads((Path(self.temp.name)/'historical.json').read_text())
+        rows=json.loads((Path(self.temp.name)/gs.EXPORT_DIRNAME/'historical.json').read_text())
         self.assertTrue(all(set(row)=={'question','answer','contexts','ground_truth'} for row in rows))
 
     def test_boolean_only_choice_and_unknown_identity(self):

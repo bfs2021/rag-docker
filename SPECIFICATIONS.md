@@ -1064,7 +1064,11 @@ Stale/orphaned sessions return **409 `HISTORICAL_SESSION`** before writing unles
 }
 ```
 
-`filename`: if null, defaults to `{collection}_{YYYYMMDD_HHMMSS}.json` where `collection` is taken from the session's own collection name.
+`filename`: if null or empty, defaults to `{collection}_{YYYYMMDD_HHMMSS}.json` where `collection` is taken from the session's own collection name (spaces become `_`, other characters outside `A-Z`, `a-z`, `0-9` and `_` are dropped). If that name would be longer than 128 characters, the collection part is shortened so the name is exactly 128 characters.
+
+Exports are written to `{UPLOAD_DIR}/goldstandard_exports/{filename}`, a folder of their own, and nowhere else (#370). A supplied `filename` must be 1-128 characters, each a letter, a digit, `_`, `-`, `.` or a space, and must end in `.json` (any letter case). It is checked as given: a path is refused, not stripped, and a missing `.json` is refused, not appended. Saving under the name of an existing export overwrites that export.
+
+**Response 400** (`INVALID_PATH`) if `filename` breaks that rule (for example `.`, `..`, `metrics.jsonl`, `report.txt`, `a/b.json`), or if something other than a regular file (a directory or a symbolic link) already has that name in the exports folder. Nothing is written. The session check (404) and the historical check (409) come first.
 
 **Response 404** if the session does not exist (uses `SESSION_NOT_FOUND` error code).
 
@@ -1105,9 +1109,11 @@ The file is a JSON array of these objects.
 GET /goldstandard/download/{filename}
 ```
 
-Returns the saved file as a JSON download (`Content-Disposition: attachment`).
+Returns the saved file from `{UPLOAD_DIR}/goldstandard_exports/` as a JSON download (`Content-Disposition: attachment`). Only that folder is served: no other file in `UPLOAD_DIR` is. Exports saved at the top level of `UPLOAD_DIR` before #370 stay on disk but are not served.
 
-**Response 404** if the file does not exist:
+**Response 400** (`INVALID_PATH`) if `filename` breaks the save name rule, or if the name in the exports folder is not a regular file (a directory or a symbolic link).
+
+**Response 404** if `filename` is valid and no export has that name:
 ```json
 { "error": { "code": "FILE_NOT_FOUND", "message": "File 'Documents_20260910_143022.json' not found.", "detail": null } }
 ```
@@ -1194,6 +1200,7 @@ Standard error codes:
 | `PAIR_GENERATION_TIMEOUT` | 504 | Regeneration model deadline exceeded; existing pair unchanged |
 | `SESSION_DURABILITY_UNCERTAIN` | 503 | Replacement published but directory durability uncertain; refresh before retry |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
+| `INVALID_PATH` | 400 | Gold-standard export name breaks the name rule (1-128 letters, digits, `_`, `-`, `.` or spaces, ending in `.json`), or the name in the exports folder is not a regular file |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
@@ -2504,6 +2511,17 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Download endpoint returns 404 for a non-existent filename.
       *Traversal attempts (`..%2F`, absolute paths, sub-directories) are rejected
       at the routing layer before reaching the handler.*
+- [x] Save writes, and download serves, only files in `{UPLOAD_DIR}/goldstandard_exports/`
+      (#370). Save as `collection_registry.json` writes an export and leaves the registry
+      unchanged; `.`, `..`, `metrics.jsonl`, a directory name, a wrong extension, a path or a
+      129-character name gets 400 `INVALID_PATH` and touches no file; a directory or link
+      in the exports folder gets 400 on save and download; a top-level file is not served
+      (404); the default name, valid custom names and the UI's default form still save and
+      download; saving twice under one name overwrites.
+      *`test_goldstandard_exports.py`, run by `10_validity.sh`, which also checks
+      download refusals through the proxy; `04_goldstandard.sh` checks the save
+      refusals and that `GET /collections` still answers after a save as
+      `collection_registry.json`.*
 
 **Also fixed here:** `pairs_completed` was incremented in a `finally`, so it
 counted *attempts*. A session that lost a pair reported "3/3 complete" while
