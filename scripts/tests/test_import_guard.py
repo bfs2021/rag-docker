@@ -53,6 +53,8 @@ class ImportGuardTests(unittest.TestCase):
         self.release = threading.Event()     # lets every held build finish
         self.addCleanup(self.release.set)
         self.built = []
+        self.create_first = False            # create the collection before holding, as Weaviate does
+        self.fail_build = set()              # targets whose build raises
         stack = ExitStack()
         self.addCleanup(stack.close)
         for change in [
@@ -102,7 +104,16 @@ class ImportGuardTests(unittest.TestCase):
 
     def build(self, target, pkg, manifest, progress, instance=None):
         self.arrived.append(target)
+        if self.create_first:
+            # The real _build creates the collection, then inserts: the target
+            # exists while the first import is still writing it.
+            self.backend.add(target)
+            assert self.release.wait(10)
+            self.built.append(target)
+            return 1
         assert self.release.wait(10)
+        if target in self.fail_build:
+            raise RuntimeError(f"insert into {target} failed")
         if target in self.backend:
             raise RuntimeError("Collection may not have been created properly.! Unexpected "
                                "status code: 422, with response body: {'error': [{'message': "
@@ -296,6 +307,76 @@ class ImportGuardTests(unittest.TestCase):
         self.assertTrue(self.wait_finished(loop, third_id))
         third = self.job(third_id)
         self.assertEqual((third["status"], third["error_code"]), ("failed", "COLLECTION_EXISTS"), third)
+
+    def test_the_claim_comes_before_the_existence_check(self):
+        # The first import's collection exists while it builds, as with Weaviate.
+        # A second import of that target is refused for the import in progress,
+        # not judged on the half-built collection: no COLLECTION_EXISTS, and no
+        # rename of a collection that is still being written.
+        self.create_first = True
+        for mode in ("abort", "rename", "replace"):
+            with self.subTest(second=mode):
+                self.backend.clear(); self.arrived.clear(); self.built.clear()
+                self.release.clear()
+                name = f"Early{mode.capitalize()}"
+                loop, first_id, second_id, owner = self.held_then_second(
+                    (f"{name}-a.tar.gz", name, "abort"), (f"{name}-b.tar.gz", name, mode),
+                    collection=name)
+                self.assert_refused(self.job(second_id), name)
+                self.assertEqual(owner, first_id)
+                self.assertEqual(self.built, [name])
+                self.assertTrue(wait_until(lambda: not getattr(importer, "_targets", {})))
+
+    def test_a_refused_import_registers_nothing(self):
+        loop = self.new_loop()
+        self.packages.update({"a.tar.gz": "Registered", "b.tar.gz": "Registered"})
+        first_id = self.start(loop, "a.tar.gz", "abort")
+        self.assertTrue(self.wait_arrived(loop, 1), self.job(first_id))
+
+        async def post():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://guard") as api:
+                return await api.post("/import", json={"filename": "b.tar.gz", "on_conflict": "abort"})
+        # The target refusal is the job's, not the request's: POST still answers 202.
+        response = loop.run_until_complete(post())
+        self.assertEqual(response.status_code, 202, response.text)
+        second_id = response.json()["job_id"]
+        self.assertTrue(self.wait_finished(loop, second_id, timeout=2.0), self.job(second_id))
+        self.assert_refused(self.job(second_id), "Registered")
+        # Only the first import is registered against the collection (#40).
+        self.assertEqual(writes.active_jobs("Registered"), [("import", first_id)])
+        self.release.set()
+        self.assertTrue(self.wait_finished(loop, first_id))
+
+    def test_a_target_is_free_again_after_its_import_fails(self):
+        loop = self.new_loop()
+        self.fail_build.add("Broken")
+        self.packages.update({"a.tar.gz": "Broken", "b.tar.gz": "Broken"})
+        first_id = self.start(loop, "a.tar.gz", "abort")
+        self.release.set()
+        self.assertTrue(self.wait_finished(loop, first_id))
+        first = self.job(first_id)
+        self.assertEqual((first["status"], first["error_code"]), ("failed", "IMPORT_FAILED"), first)
+        self.assertTrue(wait_until(lambda: not getattr(importer, "_targets", {})))
+        self.fail_build.clear()
+        second_id = self.start(loop, "b.tar.gz", "abort")
+        self.assertTrue(self.wait_finished(loop, second_id))
+        self.assertEqual(self.job(second_id)["status"], "completed", self.job(second_id))
+        self.assertEqual(self.built, ["Broken"])
+
+    def test_a_failed_start_releases_every_spelling(self):
+        # A start whose first record can't be stored releases the package name,
+        # not the spelling it was sent with.
+        loop = self.new_loop()
+        self.packages["x.tar.gz"] = "Retried"
+        with patch.object(importer._jobs, "create", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.start(loop, "./x.tar.gz", "abort")
+        self.assertEqual(importer._active, set())
+        job_id = self.start(loop, "x.tar.gz", "abort")
+        self.release.set()
+        self.assertTrue(self.wait_finished(loop, job_id))
+        self.assertEqual(self.job(job_id)["status"], "completed", self.job(job_id))
 
 
 if __name__ == "__main__":

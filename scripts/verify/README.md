@@ -201,7 +201,13 @@ answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
 building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
 `on_conflict`, never builds, and leaves the first job's in-progress marker in place;
 imports into different targets run side by side; a `rename` claims its new name and
-frees the original. `05_transfer.sh` runs it in the verify project's API container.
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
