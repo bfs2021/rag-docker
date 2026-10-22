@@ -1080,7 +1080,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     source_file: str
     chunk_index: int
-    score: float
+    score: Optional[float]  # higher is better in every mode; null when missing (#376)
     excerpt: str
 
 
@@ -1187,6 +1187,15 @@ class PatchPairRequest(BaseModel):
                 f"changing {', '.join(content)} requires status='edited'; "
                 f"got status={self.status!r}")
         return self
+
+    @field_validator("question", "answer", "ground_truth")
+    @classmethod
+    def _content_not_empty(cls, v: Optional[str], info) -> Optional[str]:
+        """An empty field would be saved into the RAGAS export as an empty row
+        field. Generation refuses empty model fields the same way (#381)."""
+        if v is not None and not v.strip():
+            raise ValueError(f"{info.field_name} must not be empty or only whitespace")
+        return v
 
     @field_validator("status")
     @classmethod
@@ -2738,11 +2747,39 @@ async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
     await asyncio.to_thread(_insert_chunks_sync, collection_name, chunks)
 
 
+# A citation's score is higher-is-better in every retrieval mode (#376), so the
+# distance-based modes turn Weaviate's distance into a similarity by the
+# collection's distance metric.
+_SIMILARITY = {
+    VectorDistances.COSINE: lambda d: 1 - d,            # cosine similarity, -1 to 1
+    VectorDistances.DOT: lambda d: -d,                  # the dot product itself
+    VectorDistances.L2_SQUARED: lambda d: 1 / (1 + d),  # 0 to 1
+}
+
+
+def _distance_to_score(coll):
+    """The distance-to-score conversion for this collection's metric.
+
+    The metric is read on every query, not cached, so a collection deleted and
+    recreated with another metric is converted by its new one. A missing
+    distance, or a metric that can't be read or has no conversion, gives None.
+    """
+    vector_config = coll.config.get().vector_index_config
+    convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
+
+    def to_score(distance: float | None) -> float | None:
+        if convert is None or distance is None:
+            return None
+        return convert(distance)
+    return to_score
+
+
 def _near_vector_query_sync(
     collection_name: str, vector: list[float], top_k: int
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_vector(
         near_vector=vector,
         limit=top_k,
@@ -2751,12 +2788,11 @@ def _near_vector_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2772,6 +2808,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_text(
         query=query,
         limit=top_k,
@@ -2780,12 +2817,11 @@ def _near_text_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2814,7 +2850,8 @@ def _hybrid_query_sync(
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": obj.metadata.score or 0.0,
+            # Weaviate's fusion score, higher is better; missing reads as None (#376).
+            "score": obj.metadata.score,
         })
     return rows
 
@@ -4169,6 +4206,17 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
+def _is_macos_metadata(logical: str) -> bool:
+    """Whether a ZIP member is macOS metadata rather than a document (#378).
+
+    Finder's Compress stores each file's resource fork and extended attributes
+    as an AppleDouble file, __MACOSX/<folder>/._<name>, and other macOS tools
+    write ._<name> beside the file. Either keeps the real file's suffix, so the
+    suffix check would queue it as a document of its own."""
+    path = PurePosixPath(logical)
+    return path.parts[0] == "__MACOSX" or path.name.startswith("._")
+
+
 def _limit_text(limit: int) -> str:
     mib = 1024 * 1024
     if limit >= mib and limit % mib == 0:
@@ -4195,7 +4243,8 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
-    them; nothing is repaired, and nothing from it is ingested (#290).
+    them; nothing is repaired, and nothing from it is ingested (#290). macOS
+    metadata members (__MACOSX/, ._*) are skipped like unsupported ones (#378).
 
     The request's ZIPs may expand to at most the budget (#298): the sizes this
     ZIP declares are checked before anything is read, then the bytes actually
@@ -4261,6 +4310,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
         for member, logical in members:
             basename = PurePosixPath(logical).name
+            if _is_macos_metadata(logical):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} (macOS metadata (AppleDouble), not a document)")
+                continue
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
                     or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
@@ -4469,11 +4522,17 @@ SYNTHESIS_ENGINEER_SYSTEM = (
 
 
 class ServiceUnavailable(Exception):
-    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+    """Ollama or Weaviate failed during a query; `service` names which (#373).
 
-    def __init__(self, service: str):
+    `embedder` names the service that embeds the question for `service`, when it
+    does so itself: in hybrid and semantic modes Weaviate embeds through Ollama,
+    so an Ollama failure there comes back as a Weaviate error (#411).
+    """
+
+    def __init__(self, service: str, embedder: str | None = None):
         super().__init__(f"{service} failed during the query")
         self.service = service
+        self.embedder = embedder
 
 
 async def _from_ollama(call):
@@ -4484,12 +4543,12 @@ async def _from_ollama(call):
         raise ServiceUnavailable("Ollama") from exc
 
 
-async def _from_weaviate(call):
+async def _from_weaviate(call, embedder: str | None = None):
     """Await a Weaviate query; any error from it is ServiceUnavailable."""
     try:
         return await call
     except Exception as exc:                          # noqa: BLE001
-        raise ServiceUnavailable("Weaviate") from exc
+        raise ServiceUnavailable("Weaviate", embedder) from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -4529,9 +4588,11 @@ async def run_query(
         vector = await _from_ollama(ollama.embed(reformulated))
         chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
     elif retrieval_mode == "hybrid":
-        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
+        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k),
+                                      embedder="Ollama")
     elif retrieval_mode == "semantic":
-        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
+        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k),
+                                      embedder="Ollama")
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
@@ -4551,7 +4612,7 @@ async def run_query(
             {
                 "source_file": c["source_file"],
                 "chunk_index": c["chunk_index"],
-                "score": round(c["score"], 4),
+                "score": None if c["score"] is None else round(c["score"], 4),
                 "excerpt": c["content"][:200],
             }
             for c in chunks
@@ -5546,20 +5607,32 @@ async def start_generation(
     }
 
 
+def _session_not_found(session_id: str) -> GoldStandardError:
+    return GoldStandardError("SESSION_NOT_FOUND", f"Session '{session_id}' not found.", 404)
+
+
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
+    """The updated pair, or None for an unknown pair. An unknown session raises
+    SESSION_NOT_FOUND, so the two 404s stay apart (#381)."""
     def change(current):
         for pair in current["pairs"]:
             if pair["pair_id"] == pair_id:
                 pair.update({key: value for key, value in updates.items() if value is not None})
                 return pair
         return None
-    return await asyncio.to_thread(_update_session_sync, session_id, change)
+
+    def apply():
+        with _state_lock:
+            if session_id not in _sessions:
+                raise _session_not_found(session_id)
+            return _update_session_sync(session_id, change)
+    return await asyncio.to_thread(apply)
 
 
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
-        return None
+        raise _session_not_found(session_id)
     if session.get("status") == "generating":
         # The generation loop is appending to session["pairs"] and saving it;
         # regenerating underneath that races with it and can lose a pair.
@@ -6142,7 +6215,7 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
             wanted = [settings.embed_model, settings.llm_model]
             if not model_bundle.store_available():
@@ -6157,7 +6230,8 @@ def build(
                     except (OSError, ValueError) as exc:
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model.split(":")[0])
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -6203,9 +6277,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -6219,18 +6293,6 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -6254,7 +6316,6 @@ def build(
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
@@ -7320,20 +7381,23 @@ def _check_embedding(manifest: dict) -> None:
 
     if pkg_model != our_model:
         fidelity = manifest.get("fidelity")
-        remedy = ("This package is `with-sources`, so it can be re-embedded after "
-                  "import once that is supported."
+        # Nothing re-embeds a refused package, whatever its fidelity (#390).
+        remedy = (f"Use an instance running '{pkg_model}', or re-export from one."
                   if fidelity == "with-sources" else
                   "This package is `chunks-only`, so it cannot be re-embedded from "
                   "the original documents. Use an instance running "
                   f"'{pkg_model}', or re-export from one.")
+        actual = _probe_dimensions()
+        ours = (f"{actual} dimensions" if actual is not None else
+                "whose dimension count couldn't be read from Ollama")
         raise PackageError(
             "EMBEDDING_MISMATCH",
             f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
-            f"but this instance uses '{our_model}'. Vectors from a different model "
-            f"are meaningless here, not merely different, so the import is refused. "
-            + remedy,
+            f"but this instance uses '{our_model}' ({ours}). Vectors from a different "
+            f"model are meaningless here, not merely different, so the import is "
+            f"refused. " + remedy,
             {"package_model": pkg_model, "package_dimensions": pkg_dims,
-             "instance_model": our_model})
+             "instance_model": our_model, "instance_dimensions": actual})
 
     # Same model name but a different width means one side is not what it claims.
     if pkg_dims is not None:
@@ -7471,7 +7535,16 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Could not install bundled model '{name}': {exc}",
                 {"model": name}) from exc
-        if not model_bundle.is_installed(model):
+        # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
+        reported = _ollama_reports(model)
+        if reported is None:
+            raise PackageError(
+                "IMPORT_FAILED",
+                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"confirm it is there. Check that the ollama service is running, "
+                f"then import again.",
+                {"model": name})
+        if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
@@ -8331,6 +8404,18 @@ def _nothing_to_rebuild(collection: str) -> PackageError:
         {"collection": collection})
 
 
+# An invalid retained source index (sources.load_index raises ValueError) is
+# refused before a job is created too, as the tuning options already report it
+# (#389). Re-embedding from stored chunks and re-indexing never read it.
+def _source_index_invalid(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCE_INDEX_INVALID",
+        f"Cannot re-chunk '{collection}': its retained source index is invalid. "
+        "Repair it before re-chunking; re-embedding from stored chunks and "
+        "re-indexing remain available.",
+        {"collection": collection})
+
+
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
@@ -8341,16 +8426,17 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
 
 
 def _refuse_nothing_to_rebuild(collection: str) -> None:
-    """The one re-chunk refusal made before a job is created (#328).
+    """The re-chunk refusals made before a job is created: an invalid
+    retained source index (#389) and nothing to rebuild (#328).
 
-    The other refusals, and an invalid index, are still reported by the job.
-    A Weaviate failure during the walk raises ServiceUnavailableError, which
-    the router answers with 503 rather than a bare 500 (#340).
+    The other refusals are still reported by the job. A Weaviate failure
+    during the walk raises ServiceUnavailableError, which the router answers
+    with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
-    except ValueError:
-        return
+    except ValueError as exc:
+        raise _source_index_invalid(collection) from exc
     if not documents:
         return
     try:
@@ -8708,8 +8794,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guards; the store removes the record.
     try:
-        # A re-chunk with nothing to rebuild is refused here, before any job
-        # exists (#328); the walk runs off the event loop too.
+        # A re-chunk with an invalid source index (#389) or nothing to rebuild
+        # (#328) is refused here, before any job exists; the walk runs off the
+        # event loop too.
         if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
             await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
         await _jobs.create(job_id, {
@@ -8923,6 +9010,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8953,20 +9042,51 @@ def _registry_path() -> Path:
     return _REGISTRY_FILE
 
 
+class _RegistryUnreadable(Exception):
+    """The registry file exists but can't be read as a JSON object (#388)."""
+
+
 def _load_registry() -> dict:
+    """The registry, or {} when the file doesn't exist yet. A file that exists but
+    can't be read, isn't JSON or isn't an object raises _RegistryUnreadable, so it
+    is never taken for an empty registry and overwritten by the next save (#388)."""
     p = _registry_path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return {}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RegistryUnreadable(f"{p} can't be read: {exc}") from exc
+    try:
+        reg = json.loads(text)
+    except ValueError as exc:
+        raise _RegistryUnreadable(f"{p} isn't valid JSON: {exc}") from exc
+    if not isinstance(reg, dict):
+        raise _RegistryUnreadable(f"{p} isn't a JSON object")
+    return reg
 
 
 def _save_registry(reg: dict) -> None:
+    """Publish the whole registry atomically (#388): a uniquely named temporary file
+    in the same folder, fsynced, then os.replace. A failure at any step leaves the
+    old file whole and no temporary file, and raises. Callers hold _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(reg, indent=2))
+    payload = json.dumps(reg, indent=2)
+    # mkstemp creates the file 0600, like the job and session files.
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 @router.get("", response_model=CollectionsResponse)
@@ -8979,7 +9099,13 @@ async def list_collections():
         return api_error(503, "SERVICE_UNAVAILABLE",
                          "Cannot list the collections: Weaviate could not be read. "
                          "Try again when Weaviate is available.")
-    registry = await asyncio.to_thread(_load_registry)
+    try:
+        registry = await asyncio.to_thread(_load_registry)
+    except _RegistryUnreadable as exc:
+        # Listed without created_at; the file is left for someone to fix (#388).
+        _log.warning("The collection registry can't be read, so created_at is null "
+                     "for every collection: %s", exc)
+        registry = {}
     items = [
         CollectionInfo(
             name=c["name"],
@@ -9018,9 +9144,16 @@ async def create_collection(body: CreateCollectionRequest):
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        registry[body.name] = datetime.now(timezone.utc).isoformat()
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten with this one entry (#388).
+            _log.exception("Collection %r was created, but its created_at was not recorded: "
+                           "the collection registry can't be read and is left unchanged",
+                           body.name)
+        else:
+            registry[body.name] = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(_save_registry, registry)
 
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
@@ -9074,10 +9207,17 @@ async def delete_collection(name: str, confirm: str | None = None):
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        for spelling in aliases(name):
-            registry.pop(spelling, None)
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten without its other entries (#388).
+            _log.exception("Collection %r was deleted, but its created_at was not removed: "
+                           "the collection registry can't be read and is left unchanged",
+                           name)
+        else:
+            for spelling in aliases(name):
+                registry.pop(spelling, None)
+            await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
 ```
@@ -9218,6 +9358,22 @@ router = APIRouter(prefix="/query")
 _log = logging.getLogger(__name__)
 
 
+def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
+    """The 503 for a dependency failure, naming the embedder too when there is one (#411)."""
+    service, embedder = exc.service, exc.embedder
+    if embedder is None:
+        _log.exception("Query on %r failed: %s did not answer", collection, service)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error. Try again when {service} is available.")
+    else:
+        _log.exception("Query on %r failed: %s (or %s, embedding the question for it) "
+                       "did not answer", collection, service, embedder)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error, or {embedder} could not embed the "
+                   f"question for it. Try again when {service} and {embedder} are available.")
+    return api_error(503, "SERVICE_UNAVAILABLE", message, detail={"collection": collection})
+
+
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
     try:
@@ -9241,12 +9397,7 @@ async def run_query(body: QueryRequest):
         )
     except rag_pipeline.ServiceUnavailable as exc:
         # The cause is logged, not sent (#373).
-        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
-        return api_error(503, "SERVICE_UNAVAILABLE",
-                         f"The question was not answered: {exc.service} could not be reached, "
-                         f"timed out or returned an error. Try again when {exc.service} "
-                         f"is available.",
-                         detail={"collection": body.collection})
+        return _unavailable(body.collection, exc)
 
     await metrics.record(
         collection=body.collection,
@@ -11179,7 +11330,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -11223,7 +11374,7 @@ export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface ImportBody { filename: string; on_conflict: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
@@ -11342,7 +11493,7 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
           <div key={i} className="text-xs bg-gray-50 border rounded p-2">
             <div className="flex justify-between mb-1">
               <span className="font-medium">{c.source_file}</span>
-              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score.toFixed(3)}</span>
+              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score === null ? 'n/a' : c.score.toFixed(3)}</span>
             </div>
             <p className="text-gray-700 italic">{c.excerpt}</p>
           </div>
@@ -11683,6 +11834,9 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The status the upload was accepted with, shown with the job ID until the
+  // first poll answers, so the page responds at once rather than 3 s later (#394).
+  const [queuedStatus, setQueuedStatus] = useState('')
   const [error, setError] = useState('')
   // A failed status poll, shown instead of ignored (#290). Polling carries on,
   // and the next successful poll clears it.
@@ -11772,9 +11926,15 @@ export default function ImportPage() {
   }
 
   async function startIngest() {
-    if (!files.length || !collection) return
+    if (!files.length) return
     setError('')
     setPollError('')
+    // With no collection selected (none exist, or the list failed to load),
+    // say so instead of doing nothing (#394).
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -11795,6 +11955,7 @@ export default function ImportPage() {
     try {
       const res = await api.uploadFiles(form)
       setJobId(res.job_id)
+      setQueuedStatus(res.status)
       setJob(null)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -11874,6 +12035,13 @@ export default function ImportPage() {
         Start Ingest
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {jobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{jobId}</span></p>}
+      {jobId && !job && (
+        <div className="mt-4 p-4 border rounded bg-gray-50 flex justify-between text-sm">
+          <span>Waiting for the first progress update</span>
+          <span className="text-blue-600">{queuedStatus}</span>
+        </div>
+      )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
@@ -12711,92 +12879,166 @@ const CONFLICT = [
   { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
 ]
 
+// Both halves poll their job every 2 s. A failed poll is shown and retried;
+// after POLL_ATTEMPTS failures in a row (about a minute, long enough for an API
+// restart) the page stops watching that job and enables its button again, so
+// one transient 502 can no longer leave it stuck until a reload (#382).
+const POLL_MS = 2000
+const POLL_ATTEMPTS = 30
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 export default function TransferPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
+  const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
+  const [exportWatching, setExportWatching] = useState(false)
+  const [exportPollError, setExportPollError] = useState('')
 
   const [packages, setPackages] = useState<PackageSummary[]>([])
+  const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
+  const [importWatching, setImportWatching] = useState(false)
+  const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching.
+  // does not leave a timer running against a job nobody is watching. The job
+  // id being polled is kept too: a poll that answers after the page unmounted,
+  // or after it stopped watching that job, schedules nothing and changes nothing.
+  const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
+  const exportPoll = useRef<string | null>(null)
+  const importPoll = useRef<string | null>(null)
 
   const loadPackages = useCallback(() => {
-    api.getPackages().then(r => setPackages(r.packages)).catch(() => {})
+    api.getPackages().then(r => {
+      setPackages(r.packages)
+      setPackagesError('')
+    }, (e: unknown) => setPackagesError(`Could not list the packages in ./exports: ${message(e)}`))
   }, [])
 
   useEffect(() => {
+    alive.current = true
     api.getCollections().then(r => {
       setCollections(r.collections)
       if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch(() => {})
     loadPackages()
     return () => {
+      alive.current = false
+      exportPoll.current = null
+      importPoll.current = null
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
   }, [loadPackages])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
-  // than discovered afterwards in the manifest.
+  // than discovered afterwards in the manifest. A lookup that fails says so
+  // instead of hiding the line, and an answer for a collection that is no
+  // longer selected is ignored.
   useEffect(() => {
-    if (!collection) { setTune(null); return }
-    api.getTuneOptions(collection).then(setTune).catch(() => setTune(null))
+    setTune(null); setTuneError('')
+    if (!collection) return
+    let current = true
+    api.getTuneOptions(collection).then(t => {
+      if (current) setTune(t)
+    }, (e: unknown) => {
+      if (current) setTuneError(message(e))
+    })
+    return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string) {
+  function pollExport(jobId: string, failures = 0) {
     api.getExportJob(jobId).then(job => {
+      if (exportPoll.current !== jobId) return
       setExportJob(job)
+      setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
+        exportPoll.current = null
+        setExportWatching(false)
         loadPackages()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), 2000)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
-    }).catch((e: unknown) => setExportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (exportPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        exportPoll.current = null
+        setExportWatching(false)
+        setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
+      } else {
+        setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
-  function pollImport(jobId: string) {
+  function pollImport(jobId: string, failures = 0) {
     api.getImportJob(jobId).then(job => {
+      if (importPoll.current !== jobId) return
       setImportJob(job)
+      setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), 2000)
-      } else if (job.status === 'completed') {
+        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        return
+      }
+      importPoll.current = null
+      setImportWatching(false)
+      if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
-    }).catch((e: unknown) => setImportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (importPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        importPoll.current = null
+        setImportWatching(false)
+        setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
+      } else {
+        setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
   async function startExport() {
-    setExportError(''); setExportJob(null)
+    setExportError(''); setExportPollError(''); setExportJob(null)
     try {
       const r = await api.startExport({ collection, include_models: includeModels })
+      if (!alive.current) return
+      exportPoll.current = r.job_id
+      setExportWatching(true)
       pollExport(r.job_id)
     } catch (e: unknown) {
-      setExportError(e instanceof Error ? e.message : String(e))
+      setExportError(message(e))
     }
   }
 
   async function startImport() {
-    setImportError(''); setImportJob(null)
+    setImportError(''); setImportPollError(''); setImportJob(null)
     try {
       const r = await api.startImport({ filename, on_conflict: onConflict })
+      if (!alive.current) return
+      importPoll.current = r.job_id
+      setImportWatching(true)
       pollImport(r.job_id)
     } catch (e: unknown) {
-      setImportError(e instanceof Error ? e.message : String(e))
+      setImportError(message(e))
     }
   }
 
-  const exportBusy = exportJob !== null && exportJob.status !== 'completed' && exportJob.status !== 'failed'
-  const importBusy = importJob !== null && importJob.status !== 'completed' && importJob.status !== 'failed'
+  const exportBusy = exportWatching
+  const importBusy = importWatching
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -12826,7 +13068,7 @@ export default function TransferPage() {
           ))}
         </select>
 
-        {tune && (
+        {tune ? (
           <p className="text-xs mb-3">
             <span className={tune.fidelity === 'with-sources' ? 'text-green-700' : 'text-amber-700'}>
               Fidelity: <strong>{tune.fidelity}</strong>
@@ -12836,7 +13078,13 @@ export default function TransferPage() {
               ? `${tune.source_document_count} original document(s) will travel with the package.`
               : 'No original documents were retained, so the package cannot be re-chunked after import.'}
           </p>
-        )}
+        ) : tuneError ? (
+          <p className="text-xs mb-3 text-red-600">
+            Fidelity: <strong>unknown</strong> — it could not be read: {tuneError}
+          </p>
+        ) : collection ? (
+          <p className="text-xs mb-3 text-gray-500">Fidelity: reading…</p>
+        ) : null}
 
         <label className="flex items-start gap-2 text-sm mb-3">
           <input type="checkbox" checked={includeModels} onChange={e => setIncludeModels(e.target.checked)} className="mt-1" />
@@ -12858,6 +13106,7 @@ export default function TransferPage() {
         </button>
 
         {exportError && <p className="text-red-600 text-sm mt-3">{exportError}</p>}
+        {exportPollError && <p className="text-red-600 text-sm mt-3">{exportPollError}</p>}
         {exportJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -12875,7 +13124,12 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
-            {exportJob.status === 'failed' && <p className="text-red-600">{exportJob.error}</p>}
+            {exportJob.status === 'failed' && (
+              <p className="text-red-600">
+                {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
+                {exportJob.error}
+              </p>
+            )}
             {exportJob.warnings.map((w, i) => (
               <p key={i} className="text-amber-700 text-xs mt-1">{w}</p>
             ))}
@@ -12906,7 +13160,8 @@ export default function TransferPage() {
             </option>
           ))}
         </select>
-        {packages.length === 0 && (
+        {packagesError && <p className="text-red-600 text-xs mb-3">{packagesError}</p>}
+        {packages.length === 0 && !packagesError && (
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
@@ -12935,6 +13190,7 @@ export default function TransferPage() {
         </button>
 
         {importError && <p className="text-red-600 text-sm mt-3">{importError}</p>}
+        {importPollError && <p className="text-red-600 text-sm mt-3">{importPollError}</p>}
         {importJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -13330,7 +13586,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the four controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13374,6 +13630,15 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
+an import job of a digest-valid package embedded with another model is refused
+`EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
+and both dimension counts (or saying this instance's count couldn't be read), with
+no promise of re-embedding; a same-name package of another width is refused too.
+It also checks that a model installed from a package is confirmed through Ollama's
+model list: reported, not reported, and Ollama unreachable. Only Ollama is
+replaced. `05_transfer.sh` runs it in the verify project's API container.
+
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
 wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
@@ -13389,6 +13654,10 @@ in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
 (suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
 failing status poll, and that a new ingest and the next successful poll clear that error.
+Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
+queued panel show as soon as an upload is accepted, before the first poll, and stay through a
+failed poll; that the first answered poll replaces the panel while the job ID stays; and that
+"Start Ingest" with no collection selected says so and sends nothing.
 
 `scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
 upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
@@ -13546,7 +13815,11 @@ same-named inputs don't collide. Admission: a name twice in one request keeps th
 repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
 keep the last and list each earlier one in `skipped`; members in different folders stay
 separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
-names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling.
+macOS metadata in a ZIP (#378): a Finder-style ZIP queues its file and lists the
+`__MACOSX/` AppleDouble member in `skipped`, a `._*` file beside its file and any other
+`__MACOSX/` member are skipped the same way, names that only look like them are queued, and a
+ZIP of nothing else is refused with `NO_SUPPORTED_FILES`. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
 marking failure fails only that file and changes nothing; a failed lookup of the later files
@@ -13578,8 +13851,9 @@ the JSON 503 reaches the client (#369).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
-names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
-with one filename. With a real gold-standard session planted for the collection, it checks
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, a Finder-style
+ZIP (it completes with no errors, stores only its file and lists the AppleDouble member in
+`skipped`, #378), and two parts with one filename. With a real gold-standard session planted for the collection, it checks
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
@@ -13682,17 +13956,22 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
@@ -13701,7 +13980,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -13845,6 +14124,24 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
+
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
@@ -13858,6 +14155,13 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+It also checks (#411) that other HTTP errors keep FastAPI's own answer (a malformed
+multipart upload is FastAPI's 400 with `detail`, not the envelope), that the engineer-format
+synthesis failing is the Ollama 503, that a Weaviate failure in `hybrid` and `semantic`
+modes names Ollama too (Weaviate embeds the question through it there), and that a help
+template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+checks the envelope through the proxy on the running stack: an unknown route answers 404
+`NOT_FOUND` and `PUT /query` answers `METHOD_NOT_ALLOWED`.
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
@@ -13870,6 +14174,18 @@ service red and the others green, that a proxy 502, a refused connection and a 5
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
 refresh whatever health answers.
+
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
 
 Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
 runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
@@ -13916,6 +14232,22 @@ tried again; that 1,100 concurrent records all land; and that a restart restores
 records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
 files a crash left, and starts when the file can't be read or compacted. It also checks the
 `IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+
+Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
+`scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
+the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
+`1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
+first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
+`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+rounds numbers and passes `null` through, and `/query` returns it. It also checks the
+`IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
+project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
+vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled, and checks the
+scores against the expected similarities; then it deletes the cosine collection, recreates it
+with l2-squared, and checks the next query uses the new metric. With models, the suite checks
+that in each of the four modes the citation scores are numbers, highest first.
+`browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
+`n/a` for a `null` score.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
@@ -15508,13 +15840,26 @@ section "§10.5 Infrastructure"
 check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Both distribution scripts in a scratch git repository, docker stubbed (#384).
+python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
+check "Distribution archives hold only the tracked files of HEAD (#384)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# The same envelope through the proxy on the running stack (#373).
+check_eq "an unknown API route answers 404 through the proxy (#373)" \
+  "$(api_code "$API/no-such-route-373")" "404"
+check_eq "  ... in the envelope, code NOT_FOUND" \
+  "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
+check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
+  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -16504,6 +16849,40 @@ sys.exit(0 if ok else 1)
 ENDPY
 check "ZIP members with one basename in two folders stay two documents, named by path" $?
 
+# A Finder "Compress" ZIP (#378): __MACOSX/finder/._report.txt is the file's
+# AppleDouble resource fork with the same suffix, and was queued as a document.
+python3 - "$RIFIX/finder.zip" <<'ENDPY'
+import sys, zipfile
+double = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for name, data in [("finder/", b""), ("finder/report.txt",
+                        b"Finder report. The pool closes at eight on Sundays."),
+                       ("__MACOSX/", b""), ("__MACOSX/finder/", b""),
+                       ("__MACOSX/finder/._report.txt", double)]:
+        z.writestr(zipfile.ZipInfo(name), data)
+ENDPY
+ingest "$RI" fixed 200 40 "$RIFIX/finder.zip"
+cp /tmp/vfy_job.json /tmp/vfy_ri_finder.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_finder.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+checks = {
+    "completed": job["status"] == "completed",
+    "no errors": job["errors"] == [],
+    "one file": job["files_total"] == 1,
+    "skipped names the AppleDouble member": job["skipped"] == [
+        "finder.zip:__MACOSX/finder/._report.txt (macOS metadata (AppleDouble), not a document)"],
+    "real file stored": "Finder report" in names.get("finder/report.txt", ""),
+    "no metadata stored": not any("__MACOSX" in n or "/._" in n for n in names),
+}
+print({k: v for k, v in checks.items() if not v} or "ok", sorted(names))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a Finder ZIP stores its file, not the __MACOSX AppleDouble member, which is listed in skipped" $? \
+  "$(head -c 300 /tmp/vfy_ri_finder.json)"
+
 # Two parts with one filename: the second's bytes are stored, the first reported.
 ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
 cp /tmp/vfy_job.json /tmp/vfy_ri_dupe.json
@@ -17005,6 +17384,13 @@ section "§10.2 Query"
 # controlled, in the API image with no network.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
 check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
+# Citation scores are higher-is-better in every mode, and null when missing (#376):
+# controlled in the API image with no network, then on the real Weaviate with each
+# distance metric (models controlled, no LLM work).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_citation_score.py)
+check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
+check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -17039,7 +17425,7 @@ import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
 c = d.get('citations') or []
 ok = bool(c) and all(
     isinstance(x.get('source_file'), str) and x['source_file']
-    and isinstance(x.get('score'), (int, float))
+    and (x.get('score') is None or isinstance(x.get('score'), (int, float)))
     and isinstance(x.get('chunk_index'), int)
     and isinstance(x.get('excerpt'), str) for x in c)
 sys.exit(0 if ok else 1)"
@@ -17060,6 +17446,14 @@ try: d=json.load(open('/tmp/vfy_ans.json'))
 except Exception: sys.exit(1)
 sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
   check "retrieval mode '$mode' returns results" $?
+  python3 -c "
+import json,sys
+try: c=json.load(open('/tmp/vfy_ans.json')).get('citations') or []
+except Exception: sys.exit(1)
+s=[x.get('score') for x in c]
+sys.exit(0 if s and all(isinstance(v,(int,float)) for v in s) and s==sorted(s,reverse=True) else 1)"
+  check "retrieval mode '$mode' citation scores are numbers, best (highest) first (#376)" $? \
+    "$(python3 -c "import json;print([x.get('score') for x in json.load(open('/tmp/vfy_ans.json')).get('citations') or []])" 2>/dev/null)"
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
@@ -17081,6 +17475,119 @@ check "end_user answers are shorter than engineer on average" $? \
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/citation_score.py
+
+```python
+"""Citation scores on a real Weaviate: higher is better, by the collection's metric (#376).
+
+Inside the disposable API container (`03_query.sh`):
+
+    docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py
+
+Creates owned collections with each distance metric through `POST /collections`,
+inserts known vectors, and asks `/query` in the `hnsw` and `flat` modes with
+Ollama's reformulation, embedding and answer controlled. Weaviate's distances
+are real. Then deletes one collection, recreates it under the same name with
+another metric, and checks the next query converts by the new metric. Its
+collections are deleted at the end, pass or fail.
+"""
+import math
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from services import weaviate_client as wc
+
+prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
+QUERY = [1.0, 0.0, 0.0, 0.0]
+
+
+def unit(cos):
+    return [cos, math.sqrt(1 - cos * cos), 0.0, 0.0]
+
+
+# metric -> (vectors, expected score of each against QUERY), best match first.
+CASES = {
+    "cosine": ([unit(c) for c in (0.95, 0.6, 0.1, -0.5)], [0.95, 0.6, 0.1, -0.5]),
+    "dot": ([[a, 0.0, 0.0, 0.0] for a in (3.0, 1.5, -0.5, -2.0)], [3.0, 1.5, -0.5, -2.0]),
+    "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
+}
+
+client = TestClient(app)
+created = []
+failures = []
+
+
+def create(name, metric, index_type):
+    response = client.post("/collections", json={"name": name, "index_type": index_type,
+                                                  "distance_metric": metric})
+    assert response.status_code == 201, response.text
+    if name not in created:
+        created.append(name)
+    coll = wc.get_client().collections.get(name)
+    for i, vector in enumerate(CASES[metric][0]):
+        coll.data.insert(properties={"content": f"Score chunk {i}", "source_file": "score.txt",
+                                     "chunk_index": i}, vector=vector)
+
+
+def check(name, metric):
+    expected = CASES[metric][1]
+    for mode in ("hnsw", "flat"):
+        with patch("services.rag_pipeline.ollama.chat", new=AsyncMock(return_value="Controlled")), \
+                patch("services.rag_pipeline.ollama.embed", new=AsyncMock(return_value=QUERY)):
+            response = client.post("/query", json={"collection": name, "question": "score",
+                                                   "retrieval_mode": mode, "top_k": 4,
+                                                   "include_citations": True})
+        label = f"{metric} collection, {mode} mode"
+        if response.status_code != 200:
+            failures.append(f"{label}: {response.status_code} {response.text}")
+            continue
+        got = [c["score"] for c in response.json()["citations"]]
+        ok = (len(got) == len(expected)
+              and all(isinstance(g, (int, float)) and abs(g - e) < 1e-3 for g, e in zip(got, expected))
+              and got == sorted(got, reverse=True))
+        print(("PASS " if ok else "FAIL ") + f"{label}: scores {got}, expected {expected}", flush=True)
+        if not ok:
+            failures.append(f"{label}: scores {got}, expected {expected}")
+
+
+with tempfile.TemporaryDirectory(prefix="citation-score-") as directory, \
+        patch.object(settings, "upload_dir", directory):
+    try:
+        for metric, index_type in (("cosine", "hnsw"), ("dot", "flat"), ("l2-squared", "flat")):
+            name = prefix + metric.replace("-", "").capitalize()
+            create(name, metric, index_type)
+            check(name, metric)
+        # Same name, another metric: the next query must use the new metric.
+        name = prefix + "Cosine"
+        response = client.delete("/collections/" + name + "?confirm=true")
+        assert response.status_code == 200, response.text
+        create(name, "l2-squared", "hnsw")
+        print("recreated " + name + " with l2-squared", flush=True)
+        check(name, "l2-squared")
+    finally:
+        for name in created:
+            try:
+                if wc._collection_exists_sync(name):
+                    response = client.delete("/collections/" + name + "?confirm=true")
+                    if response.status_code != 200:
+                        failures.append(f"cleanup {name}: {response.status_code} {response.text}")
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"cleanup {name}: {error!r}")
+        wc.close_client()
+
+if failures:
+    print("FAIL " + "; ".join(failures), flush=True)
+    sys.exit(1)
+print("PASS citation scores convert by each collection's metric, best first", flush=True)
 ```
 
 ### scripts/verify/12_persistence.sh
@@ -17308,6 +17815,21 @@ section "§10.3 Gold Standard"
 bash ./09_sampling.sh
 check "UUID sampling acceptance" $?
 
+# Review errors need no model: an unknown session is SESSION_NOT_FOUND, an
+# unknown pair PAIR_NOT_FOUND, and an empty edit is refused with 422 (#381).
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_review.py)
+check "review 404 codes and empty-edit refusal" $?
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/gs_00000000/pair/p_1" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X POST \
+  "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+  -d '{"session_id":"gs_00000000","pair_id":"p_1"}')
+check_eq "regenerate on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
@@ -17390,6 +17912,15 @@ code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
 check_eq "a status-only change is accepted" "$code" "200"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"status":"edited","question":""}')
+check_eq "an empty question is refused" "$code" "422"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/p_unknown" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown pair returns 404 PAIR_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 PAIR_NOT_FOUND"
 
 # ── regenerate replaces exactly one pair ─────────────────────────────────────
 if [ "$actual" -ge 2 ]; then
@@ -17610,6 +18141,8 @@ check "evaluation import and generated-session regressions" $?
 check "retained-source index boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
+check "E12 embedding mismatch and post-install Ollama check regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
@@ -18141,9 +18674,23 @@ for mode in abs link; do
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
-  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
-  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
-    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  RECHUNK="{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation refuses the source-dependent starts with
+    # the typed 409, before any job is created (#389).
+    for route in rechunk reembed; do
+      check_eq "E29: $route with chunking on an on-disk abs entry is HTTP 409" \
+        "$(api_post_code "/tune/$route" "$RECHUNK")" "409"
+      api_post "/tune/$route" "$RECHUNK" > /tmp/vfy_tj.json
+      check_eq "E29: ... with error code SOURCE_INDEX_INVALID and no job ($route)" \
+        "$(jfield "['error']['code']" < /tmp/vfy_tj.json) $(jfield ".get('job_id')" < /tmp/vfy_tj.json)" \
+        "SOURCE_INDEX_INVALID None"
+    done
+  else
+    api_post "/tune/rechunk" "$RECHUNK" > /tmp/vfy_tj.json
+    check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
   if [ "$mode" = abs ]; then
     # An index that fails validation is a typed 409, not a 500, and doesn't
@@ -19425,7 +19972,7 @@ async function fixture(browser, base) {
       }
       if (path === '/api/query') {
         entry.done = true;
-        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+        return Promise.resolve(response(window.queryConfigFixture.queryResult || { answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
       }
       if (path.startsWith('/api/retrieval/config')) {
         return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
@@ -19641,6 +20188,31 @@ async function runQueryConfigTests(browser, base, reporter) {
     await assertSettings(page, { ...A, top_k: 19 });
     assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
   }]);
+  // #376: a citation's score is a number (higher is better) or null when Weaviate gave none.
+  cases.push(['citations show a numeric score and n/a for a null score', async page => {
+    await page.evaluate(() => {
+      window.queryConfigFixture.queryResult = {
+        answer: 'Fixture answer', retrieval_latency_ms: 1, llm_latency_ms: 1, chunks_retrieved: 2,
+        citations: [
+          { source_file: 'scored.txt', chunk_index: 3, score: 0.9123, excerpt: 'Scored excerpt' },
+          { source_file: 'unscored.txt', chunk_index: 4, score: null, excerpt: 'Unscored excerpt' },
+        ],
+      };
+    });
+    assert.equal(await clickByText(page, 'Q&A'), true);
+    await page.waitForSelector('textarea');
+    await page.evaluate(() => {
+      const box = [...document.querySelectorAll('label')].find(l => l.innerText.includes('Show source citations')).querySelector('input');
+      if (!box.checked) box.click();
+    });
+    await setValue(page, '() => document.querySelector("textarea")', 'Which sources?');
+    assert.equal(await clickByText(page, 'Ask'), true);
+    await page.waitForFunction(() => document.body.innerText.includes('Unscored excerpt') || document.body.innerText.includes('Fixture answer'));
+    await sleep(200);
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /chunk 3 \S score 0\.912\b/, 'the numeric score is not shown with 3 decimals');
+    assert.match(text, /chunk 4 \S score n\/a/, 'the null score is not shown as n/a');
+  }]);
   for (const [name, test] of cases) {
     let s;
     try {
@@ -19693,6 +20265,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
+
+  await require('./transfer_page').runTransferPageTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -20305,6 +20879,92 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
+    }
+  }
+
   // ── re-ingest progress (#22) ───────────────────────────────────────────────
   // The progress panel reports replaced chunks, and the skipped heading no
   // longer claims every skip is an unsupported type: a later file with the
@@ -20812,9 +21472,13 @@ re-downloads the models, so it needs internet.
 # Invoke with `bash package.sh` rather than `./package.sh` so the script does
 # not depend on its own executable bit surviving a file transfer.
 #
-# What the archive contains: source, Dockerfiles, compose file, both lock files
+# What the archive contains: the files git tracks in the current commit (HEAD),
+# built with `git archive`: source, Dockerfiles, compose file, both lock files
 # (ui/package-lock.json and api/requirements.txt) and the docs. That is
-# everything needed to rebuild the stack from scratch.
+# everything needed to rebuild the stack from scratch. Untracked and ignored
+# files never go in -- offline tars, .env files, node_modules/, previous
+# archives, the contents of ingest-inbox/ and exports/ -- and neither do
+# uncommitted changes, so commit first. Run it in a git checkout (#384).
 #
 # What it deliberately does NOT contain: Docker images, the Weaviate index, and
 # the Ollama model weights. Those are rebuilt or re-downloaded on the target
@@ -20829,39 +21493,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. In an extracted archive there is no repository, and in a
+# subdirectory of another one git archive would take only that subtree.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
+
 OUT="${1:-rag-docker.zip}"
 rm -f "$OUT"
 
-zip -r -q "$OUT" . \
-  -x '*.DS_Store' \
-  -x '__MACOSX/*' \
-  -x '*/node_modules/*' \
-  -x '*/__pycache__/*' \
-  -x '*.pyc' \
-  -x '*.pyo' \
-  -x '*/dist/*' \
-  -x '*/.venv/*' \
-  -x '*/venv/*' \
-  -x '*/.pytest_cache/*' \
-  -x '*/.mypy_cache/*' \
-  -x '*/.ruff_cache/*' \
-  -x '*/uploads/*' \
-  -x 'ingest-inbox/*' \
-  -x 'exports/*' \
-  -x '.env' \
-  -x '*/.env' \
-  -x '*/.env.*' \
-  -x '.git/*' \
-  -x '*.zip'
-
-# The blanket ingest-inbox exclusion also drops the directory itself. Add the
-# placeholder back so the bind-mount target exists on the target machine; without
-# it Docker creates the directory as root and the user cannot drop files in.
-zip -q "$OUT" ingest-inbox/.gitkeep
-# Same for ./exports: it is the bind mount export packages are written to.
-# Its contents are somebody's corpus and never belong in a source archive,
-# but the directory itself must exist or Docker creates it as root.
-zip -q "$OUT" exports/.gitkeep
+# Tracked files only. ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so
+# both bind-mount targets exist on the target machine; without them Docker
+# creates the directories as root and the user cannot drop files in.
+git archive --format=zip -o "$OUT" HEAD
 
 echo "Created $OUT ($(du -h "$OUT" | cut -f1))"
 echo
@@ -20891,7 +21538,9 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 # Unlike package.sh (source only, ~150 KB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
-#   * the source tree
+#   * the source tree: the files git tracks in the current commit (HEAD),
+#     built with `git archive`, exactly as package.sh does. Untracked and
+#     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
 #   * the Ollama model weights (phi3.5 + nomic-embed-text)
 #
@@ -20901,6 +21550,14 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. Checked first, before any image or volume is touched.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package-offline.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
 
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
@@ -20934,26 +21591,11 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/rag-docker/offline"
 
-echo "==> Copying source"
-tar cf - \
-  --exclude='./.DS_Store' --exclude='*/.DS_Store' \
-  --exclude='*/node_modules/*' --exclude='*/__pycache__/*' \
-  --exclude='*.pyc' --exclude='*/dist/*' \
-  --exclude='*/.venv/*' --exclude='*/venv/*' \
-  --exclude='./.env' --exclude='*/.env' --exclude='*/.env.*' \
-  --exclude='./.git/*' --exclude='*.tar' --exclude='*.zip' \
-  --exclude='./offline/*' \
-  --exclude='./ingest-inbox/*' \
-  --exclude='./exports/*' \
-  . | ( cd "$STAGE/rag-docker" && tar xf - )
-
-# Both zip and tar drop a directory once all its contents are excluded, so the
-# mount target is recreated explicitly. Without it Docker creates ./ingest-inbox
-# as root on the target machine and the user cannot drop files into it.
-mkdir -p "$STAGE/rag-docker/ingest-inbox"
-touch "$STAGE/rag-docker/ingest-inbox/.gitkeep"
-mkdir -p "$STAGE/rag-docker/exports"
-touch "$STAGE/rag-docker/exports/.gitkeep"
+echo "==> Copying source (tracked files of the current commit)"
+# ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so both mount targets
+# exist on the target machine; without them Docker creates the directories as
+# root and the user cannot drop files into ./ingest-inbox.
+git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
@@ -21034,6 +21676,169 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/tests/test_package_archives.py
+
+Host-side check that both distribution scripts hold exactly the tracked files
+of `HEAD` (#384), run in a scratch git repository with `docker` stubbed.
+
+```python
+"""Distribution archives hold only the tracked files of HEAD (#384).
+
+Host-side, no stack: each script runs in a scratch git repository, and
+package-offline.sh talks to a stub `docker` first on PATH, never to a daemon.
+
+Run: python3 scripts/tests/test_package_archives.py
+"""
+import os
+import shutil
+import stat
+import subprocess
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ('package.sh', 'package-offline.sh')
+REFUSAL = 'not the top level of a git checkout'
+COMMITTED_README = 'Scratch project.\n'
+GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
+       '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+
+# Answers what package-offline.sh asks of docker, and logs each call.
+STUB_DOCKER = r'''#!/usr/bin/env bash
+echo "$*" >> "$STUB_DOCKER_LOG"
+case "$1 $2" in
+  "compose config") echo '{"name":"scratch"}' ;;
+  "image inspect"|"volume inspect") ;;
+  save*) printf 'stub image layers' ;;
+  run*)
+    while [ $# -gt 0 ]; do
+      case "$1" in -v) case "$2" in *:/out) touch "${2%:/out}/ollama_models.tar.gz" ;; esac; shift ;; esac
+      shift
+    done ;;
+  *) echo "stub docker: unexpected call: $*" >&2; exit 1 ;;
+esac
+'''
+
+# Untracked or ignored content that must never reach an archive.
+UNTRACKED = (
+    '.env', '.env.local', 'tools/.env.production', 'rag-docker-offline.tar', 'old.zip',
+    'offline/images.tar.gz', '.claude/worktrees/fix-1/README.md', 'dev-docs/issue-1/analysis.md',
+    '0', '.DS_Store', 'notes.txt', 'ingest-inbox/doc.pdf', 'exports/pkg.tar.gz',
+)
+EXECUTABLE = ('install-offline.sh', 'tools/run.sh')
+
+
+def write(path, text, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(mode)
+
+
+class PackageArchiveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name).resolve()
+        self.repo = self.tmp / 'project'
+        self.repo.mkdir()
+        for name in SCRIPTS + ('.gitignore',):
+            shutil.copy(ROOT / name, self.repo / name)
+        write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
+        write(self.repo / 'README.md', COMMITTED_README)
+        write(self.repo / 'ingest-inbox' / '.gitkeep', '')
+        write(self.repo / 'exports' / '.gitkeep', '')
+        write(self.repo / 'tools' / 'run.sh', '#!/usr/bin/env bash\n', 0o755)
+        write(self.repo / 'tools' / 'data.txt', 'data\n')
+        self.git('init', '-q')
+        self.git('add', '-A')
+        self.git('add', '-f', 'ingest-inbox/.gitkeep', 'exports/.gitkeep')
+        self.git('commit', '-q', '-m', 'scratch')
+        self.tracked = set(self.git('ls-files').split())
+        for name in UNTRACKED:
+            write(self.repo / name, 'must not ship\n')
+        with open(self.repo / 'README.md', 'a') as handle:
+            handle.write('UNCOMMITTED EDIT\n')
+        self.assertEqual(set(self.git('ls-files').split()), self.tracked)
+        bin_dir = self.tmp / 'bin'
+        write(bin_dir / 'docker', STUB_DOCKER, 0o755)
+        self.log = self.tmp / 'docker.log'
+        self.env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log), GIT_CONFIG_NOSYSTEM='1')
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, check=True,
+                              capture_output=True, text=True).stdout
+
+    def run_script(self, directory, script, out):
+        return subprocess.run(['bash', str(directory / script), str(out)], cwd=self.tmp, env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def assert_ran(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_zip_holds_exactly_the_tracked_files(self):
+        out = self.tmp / 'out.zip'
+        self.assert_ran(self.run_script(self.repo, 'package.sh', out))
+        with zipfile.ZipFile(out) as archive:
+            infos = {i.filename: i for i in archive.infolist() if not i.filename.endswith('/')}
+            self.assertEqual(set(infos), self.tracked)
+            self.assertEqual(archive.read('README.md').decode(), COMMITTED_README)
+        for name in EXECUTABLE:
+            with self.subTest(executable=name):
+                self.assertTrue((infos[name].external_attr >> 16) & stat.S_IXUSR)
+
+    def test_offline_bundle_holds_tracked_files_and_offline_payload(self):
+        out = self.tmp / 'bundle.tar'
+        self.assert_ran(self.run_script(self.repo, 'package-offline.sh', out))
+        expected = {'rag-docker/' + name for name in self.tracked}
+        expected |= {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'}
+        with tarfile.open(out) as archive:
+            files = {m.name: m for m in archive.getmembers() if m.isfile()}
+            self.assertEqual(set(files), expected)
+            self.assertEqual(archive.extractfile('rag-docker/README.md').read().decode(), COMMITTED_README)
+        for name in EXECUTABLE:
+            with self.subTest(executable=name):
+                self.assertTrue(files['rag-docker/' + name].mode & stat.S_IXUSR)
+
+    def test_refuses_outside_a_git_top_level(self):
+        plain = self.tmp / 'extracted'
+        nested = self.repo / 'tools' / 'copy'
+        for directory in (plain, nested):
+            directory.mkdir(parents=True)
+            for script in SCRIPTS:
+                shutil.copy(ROOT / script, directory / script)
+                out = self.tmp / f'{directory.name}-{script}.out'
+                with self.subTest(directory=directory.name, script=script):
+                    result = self.run_script(directory, script, out)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(REFUSAL, result.stderr)
+                    self.assertFalse(out.exists())
+        calls = self.log.read_text() if self.log.exists() else ''
+        self.assertEqual(calls, '', 'docker was called before the refusal')
+
+
+class EmbeddedCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        text = (ROOT / 'IMPLEMENTATION.md').read_text()
+        for name in SCRIPTS + ('scripts/verify/01_infrastructure.sh', 'scripts/verify/README.md',
+                               'scripts/tests/test_package_archives.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n'
+                start = text.index(header) + len(header)
+                start = text.index(f'{fence}{language}\n', start) + len(fence + language) + 1
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (ROOT / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
 ```
 
 ### scripts/verify/session_persistence_cases.py
@@ -24560,6 +25365,66 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
 
+    def build_with_models(self, failing):
+        """Export with both models requested; models named in `failing` cannot bundle."""
+        blob = self.root / 'model-blob'
+        blob.write_text('inert model bytes')
+
+        def export_model(model, stage):
+            if model in failing:
+                raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
+            return [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
+            mocks.enter_context(patch.object(settings, 'llm_model', 'chat:v2'))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=True))
+            mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
+            result = packager.build('Corpus', include_models=True)
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
+                          and m.name.count('/') == 1)
+            manifest = json.load(archive.extractfile(member))
+        return result, manifest
+
+    def test_manifest_lists_only_models_actually_bundled(self):
+        for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
+                                  (set(), ['chat', 'embed']), ({'embed:v1', 'chat:v2'}, [])]:
+            with self.subTest(failing=sorted(failing)):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(failing)
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(manifest['models_bundled'], bool(expected))
+                self.assertEqual(result['models_bundled'], bool(expected))
+                for name in ('embed', 'chat'):
+                    self.assertEqual(f'models/{name}/manifest.json' in manifest['files'],
+                                     name in expected)
+                for model in sorted(failing):
+                    self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
+                                        for w in manifest['warnings']))
+
+    def test_package_readme_contents_come_from_the_partial(self):
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        partial = (packager._TEMPLATE_DIR / 'partials' / 'contents.md').read_text().rstrip('\n')
+        self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
+        self.assertNotIn('@@', readme)
+
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
             if value is None:  # None denotes no saved file, not an invalid saved config.
@@ -24859,6 +25724,238 @@ if (require.main === module) (async () => {
   const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   const reporter = makeReporter();
   try { await runChunkingConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/transfer_page.js
+
+```javascript
+// Transfer page polling and failure display (#382), against the rendered page
+// with every API call stubbed in the browser; no backend reads or writes.
+//
+// Each case gets fresh fetch stubs. Fixed answers cover the collections, the
+// package list and the fidelity lookup unless a case holds them; every other
+// /api/ request is held until the case releases it with a status and body. The
+// page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
+// second.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue } = require('./lib');
+
+const A = 'VfyTransferA', B = 'VfyTransferB';
+const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
+const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
+const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
+const json = (status, body) => ({ status, body: JSON.stringify(body) });
+const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
+// nginx's own page when the API is down; request() turns it into this message.
+const BAD_GATEWAY = { status: 502, body: '<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>' };
+const DOWN = 'The API is not responding. It may still be starting; try again in a minute.';
+const exportJob = (status, extra = {}) => json(200, { job_id: 'vfyexp', status, collection: A, chunks_written: 1, filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null, retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null, ...extra });
+const importJob = (status, extra = {}) => json(200, { job_id: 'vfyimp', status, filename: PACKAGE, on_conflict: 'abort', collection: null, original_collection: null, chunks_written: 1, fidelity: null, renamed: false, notes: [], error: null, error_code: null, error_detail: null, ...extra });
+
+const HALVES = {
+  export: { start: '/api/export', started: json(202, { job_id: 'vfyexp', status: 'queued', collection: A }), poll: '/api/export/job/vfyexp', job: exportJob, idle: 'Export', busy: 'Exporting…', progress: "the export's progress",
+            done: exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true }) },
+  import: { start: '/api/import', started: json(202, { job_id: 'vfyimp', status: 'queued', filename: PACKAGE }), poll: '/api/import/job/vfyimp', job: importJob, idle: 'Import', busy: 'Importing…', progress: "the import's progress",
+            done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
+};
+
+async function fixture(browser, base, { hold = [] } = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  const fixed = {
+    'GET /api/collections': json(200, collectionsBody),
+    'GET /api/packages': json(200, packagesBody),
+    ['GET /api/tune/' + A]: json(200, tuneBody(A)),
+    ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+  };
+  for (const key of hold) delete fixed[key];
+  await page.evaluateOnNewDocument(answers => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
+    const realFetch = window.fetch.bind(window);
+    window.transferFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const entry = { path, method, done: false };
+      window.transferFixture.requests.push(entry);
+      const answer = answers[method + ' ' + path];
+      if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
+      return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
+    };
+  }, fixed);
+  await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
+  return { ctx, page, errors };
+}
+
+const count = (page, path, method = 'GET') => page.evaluate((p, m) => window.transferFixture.requests.filter(r => r.path === p && r.method === m).length, path, method);
+async function pending(page, path, method = 'GET') {
+  await page.waitForFunction((p, m) => window.transferFixture.requests.some(r => r.path === p && r.method === m && !r.done), { timeout: 5000 }, path, method)
+    .catch(() => { throw new Error(`no ${method} ${path} request arrived`); });
+}
+async function release(page, path, answer, method = 'GET') {
+  await pending(page, path, method);
+  await page.evaluate((p, m, status, body) => {
+    window.transferFixture.requests.find(r => r.path === p && r.method === m && !r.done).resolve(status, body);
+  }, path, method, answer.status, answer.body);
+}
+const text = page => page.evaluate(() => document.body.innerText.replace(/\s+/g, ' '));
+async function waitText(page, want, gone = false) {
+  await page.waitForFunction((w, g) => document.body.innerText.replace(/\s+/g, ' ').includes(w) !== g, { timeout: 5000 }, want, gone)
+    .catch(async () => { throw new Error(`${gone ? 'still shows' : 'never showed'} "${want}"; page: ${(await text(page)).slice(0, 600)}`); });
+}
+// The half's start button, found by either of its labels.
+const button = (page, half) => page.evaluate((idle, busy) => {
+  const b = [...document.querySelectorAll('button')].find(x => [idle, busy].includes(x.textContent.trim()));
+  return b ? { label: b.textContent.trim(), disabled: b.disabled } : null;
+}, HALVES[half].idle, HALVES[half].busy);
+async function expectButton(page, half, busy) {
+  const want = busy ? HALVES[half].busy : HALVES[half].idle;
+  await page.waitForFunction((label, disabled) => [...document.querySelectorAll('button')].some(x => x.textContent.trim() === label && x.disabled === disabled), { timeout: 5000 }, want, busy)
+    .catch(async () => { throw new Error(`expected "${want}" ${busy ? 'disabled' : 'enabled'}, got ${JSON.stringify(await button(page, half))}`); });
+}
+// Buttons only by default: the nav has an "Import" link as well as the Import button.
+const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
+  const b = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
+  if (!b) return false; b.click(); return true;
+}, label, selector);
+
+// Selects the package (import) and starts the half; leaves its start request held.
+async function start(page, half) {
+  if (half === 'import') {
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(PACKAGE)}))`, PACKAGE);
+  }
+  await expectButton(page, half, false);
+  assert.equal(await click(page, HALVES[half].idle), true, `no ${HALVES[half].idle} button`);
+  await pending(page, HALVES[half].start, 'POST');
+}
+async function startAndPoll(page, half) {
+  await start(page, half);
+  await release(page, HALVES[half].start, HALVES[half].started, 'POST');
+  await pending(page, HALVES[half].poll);
+}
+const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
+const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
+
+async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+async function runTransferPageTests(browser, base, reporter) {
+  reporter.section('Transfer page polling and failures (#382)');
+  const cases = [];
+  for (const half of ['export', 'import']) {
+    const h = HALVES[half];
+    cases.push([`${half}: a failed poll is shown and retried with the button still busy, and the next good poll clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.job('running'));
+      await waitText(page, retrying(half), true);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.done);
+      await waitText(page, 'Done.');
+      await waitText(page, retrying(half), true);
+      await expectButton(page, half, false);
+    }]);
+    cases.push([`${half}: after 30 failed polls in a row polling stops, the reason is shown and the button is usable; a new start clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      for (let i = 0; i < 30; i++) await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, stopped(half));
+      await expectButton(page, half, false);
+      const polls = await count(page, h.poll);
+      await sleep(400);
+      assert.equal(await count(page, h.poll), polls, 'polling went on after the limit');
+      assert.equal(polls, 31, 'one good poll and 30 failed ones');
+      await start(page, half);
+      await waitText(page, stopped(half), true);
+    }]);
+    cases.push([`${half}: a poll in flight when the page is left schedules no further poll`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      await pending(page, h.poll);
+      assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+      await page.waitForFunction(() => location.pathname === '/collections');
+      await release(page, h.poll, h.job('running'));
+      await sleep(400);
+      assert.equal(await count(page, h.poll), 2, 'a poll was sent after the page was left');
+    }]);
+  }
+  cases.push(['export: a start answered after the page was left starts no polling', async page => {
+    await start(page, 'export');
+    assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+    await page.waitForFunction(() => location.pathname === '/collections');
+    await release(page, HALVES.export.start, HALVES.export.started, 'POST');
+    await sleep(400);
+    assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
+                                     [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],
+                                     [404, 'COLLECTION_NOT_FOUND', `Collection '${A}' not found.`]]) {
+    cases.push([`fidelity: a ${status} ${code} from /tune is labelled, not hidden`, async page => {
+      await pending(page, '/api/tune/' + A);
+      await waitText(page, 'Fidelity: reading…');
+      await release(page, '/api/tune/' + A, apiError(status, code, msg));
+      await waitText(page, `Fidelity: unknown — it could not be read: ${msg}`);
+    }, { hold: ['GET /api/tune/' + A] }]);
+  }
+  cases.push(['fidelity: a good lookup shows the fidelity line', async page => {
+    await waitText(page, 'Fidelity: with-sources — 2 original document(s) will travel with the package.');
+  }]);
+  cases.push(['fidelity: a late answer for a collection no longer selected is ignored', async page => {
+    await pending(page, '/api/tune/' + A);
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(B)}))`, B);
+    await release(page, '/api/tune/' + B, json(200, { ...tuneBody(B), fidelity: 'chunks-only', source_document_count: 0 }));
+    await waitText(page, 'Fidelity: chunks-only');
+    await release(page, '/api/tune/' + A, apiError(503, 'SERVICE_UNAVAILABLE', 'Synthetic late failure.'));
+    await sleep(300);
+    const shown = await text(page);
+    assert.ok(shown.includes('Fidelity: chunks-only') && !shown.includes('Synthetic late failure.'), shown.slice(0, 600));
+  }, { hold: ['GET /api/tune/' + A, 'GET /api/tune/' + B] }]);
+  cases.push(['export: a refused export shows its error_code', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('failed', { error: 'PackageError: Synthetic embedding model mismatch.', error_code: 'EMBEDDING_MISMATCH', error_detail: { expected: 'a', found: 'b' } }));
+    await waitText(page, 'Failed.');
+    const codes = await page.evaluate(() => [...document.querySelectorAll('code')].map(c => c.textContent.trim()));
+    assert.ok(codes.includes('EMBEDDING_MISMATCH'), `codes shown: ${JSON.stringify(codes)}`);
+    await waitText(page, 'Synthetic embedding model mismatch.');
+    await expectButton(page, 'export', false);
+  }]);
+  cases.push(['packages: a failed list is shown without the empty-folder hint, and a good Refresh clears it', async page => {
+    await release(page, '/api/packages', apiError(500, 'INTERNAL_ERROR', 'Synthetic package list failure.'));
+    await waitText(page, 'Could not list the packages in ./exports: Synthetic package list failure.');
+    assert.ok(!(await text(page)).includes('Nothing in ./exports yet'), 'the empty-folder hint is shown for a failed list');
+    assert.equal(await click(page, 'Refresh'), true, 'no Refresh button');
+    await release(page, '/api/packages', json(200, packagesBody));
+    await waitText(page, 'Could not list the packages', true);
+    const listed = await page.evaluate(p => [...document.querySelectorAll('option')].some(o => o.value === p), PACKAGE);
+    assert.equal(listed, true, 'the package is not listed after a good Refresh');
+  }, { hold: ['GET /api/packages'] }]);
+
+  for (const [name, test, opts] of cases) {
+    let s;
+    try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+
+module.exports = { runTransferPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runTransferPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
   finally { await browser.close(); }
   process.exitCode = reporter.summary() ? 0 : 1;
 })().catch(e => { console.error(e); process.exitCode = 2; });
