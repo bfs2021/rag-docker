@@ -148,7 +148,7 @@ Navigate to **Q&A**, select a collection, type your question, and press **Ask** 
 
 ### 5. Generate gold standard data
 
-Navigate to **Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
+Navigate to **Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. The page shows how the generation ended, including pairs that failed and why. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
 
 ## Health check
 

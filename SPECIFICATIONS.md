@@ -2039,7 +2039,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Sample size input (1–100, default 20). While the value is empty, not a whole number, below 1 or above 100, "Generate Pairs" is disabled and the page says "Sample size must be a whole number from 1 to 100."; no request is sent (#393).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
+- "Generate Pairs" is disabled while its start request is in flight, while a generation runs and between the start being accepted and the first poll answer (so a second click cannot start another session or skip the confirmation below); a retained session that is still `generating` disables it too (#380).
 - Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review list as they complete (partial display during generation).
+- If a poll fails, polling stops and the page says so as an alert: "Could not read the generation's progress: " followed by the reason, then "Polling stopped; use Load / refresh session to check again." The progress is no longer shown and Generate is enabled again. "Load / refresh session" clears the message and polls again while the session is `generating` (#380).
+- When the session is no longer `generating`, the page shows its outcome under the controls (#380), for a session generated here and for a retained session loaded by ID. `completed`: "Generation completed: C of T pairs generated." and, when `pairs_failed` is above 0, "F pairs failed and are missing from the review list." (a warning). `completed` with `pairs_total` 0: "No pairs were generated: the collection has no chunks." `failed`: "Generation failed." and "F of T pairs failed." when `pairs_failed` is above 0 (an error). `cancelled`: "Generation was cancelled." Any other status: "Generation ended with status S." Under the headline the `errors` reasons are listed once each, with "(xN)" when a reason repeats, at most five, then "and K more reasons". Warnings and errors are alerts.
 - If a session already exists in the UI (from a previous generation), clicking "Generate Pairs" displays a confirmation dialog: "This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?" Previous sessions remain on the server (accessible via direct session ID) but are no longer referenced by the UI after confirmation.
 
 **Phase 2 — Review:**
@@ -2047,9 +2050,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Expanding a row shows the answer, the ground truth and a preview of the first context chunk: its first 300 characters, followed by `…`.
 - Actions per row:
   - Approve (green check) → calls `PATCH /goldstandard/session/{session_id}/pair/{pair_id}` with `{ "status": "approved" }`
-  - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included)
+  - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included; with no change, only the status). If the `PATCH` is refused (for example a cleared field, `422 INVALID_PARAMETER`), the form stays open with the typed values and shows the API's message inside it as an alert; no page-level error is set (#380).
   - Reject (red X) → calls `PATCH` with `{ "status": "rejected" }`
-  - Regenerate (refresh icon) → calls `POST /goldstandard/regenerate` with `session_id` and `pair_id`, replaces row with returned pair
+  - Regenerate (refresh icon) → calls `POST /goldstandard/regenerate` with `session_id` and `pair_id`, replaces row with returned pair. While that request runs (up to 1800 s) the pair's button is disabled with the title "Regenerating..." and the other pairs' buttons stay enabled (#380).
 - Summary bar: `X approved · Y edited · Z rejected · W pending`
 
 **Phase 3 — Export:**
@@ -2734,6 +2737,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       request sent for 0, 101, 2.5 and an empty field). It also clicks Export in Chromium with the
       popup blocker on: a save answered in 1 s opens the download tab, and a control answered after
       6 s opens none.*
+- [x] The Gold Standard page shows how a generation ended (final status, failed pairs and the `errors` reasons, and the empty collection), stops polling with a message when a poll fails, keeps Generate disabled while a start or generation runs and Regenerate disabled per pair while it runs, and keeps the edit form open with the typed values when the `PATCH` is refused, sending only the changed fields (#380).
+      *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
+      API call by request interception: a completed, partially failed, failed, cancelled and empty
+      session; a poll answered 503 and 404; a second Generate click in the window before the first
+      poll; repeated Regenerate clicks; and an edit refused with 422, then retried. 30 of its checks
+      fail on the code before #380 (no outcome shown, polling forever, a second session started,
+      a second regenerate request, the modal closed with all three fields sent).*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
