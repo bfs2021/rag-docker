@@ -2762,7 +2762,8 @@ def _distance_to_score(coll):
 
     The metric is read on every query, not cached, so a collection deleted and
     recreated with another metric is converted by its new one. A missing
-    distance, or a metric that can't be read or has no conversion, gives None.
+    distance, or a config with no metric or a metric with no conversion, gives
+    None. A failed config read raises, and the query answers the #373 503.
     """
     vector_config = coll.config.get().vector_index_config
     convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
@@ -10252,7 +10253,9 @@ curl -X POST http://localhost:8080/api/import \
 
 `on_conflict` is required and has no default. It is one of `abort` (fail if the
 name is taken), `rename` (import under a free name) or `replace` (overwrite,
-but only after this package has been proven to import cleanly).
+but only after this package has been proven to import cleanly; a failure while the
+final copy is being built can leave the name unavailable, with the data kept in a
+recovery collection named in the error).
 
 ## The filename is a label, not an input
 
@@ -10535,7 +10538,7 @@ choice can delete a collection.
 |---|---|
 | `abort` | Fail if a collection of that name already exists. |
 | `rename` | Import alongside it as `<name>_imported_<id8>`. |
-| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact. |
+| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`). |
 
 Replacing a collection keeps its gold-standard sessions and marks them orphaned,
 and the import result reports how many. They are never deleted silently.
@@ -10552,8 +10555,10 @@ and the import result reports how many. They are never deleted silently.
 
 `GET /api/tune/<collection>` reports which of these a given collection can do.
 
-Every rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failed tune leaves the collection as it was.
+Every rebuild is staged into a temporary collection and verified before the
+original is touched, so a failure before cutover leaves the collection as it was.
+A failure during the final replacement can leave its name missing or partial, with
+the data kept in a recovery collection named in the error (`recovered_as`).
 
 **Gold-standard sessions are flagged, never deleted or remapped.** Re-chunking or
 re-embedding changes which chunks exist, so evaluation pairs built against the
@@ -11235,8 +11240,9 @@ function isHealthResult(data: any): data is HealthResult {
 
 // GET /health answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
-// service failed and could not show it red (#375). This call accepts a 503
-// that carries that body; every other error is thrown as request() would.
+// service failed and could not show it red (#375). This call accepts a 200 or
+// a 503 that carries that body; every other error is thrown as request() would,
+// and a 200 without it is unreadable (#415).
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
@@ -11252,8 +11258,9 @@ async function getHealthResult(): Promise<HealthResult> {
   if (!res.ok) {
     throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
   }
-  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
-  return data as HealthResult
+  // Another JSON shape, text or an empty body: the page would throw while
+  // rendering the cards, or show nothing at all (#415).
+  throw new Error('The server sent a response the UI could not read.')
 }
 
 export const api = {
@@ -12876,7 +12883,7 @@ function sizeLabel(bytes: number | null): string {
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
   { id: 'rename', label: 'Rename', description: 'Import alongside the existing one, under a new name the API reports back.' },
-  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
+  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly. A failure while the final copy is built can leave the name missing; the data is then kept in a recovery collection the error names.' },
 ]
 
 // Both halves poll their job every 2 s. A failed poll is shown and retried;
@@ -13284,6 +13291,11 @@ export default function HealthPage() {
 
   const [diagnosticPending, setDiagnosticPending] = useState(true)
   const diagnosticTicket = useRef(0)
+  // Each load is numbered; a result is shown only if no later load's result
+  // already is, so a slow older response can't replace a newer one (#415).
+  const loadCount = useRef(0)
+  const healthShown = useRef(0)
+  const metricsShown = useRef(0)
 
   function load() {
     const ticket = ++diagnosticTicket.current
@@ -13299,12 +13311,18 @@ export default function HealthPage() {
     })
     // Health and metrics load separately: a degraded or unreachable API must not
     // stop the latency charts, and no stale green cards stay up (#375).
+    const n = ++loadCount.current
     api.getHealth().then(h => {
-      setHealth(h); setHealthError(null)
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(h); setHealthError(null)
     }).catch(e => {
-      setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
     })
-    api.getMetrics().then(setMetrics).catch(() => { /* keep the last metrics shown */ })
+    api.getMetrics().then(m => {
+      if (n < metricsShown.current) return
+      metricsShown.current = n; setMetrics(m)
+    }).catch(() => { /* keep the last metrics shown */ })
   }
 
   useEffect(() => {
@@ -13555,7 +13573,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -13959,12 +13977,15 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
+| `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
-| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
@@ -13989,7 +14010,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -14016,7 +14037,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -14132,6 +14153,20 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Health page refresh checks
+
+`browser/health_page.js` (#415), registered in `06_ui.sh` through `ui_criteria.js`,
+stubs every API call the Health page makes and holds each health and metrics answer
+until the check releases it, driving each refresh through the captured 30 s timer. Ten
+cases cover a failed metrics call (an API error, and no answer) keeping the charts last
+shown; a 200 without a health body (JSON of another shape, an empty body, text) and a 503
+carrying the API's error envelope, each shown as "Service health could not be read:" with
+no cards; and late responses from an older refresh, which never replace a newer health
+result (success or failure) or newer charts, while a late metrics result after a newer
+failed one is still shown. Every case also fails on a React page error. These fixtures
+make no backend calls; like the other modules, the file runs standalone with
+`RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
@@ -14148,6 +14183,38 @@ on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
 node scripts/verify/browser/transfer_page.js
+```
+
+## UI control browser checks
+
+`browser/ui_controls.js` and `browser/ui_pages.js`, registered in `06_ui.sh` through
+`ui_criteria.js` (#400), check the page controls that had no browser check. They share
+`browser/stub.js`, which opens the built UI in a fresh browser context and answers every
+`/api/` request itself; a request a case did not stub is answered 599 and fails the case, so
+nothing reaches the backend or a model. 67 cases:
+
+- `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
+  modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
+  queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
+  form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
+  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
+  the latency and error lines and the End User view with `response_format`; the Retrieval page's
+  saved and default texts, alpha slider and Save while loading; and the client's handling of
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+- `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
+  (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
+  export controls (collection selector, fidelity line, include-models payload, progress and
+  result), the package list, the empty hint, Refresh, conflict choice and import failure display;
+  the Help page error state and its links to and from Transfer; and the Health latency stat row,
+  chart and empty state.
+
+The Transfer polling and `/tune` failure labels stay with `transfer_page.js` (#382). Like
+`query_config.js`, each module can run on its own against a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_controls.js
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_pages.js
 ```
 
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
@@ -14175,8 +14242,10 @@ Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends 
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
-`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
-names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+`error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
+together (all three `error`), each with its latency, model names and `resources`; and 200
+`ok` when everything is up, also with memory below the recommendation or unreadable
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
 stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
@@ -14195,6 +14264,39 @@ JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logge
 checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
 the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
 
+Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
+runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
+temporary folder: an upload with no supported file answers 400 `NO_SUPPORTED_FILES` with the
+exact message listing a direct file and a ZIP member it skipped, and leaves no job, staging
+folder or registration; an unknown ingest job answers 404 `JOB_NOT_FOUND`; a `/query` body
+with only `question` and `collection` reaches the pipeline with the defaults (`hnsw`, `top_k`
+5, `alpha` 0.75, no citations, `end_user`), and through the real pipeline runs a top-5 vector
+search with the end-user prompt; the reformulation, end-user and engineer prompts and their
+`[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
+successful query records one metric; a saved retrieval config missing newer keys is filled
+from the defaults, and one that isn't JSON or can't be read gives the defaults with
+`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
+instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+checked for its statistics against hand-worked percentiles, its exact-match `collection` and
+`retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
+Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
+`/proc/meminfo` reports memory `unknown` with a note while `/health` stays 200. On the host,
+`scripts/tests/test_ollama_entrypoint.py` runs `ollama/entrypoint.sh` with stub `ollama`,
+`timeout` and `sleep` commands: models already listed are not pulled, a missing one is pulled
+as `timeout 7200 ollama pull`, a failed or timed-out pull is retried after 15 s, and the fifth
+failure exits 1 with its error. Then, on the verify stack: the upload and job errors through
+the proxy; a new collection's schema has BM25 off for `source_file`, `source_type` and
+`chunk_strategy` and refuses an insert with an undeclared property; the running proxy's
+loaded configuration (`nginx -T`) reads `/api/` for 300 s and connects for 10 s; the metrics
+route's shape, `history_limit=0` and the 422. Unless `RAG_SKIP_SLOW=1`, a query with the
+defaults on a text of more than five chunks retrieves 5 chunks without citations and records
+one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
+and that metric read back unchanged after the API restarts, and then a first start: `down -v`
+(the model copy is external and kept) and `up -d --wait` must bring every service healthy
+within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
+SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
+internet. It removes the verify project's data, so it runs last in suite 01.
+
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
 It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
@@ -14212,8 +14314,9 @@ Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
 `scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
 the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
 `1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
-first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
-`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+first; a missing distance, a missing hybrid score and a config with no metric or an unknown
+one give `null` (a distance of 0 is a real value); the metric is read again on every query; a
+failed metric read answers 503 `SERVICE_UNAVAILABLE` in each distance mode; the pipeline
 rounds numbers and passes `null` through, and `/query` returns it. It also checks the
 `IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
 project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
@@ -16143,8 +16246,228 @@ finally:
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
 
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
+
 drop_collection "$C"
 cleanup_prefixed
+summary
+```
+
+### scripts/verify/16_api_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Ingest, query, metrics and health API paths no other check covers (#399).
+#
+# Run by 01_infrastructure.sh, after its own checks: the opt-in first-start check
+# at the end removes the verify project's volumes. The query checks need an LLM
+# (skipped with RAG_SKIP_SLOW=1); the restart and first-start checks are opt-in
+# (RAG_ALLOW_RESTART=1) and never reach the live rag-docker project.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+C="${PREFIX}ApiPaths"
+
+RAG_PATHS_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-paths.XXXXXX") || exit 2
+export RAG_PATHS_TMP
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_PATHS_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
+
+section "API paths: controlled (#399)"
+# Through the app with Weaviate and Ollama mocked, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_api_paths.py)
+check "ingest, query, retrieval-config, metrics and health paths through the app" $?
+python3 "$REPO_ROOT/scripts/tests/test_ollama_entrypoint.py"
+check "the Ollama entrypoint skips present models, pulls under a timeout and retries" $?
+
+section "API paths: ingest errors and schema rules"
+drop_collection "$C"; make_collection "$C"
+printf 'not a supported type\n' > "$RAG_PATHS_TMP/notes.xyz"
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/unsupported.json" -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "files=@$RAG_PATHS_TMP/notes.xyz")
+check_eq "an upload with no supported file answers 400" "$code" "400"
+check_eq "it carries NO_SUPPORTED_FILES" "$(jfield "['error']['code']" < "$RAG_PATHS_TMP/unsupported.json")" "NO_SUPPORTED_FILES"
+check_eq "its message lists what was skipped" "$(jfield "['error']['message']" < "$RAG_PATHS_TMP/unsupported.json")" \
+  "No supported files found in upload. Skipped: notes.xyz (unsupported type '.xyz')"
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/nojob.json" -w '%{http_code}' "$API/ingest/job/vfy-no-such-job")
+check_eq "an unknown ingest job answers 404" "$code" "404"
+check_eq "it carries JOB_NOT_FOUND and names the job" \
+  "$(jfield "['error']['code'] + ' ' + d['error']['message']" < "$RAG_PATHS_TMP/nojob.json")" \
+  "JOB_NOT_FOUND Job 'vfy-no-such-job' not found."
+
+# The schema as Weaviate holds it, and an insert carrying a property it doesn't declare.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+client = wc.get_client()
+try:
+    collection = client.collections.get(name)
+    properties = {p.name: p for p in collection.config.get().properties}
+    out = {"searchable": {n: properties[n].index_searchable
+                          for n in ("content", "source_file", "source_type", "chunk_strategy")}}
+    try:
+        collection.data.insert(properties={"content": "undeclared property check",
+                                           "undeclared_prop": "x"},
+                               vector=[0.01] * 768)
+        out["insert"] = "accepted"
+    except Exception as exc:                          # noqa: BLE001
+        out["insert"] = "refused"
+    out["declared"] = "undeclared_prop" in {p.name for p in collection.config.get().properties}
+    out["objects"] = collection.aggregate.over_all(total_count=True).total_count
+    print(json.dumps(out))
+finally:
+    wc.close_client()
+ENDPY
+) > "$RAG_PATHS_TMP/schema.json"
+check_eq "BM25 is off for source_file, source_type and chunk_strategy, on for content" \
+  "$(jfield "['searchable']" < "$RAG_PATHS_TMP/schema.json")" \
+  "{'content': True, 'source_file': False, 'source_type': False, 'chunk_strategy': False}"
+check_eq "an insert with an undeclared property is refused, adding no property or object" \
+  "$(jfield "['insert'] + ' ' + str(d['declared']) + ' ' + str(d['objects'])" < "$RAG_PATHS_TMP/schema.json")" \
+  "refused False 0"
+
+section "API paths: proxy timeout and metrics route"
+# The configuration the running proxy loaded, not only the file.
+(cd "$REPO_ROOT" && docker compose exec -T proxy nginx -T 2>/dev/null) > "$RAG_PATHS_TMP/nginx.txt"
+python3 - "$RAG_PATHS_TMP/nginx.txt" <<'ENDPY'
+import re, sys
+text = open(sys.argv[1]).read()
+start = text.index("location /api/ {")
+block = text[start:text.index("}", start)]
+ok = (re.search(r"^\s*proxy_read_timeout\s+300s;", block, re.M)
+      and re.search(r"^\s*proxy_connect_timeout\s+10s;", block, re.M))
+sys.exit(0 if ok else 1)
+ENDPY
+check "the proxy's /api/ location reads for 300 s and connects for 10 s" $?
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency.json" -w '%{http_code}' "$API/metrics/latency?history_limit=0")
+check_eq "GET /metrics/latency answers 200" "$code" "200"
+python3 - "$RAG_PATHS_TMP/latency.json" <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+stats = ("p50", "p95", "p99", "mean", "count")
+ok = (set(d) == {"total_records", "retrieval_latency", "llm_latency", "total_latency", "history"}
+      and all(set(d[k]) == set(stats) for k in ("retrieval_latency", "llm_latency", "total_latency"))
+      and d["history"] == [])
+sys.exit(0 if ok else 1)
+ENDPY
+check "it reports the three latency summaries, and history_limit=0 an empty history" $?
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency501.json" -w '%{http_code}' "$API/metrics/latency?history_limit=501")
+check_eq "history_limit above 500 answers 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < "$RAG_PATHS_TMP/latency501.json")" "422 INVALID_PARAMETER"
+
+section "API paths: a query with the defaults (LLM)"
+queried=0
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "a default query and its metric" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  python3 - "$RAG_PATHS_TMP/overtime.txt" <<'ENDPY'
+import sys
+topics = ["overtime approval", "holiday requests", "expense claims", "travel booking",
+          "remote work", "sick leave", "training budgets", "equipment loans",
+          "parking permits", "visitor badges", "parental leave", "jury duty"]
+with open(sys.argv[1], "w") as f:
+    for t in topics:
+        f.write(f"The policy on {t} says a manager must approve every request about {t} "
+                f"before the end of the month, and the HR team records the decision.\n\n")
+ENDPY
+  _rag_require_lock_owner
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$RAG_PATHS_TMP/overtime.txt" > "$RAG_PATHS_TMP/ingest.json"
+  job=$(jfield "['job_id']" < "$RAG_PATHS_TMP/ingest.json")
+  check_eq "a text of more than five chunks is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+  api_post "/query" "{\"question\":\"who approves overtime?\",\"collection\":\"$C\"}" > "$RAG_PATHS_TMP/answer.json"
+  check_eq "a query with only question and collection retrieves the default 5 chunks, without citations" \
+    "$(jfield "['chunks_retrieved'], d['citations'], bool(d['answer'].strip())" < "$RAG_PATHS_TMP/answer.json")" \
+    "5 None True"
+  api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/latency_c.json"
+  python3 - "$RAG_PATHS_TMP/latency_c.json" "$RAG_PATHS_TMP/answer.json" <<'ENDPY'
+import json, sys
+d, a = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+h = d["history"]
+ok = (d["total_records"] == 1 and len(h) == 1 and h[0]["retrieval_mode"] == "hnsw"
+      and h[0]["retrieval_ms"] == a["retrieval_latency_ms"] and h[0]["llm_ms"] == a["llm_latency_ms"]
+      and h[0]["total_ms"] == a["retrieval_latency_ms"] + a["llm_latency_ms"])
+sys.exit(0 if ok else 1)
+ENDPY
+  check "the query recorded one hnsw metric with its latencies" $? "$(cat "$RAG_PATHS_TMP/latency_c.json")"
+  queried=1
+fi
+
+section "API paths: restart and first start (opt-in)"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "retrieval settings and metrics across a restart, and the first start" "set RAG_ALLOW_RESTART=1 to include them"
+elif [ -n "$restart_refusal" ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_refusal"
+elif [ "$restart_limit_ok" != 0 ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_limit"
+else
+  project="$COMPOSE_PROJECT_NAME"
+  saved="{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.3,\"ef\":null,\"response_format\":\"engineer\"}"
+  api_post "/retrieval/config" "$saved" > /dev/null
+  api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_before.json"
+  [ "$queried" = 1 ] && api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_before.json"
+  started=$(python3 -c "import time;print(time.time())")
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  if [ -z "$elapsed" ]; then
+    check "the API is healthy again after the restart" 1 "not healthy after $((restart_limit * 2))s"
+  else
+    api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_after.json"
+    python3 - "$RAG_PATHS_TMP/retrieval_before.json" "$RAG_PATHS_TMP/retrieval_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+want = {"retrieval_mode": "hybrid", "top_k": 7, "alpha": 0.3, "ef": None,
+        "response_format": "engineer", "is_default": False}
+ok = all(before.get(k) == v for k, v in want.items()) and after == before
+sys.exit(0 if ok else 1)
+ENDPY
+    check "saved retrieval settings survive an API restart" $? "$(cat "$RAG_PATHS_TMP/retrieval_after.json")"
+    if [ "$queried" = 1 ]; then
+      api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_after.json"
+      python3 - "$RAG_PATHS_TMP/metrics_before.json" "$RAG_PATHS_TMP/metrics_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+sys.exit(0 if before["total_records"] == 1 and after["history"] == before["history"] else 1)
+ENDPY
+      check "the query's metric survives an API restart" $? "$(cat "$RAG_PATHS_TMP/metrics_after.json")"
+    else
+      skip "the query's metric across a restart" "set RAG_SKIP_SLOW=0 to include model calls"
+    fi
+
+    # First start: no volumes but the model copy, which is external and kept by
+    # `down -v`. The model pull isn't timed: the verify project copies the models.
+    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+    up_ok=$?
+    took=$(python3 -c "import time;print(int(time.time()-$started))")
+    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+    # It started from nothing: the collection made above is gone with its volume.
+    check_eq "that first start began with no collections" \
+      "$(api_get "/collections" | jfield "['collections']")" "[]"
+  fi
+fi
+
+drop_collection "$C"
 summary
 ```
 
@@ -17682,10 +18005,11 @@ code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
 check_eq "a status-only change is accepted" "$code" "200"
-code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"edited","question":""}')
-check_eq "an empty question is refused" "$code" "422"
+check_eq "an empty question is refused with 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "422 INVALID_PARAMETER"
 code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/p_unknown" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
@@ -20042,7 +20366,12 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
+  await require('./health_page').runHealthPageTests(browser, BASE, r);
   await require('./transfer_page').runTransferPageTests(browser, BASE, r);
+
+  await require('./ui_controls').runUiControlTests(browser, BASE, r);
+
+  await require('./ui_pages').runUiPageTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -25204,6 +25533,43 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
         self.assertNotIn('@@', readme)
 
+    def test_failure_text_does_not_promise_an_intact_original(self):
+        # #385: a replace failure after the delete, or a tune failure during the
+        # final replacement, can leave the name missing; the data is in the
+        # recovery collection the error names (recovered_as).
+        help_page = packager.render_help(1024)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        for name, text in (('help page', help_page), ('package README', readme)):
+            with self.subTest(name=name):
+                self.assertNotIn('leaves the original intact', text)
+                self.assertNotIn('leaves it intact', text)
+                self.assertNotIn('a failed tune leaves', text)
+                self.assertIn('recovery collection', text)
+        replace_row = next(line for line in help_page.splitlines() if line.startswith('| `replace`'))
+        self.assertIn('recovered_as', replace_row)
+        self.assertIn('missing or partial', replace_row)
+        tuning = help_page.split('## Tuning after import', 1)[1].split('**Gold-standard', 1)[0]
+        self.assertIn('before cutover', tuning)
+        self.assertIn('recovered_as', tuning)
+
+    def test_transfer_page_replace_description_names_the_recovery_collection(self):
+        root = Path(os.environ.get('RAG_TEST_API_DIR') or '.').resolve().parent  # repo root on the host
+        page = root / 'ui' / 'src' / 'pages' / 'TransferPage.tsx'
+        if not page.is_file():  # the api container has no ui/ tree
+            self.skipTest('ui source not mounted')
+        line = next(l for l in page.read_text(encoding='utf-8').splitlines() if "id: 'replace'" in l)
+        self.assertNotIn('leaves it intact', line)
+        self.assertIn('recovery collection', line)
+
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
             if value is None:  # None denotes no saved file, not an invalid saved config.
@@ -25508,6 +25874,199 @@ if (require.main === module) (async () => {
 })().catch(e => { console.error(e); process.exitCode = 2; });
 ```
 
+### scripts/verify/browser/health_page.js
+
+```javascript
+// Health page refreshes with every API call stubbed and held in the page (#415);
+// no backend state. Each load is driven by hand through the captured 30s refresh.
+const assert = require('node:assert/strict');
+const { makeReporter } = require('./lib');
+
+const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
+const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
+const healthBody = (embed = 'ok') => ({
+  status: embed === 'ok' ? 'ok' : 'degraded',
+  services: {
+    weaviate: service('ok', 11),
+    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+  },
+  resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
+});
+const metricsBody = n => ({
+  total_records: n,
+  retrieval_latency: { p50: 10, p95: 20, p99: 30 },
+  llm_latency: { p50: 100, p95: 200, p99: 300 },
+  total_latency: { p50: 110, p95: 220, p99: 330 },
+  history: Array.from({ length: n }, (_, i) => ({ timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString(), collection: 'OwnedFixture', retrieval_mode: 'hybrid', retrieval_ms: 10, llm_ms: 100, total_ms: 110 })),
+});
+const OK = { status: 200, body: healthBody() };
+const DEGRADED = { status: 503, body: healthBody('error') };
+const ERROR = message => ({ status: 500, body: { error: { code: 'INTERNAL_ERROR', message } } });
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.evaluateOnNewDocument((health, metrics) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const original = window.setInterval;
+    window.setInterval = (fn, delay, ...args) => {
+      if (delay === 30000) { window.__healthRefresh = fn; return 45003; }
+      return original(fn, delay, ...args);
+    };
+    const realFetch = window.fetch.bind(window);
+    window.healthFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      if (path === '/api/goldstandard/diagnostics') return Promise.resolve(new Response(JSON.stringify({ issues: [] }), { status: 200 }));
+      if (path === health || path === metrics) {
+        const entry = { path, done: false };
+        window.healthFixture.requests.push(entry);
+        return new Promise((resolve, reject) => {
+          entry.release = ({ status = 200, body, text, fail }) => {
+            entry.done = true;
+            if (fail) return reject(new TypeError('Failed to fetch'));
+            resolve(new Response(text !== undefined ? text : JSON.stringify(body), { status }));
+          };
+        });
+      }
+      return Promise.reject(new Error('Unexpected fixture request ' + path));
+    };
+  }, HEALTH, METRICS);
+  await page.goto(base + '/health', { waitUntil: 'domcontentloaded' });
+  await requested(page, 1);
+  return { ctx, page, errors };
+}
+// Wait until `n` loads have asked for both health and metrics.
+async function requested(page, n) {
+  await page.waitForFunction((h, m, count) => ['h', 'm'].every((_, i) =>
+    window.healthFixture.requests.filter(r => r.path === [h, m][i]).length >= count), { timeout: 5000 }, HEALTH, METRICS, n);
+}
+// Answer load `load` (1 = the first) for `path`, then let React render.
+async function release(page, path, load, answer) {
+  await page.evaluate(async (p, i, a) => {
+    const entry = window.healthFixture.requests.filter(r => r.path === p)[i - 1];
+    if (!entry || entry.done) throw new Error(`no pending ${p} for load ${i}`);
+    entry.release(a);
+    await new Promise(r => setTimeout(r, 50));
+    for (let k = 0; k < 2; k++) await new Promise(r => requestAnimationFrame(() => r()));
+  }, path, load, answer);
+}
+async function refresh(page, n) {
+  await page.evaluate(() => window.__healthRefresh());
+  await requested(page, n);
+}
+async function load(page, n, health, metrics) {
+  await release(page, HEALTH, n, health);
+  await release(page, METRICS, n, metrics);
+}
+const text = page => page.evaluate(() => (document.querySelector('#root')?.innerText || '').replace(/\s+/g, ' ').trim());
+// Each service card's label and dot colour; the latency tiles have no dot.
+const cards = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')].map(dot => ({
+  label: (dot.parentElement.textContent || '').trim(),
+  colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
+})).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
+const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
+const charts = n => `Latency Trends (${n} queries in ring buffer)`;
+const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
+
+async function assertCharts(page, n) {
+  const t = await text(page);
+  assert.ok(t.includes(charts(n)), `expected "${charts(n)}" in: ${t.slice(0, 300)}`);
+}
+async function assertUnreadable(page, message) {
+  const t = await text(page);
+  assert.ok(t.includes(message), `expected "${message}" in: ${t.slice(0, 300)}`);
+  assert.equal(await cards(page), '');
+}
+
+async function runHealthPageTests(browser, base, reporter) {
+  reporter.section('Health page refreshes (#415, stubbed API)');
+  const cases = [
+    ['a failed metrics call (API error) keeps the last charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(2) });
+      await refresh(page, 2);
+      await load(page, 2, DEGRADED, ERROR('Synthetic metrics failure'));
+      await assertCharts(page, 2);
+      assert.equal(await cards(page), EMBED_RED, 'the same refresh\'s health is shown');
+    }],
+    ['a failed metrics call (no answer) keeps the last charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(2) });
+      await refresh(page, 2);
+      await load(page, 2, DEGRADED, { fail: true });
+      await assertCharts(page, 2);
+      assert.equal(await cards(page), EMBED_RED, 'the same refresh\'s health is shown');
+    }],
+    ['a JSON 200 without the health shape is unreadable, not a page error', async page => {
+      await load(page, 1, { status: 200, body: { status: 'ok' } }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+      await assertCharts(page, 1);
+    }],
+    ['an empty 200 is unreadable', async page => {
+      await load(page, 1, { status: 200, text: '' }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
+    ['a non-JSON 200 is unreadable', async page => {
+      await load(page, 1, { status: 200, text: '<html><body>Not the API</body></html>' }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
+    ['a 503 with the JSON error envelope shows its message, not cards', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2);
+      await load(page, 2, { status: 503, body: { error: { code: 'SERVICE_UNAVAILABLE', message: 'Synthetic health envelope' } } }, { body: metricsBody(1) });
+      await assertUnreadable(page, 'Service health could not be read: Synthetic health envelope');
+    }],
+    ['a late older health failure cannot replace a newer success', async page => {
+      await load(page, 1, DEGRADED, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, HEALTH, 3, OK);
+      await release(page, HEALTH, 2, { fail: true });
+      const t = await text(page);
+      assert.equal(healthAlert(t), '');
+      assert.equal(await cards(page), ALL_GREEN);
+    }],
+    ['a late older health success cannot replace a newer failure', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, HEALTH, 3, { status: 502, text: '<html>502 Bad Gateway</html>' });
+      await release(page, HEALTH, 2, DEGRADED);
+      await assertUnreadable(page, 'Service health could not be read: The API is not responding');
+    }],
+    ['a late older metrics success cannot replace newer charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, METRICS, 3, { body: metricsBody(5) });
+      await release(page, METRICS, 2, { body: metricsBody(3) });
+      await assertCharts(page, 5);
+    }],
+    ['a late older metrics success after a newer failure is shown', async page => {
+      await refresh(page, 2);
+      await release(page, METRICS, 2, ERROR('Synthetic metrics failure'));
+      await release(page, METRICS, 1, { body: metricsBody(4) });
+      await assertCharts(page, 4);
+    }],
+  ];
+  for (const [name, test] of cases) {
+    let s;
+    try { s = await fixture(browser, base); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.stack || e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+module.exports = { runHealthPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runHealthPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
 ### scripts/verify/browser/transfer_page.js
 
 ```javascript
@@ -25735,6 +26294,1048 @@ if (require.main === module) (async () => {
   const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   const reporter = makeReporter();
   try { await runTransferPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/stub.js
+
+```javascript
+// Shared fixture for the UI control checks (#400): the real built UI in a fresh
+// browser context, with every /api/ request answered by the check itself. Nothing
+// reaches the backend: an /api/ request with no stub is answered 599 and recorded,
+// and the case fails on it.
+const { makeReporter } = require('./lib');
+
+const json = (status, body) => ({ status, type: 'application/json', body: JSON.stringify(body) });
+const apiError = (status, code, message) => json(status, { error: { code, message, detail: null } });
+// nginx's own error page, which the proxy sends when it answers instead of the API.
+const html = (status, title) => ({ status, type: 'text/html', body: `<html><head><title>${status} ${title}</title></head><body><center><h1>${status} ${title}</h1></center><hr><center>nginx</center></body></html>` });
+
+// A response the case releases by hand: `route: () => h.promise`, later `h.release(answer)`.
+function hold() {
+  let release;
+  const promise = new Promise(r => { release = r; });
+  return { promise, release };
+}
+
+// routes: { 'METHOD /api/path': answer | (call) => answer | Promise<answer> }.
+// A key ending in '*' matches any path with that prefix. `call` is
+// { method, path, query, body (parsed JSON, or the raw text), raw }.
+async function openPage(browser, base, { role = 'engineer', routes = {}, path = '/', fastPolls = false, onDialog } = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [], unstubbed = [], calls = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('dialog', async d => { if (onDialog) await onDialog(d); else await d.dismiss(); });
+  await page.evaluateOnNewDocument((r, fast) => {
+    // FormData bodies, which the request interception cannot read back reliably.
+    window.__forms = [];
+    const realFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      if (init && init.body instanceof FormData) window.__forms.push([...init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : 'file:' + v.name]));
+      return realFetch(input, init);
+    };
+    // Seeded once: a case that signs out must stay signed out on the next load.
+    if (r && !sessionStorage.getItem('vfy_seeded')) { sessionStorage.setItem('vfy_seeded', '1'); sessionStorage.setItem('rag_role', JSON.stringify({ role: r })); }
+    if (fast) {
+      const si = window.setInterval.bind(window), st = window.setTimeout.bind(window);
+      window.setInterval = (fn, ms, ...a) => si(fn, ms === 2000 ? 20 : ms, ...a);
+      window.setTimeout = (fn, ms, ...a) => st(fn, ms === 2000 ? 20 : ms, ...a);
+    }
+  }, role, fastPolls);
+  await page.setRequestInterception(true);
+  page.on('request', async request => {
+    const url = new URL(request.url());
+    if (!url.pathname.startsWith('/api/')) return request.continue();
+    const method = request.method();
+    const raw = request.postData() || '';
+    let body = raw;
+    try { body = raw ? JSON.parse(raw) : null; } catch { /* multipart or text: kept raw */ }
+    const call = { method, path: url.pathname, query: url.search, body, raw };
+    calls.push(call);
+    let route = routes[method + ' ' + url.pathname];
+    if (route === undefined) {
+      const key = Object.keys(routes).find(k => k.endsWith('*') && (method + ' ' + url.pathname).startsWith(k.slice(0, -1)));
+      route = key === undefined ? undefined : routes[key];
+    }
+    if (route === undefined) { unstubbed.push(method + ' ' + url.pathname); return request.respond({ status: 599, contentType: 'text/plain', body: 'unstubbed' }); }
+    const answer = typeof route === 'function' ? await route(call) : route;
+    const a = answer && answer.promise ? await answer.promise : answer;
+    try { await request.respond({ status: a.status, contentType: a.type || 'application/json', body: a.body }); }
+    catch { /* the page navigated away while the answer was held */ }
+  });
+  if (path) await page.goto(base + path, { waitUntil: 'domcontentloaded' });
+  return { ctx, page, errors, unstubbed, calls };
+}
+
+const callsTo = (s, method, path) => s.calls.filter(c => c.method === method && c.path === path);
+const text = page => page.evaluate(() => document.body.innerText.replace(/\s+/g, ' ').trim());
+
+async function waitFor(page, fn, why, ...args) {
+  try { await page.waitForFunction(fn, { timeout: 8000 }, ...args); }
+  catch { throw new Error(`timed out waiting for ${why}; page: ${(await text(page)).slice(0, 500)}`); }
+}
+const waitText = (page, want, gone = false) =>
+  waitFor(page, (w, g) => document.body.innerText.replace(/\s+/g, ' ').includes(w) !== g, `"${want}" to ${gone ? 'go' : 'appear'}`, want, gone);
+
+// Buttons or links by exact trimmed text.
+const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
+  const el = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
+  if (!el) return false; el.click(); return true;
+}, label, selector);
+async function press(page, label, selector = 'button') {
+  if (!await click(page, label, selector)) throw new Error(`no ${selector} "${label}"; page: ${(await text(page)).slice(0, 300)}`);
+}
+
+// React ignores a plain .value assignment; use the native setter and the right event.
+const fill = (page, selector, value) => page.evaluate((sel, v) => {
+  const el = document.querySelector(sel);
+  if (!el) throw new Error('no element ' + sel);
+  const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, String(v));
+  el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+}, selector, value);
+
+// Sets the n-th element matching a selector, for sliders that share a selector.
+const fillNth = (page, selector, n, value) => page.evaluate((sel, i, v) => {
+  const el = document.querySelectorAll(sel)[i];
+  if (!el) throw new Error(`no element ${sel}[${i}]`);
+  const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, String(v));
+  el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+}, selector, n, value);
+
+const forms = page => page.evaluate(() => window.__forms);
+const buttonState = (page, label) => page.evaluate(t => {
+  const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === t);
+  return b ? { disabled: b.disabled } : null;
+}, label);
+
+const nav = page => page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+const path = page => page.evaluate(() => location.pathname);
+async function waitPath(page, want) {
+  await waitFor(page, w => location.pathname === w, `the path ${want}`, want);
+}
+
+// Runs each { name, opts, run(session) } in its own page. A case fails on a thrown
+// error, a React page error or an /api/ request it did not stub.
+async function runCases(browser, base, reporter, section, cases) {
+  reporter.section(section);
+  for (const c of cases) {
+    let s;
+    try {
+      s = await openPage(browser, base, c.open || {});
+      await c.run(s);
+      if (s.errors.length) throw new Error('page errors: ' + s.errors.join(' | '));
+      if (s.unstubbed.length) throw new Error('unstubbed API calls: ' + s.unstubbed.join(', '));
+      reporter.check(c.name, true);
+    } catch (e) {
+      reporter.check(c.name, false, String(e.message || e).slice(0, 700));
+    } finally {
+      if (s) await s.ctx.close().catch(() => {});
+    }
+  }
+}
+
+module.exports = { json, apiError, html, hold, openPage, callsTo, text, waitFor, waitText, click, press, fill, fillNth, forms, buttonState, nav, path, waitPath, runCases, makeReporter };
+```
+
+### scripts/verify/browser/ui_controls.js
+
+```javascript
+// UI controls that had no browser check (#400): Collections, Import, navigation
+// and roles, Q&A, Retrieval, and the client's handling of the proxy's own error
+// pages. Every API call is answered by the check (see stub.js), so nothing here
+// touches the backend or a model. Non-ASCII UI text is written as \u escapes.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const S = require('./stub');
+const { json, apiError, html, hold, callsTo, text, waitFor, waitText, press, fill, fillNth, forms, buttonState, nav, waitPath } = S;
+
+const A = 'VfyUiA', B = 'VfyUiB';
+const DASH = '\u2014', DOT = '\u00b7', ELLIPSIS = '\u2026', CROSS = '\u2715';
+const COLS = [
+  { name: A, object_count: 12, index_type: 'hnsw', distance_metric: 'cosine', created_at: '2026-01-02T12:00:00Z', hnsw_config: { ef: 64, efConstruction: 128, maxConnections: 64 } },
+  { name: B, object_count: 0, index_type: 'flat', distance_metric: 'dot', created_at: null, hnsw_config: null },
+];
+const retrievalConfig = (name, over = {}) => ({ collection: name, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true, ...over });
+const queryReply = (over = {}) => ({ answer: 'A plain answer.', citations: null, retrieval_latency_ms: 12, llm_latency_ms: 34, chunks_retrieved: 2, ...over });
+const CITATIONS = [
+  { source_file: 'alpha.txt', chunk_index: 2, score: 0.12345, excerpt: 'First excerpt.' },
+  { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
+];
+// Answers for the pages a case may pass through; a case adds or overrides routes.
+const base = (extra = {}) => ({
+  'GET /api/collections': json(200, { collections: COLS }),
+  'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
+  'GET /api/packages': json(200, { packages: [] }),
+  'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
+  'GET /api/help/transfer': json(200, { topic: 'transfer', markdown: '# Help\n\nSome text.' }),
+  ...extra,
+});
+
+const bodyHas = (page, want) => page.evaluate(w => document.body.innerText.replace(/\s+/g, ' ').includes(w), want);
+const labels = page => page.evaluate(() => [...document.querySelectorAll('label')].map(l => l.textContent.trim()));
+const rangeAttrs = (page, i) => page.evaluate(n => { const r = document.querySelectorAll('input[type=range]')[n]; return r ? { min: r.min, max: r.max, step: r.step, value: r.value } : null; }, i);
+const selectOptions = (page, i) => page.evaluate(n => [...(document.querySelectorAll('select')[n]?.options || [])].map(o => o.value), i);
+const selected = (page, i) => page.evaluate(n => document.querySelectorAll('select')[n]?.value, i);
+const modalOpen = page => page.evaluate(() => !!document.querySelector('.fixed.inset-0'));
+const waitSelected = (page, i, why) => waitFor(page, n => !!document.querySelectorAll('select')[n]?.value, why || 'the collection select to be filled', i);
+
+function tempFiles(names) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vfyui-'));
+  return names.map(n => { const f = path.join(dir, n); fs.writeFileSync(f, 'inert test file\n'); return f; });
+}
+async function queueFiles(page, names) {
+  const input = await page.$('#file-input');
+  await input.uploadFile(...tempFiles(names));
+  await waitText(page, names[names.length - 1]);
+}
+
+// Ctrl+Enter in the question box.
+async function ctrlEnter(page) {
+  await page.focus('textarea');
+  await page.keyboard.down('Control'); await page.keyboard.press('Enter'); await page.keyboard.up('Control');
+}
+async function askQuestion(page, question = 'What is inert?') {
+  await waitSelected(page, 0);
+  await fill(page, 'textarea', question);
+  await ctrlEnter(page);
+}
+const qaOpen = (role, routes = {}) => ({ role, path: '/qa', routes: base({ 'POST /api/query': json(200, queryReply()), ...routes }) });
+
+function collectionsCases() {
+  const open = (routes = {}) => ({ role: 'engineer', path: '/collections', routes: base(routes) });
+  return [
+    { name: 'Collections table shows its columns, each collection and a dash for a null created date', open: open(), async run(s) {
+      await waitText(s.page, A);
+      const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
+      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', '']);
+      const rows = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+      const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), COLS[0].created_at);
+      assert.deepEqual(rows[0].slice(0, 5), [A, '12', 'hnsw', 'cosine', date]);
+      assert.notEqual(date, DASH);
+      assert.deepEqual(rows[1].slice(0, 5), [B, '0', 'flat', 'dot', DASH]);
+    } },
+    { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
+      await waitText(s.page, A);
+      await press(s.page, '+ New Collection');
+      await waitFor(s.page, () => !!document.querySelector('.fixed.inset-0'), 'the modal');
+      assert.equal(await s.page.evaluate(() => document.querySelector('.fixed input:not([type=range])').value), '');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('.fixed select')[0].value), 'hnsw');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('.fixed select')[1].value), 'cosine');
+      assert.deepEqual(await rangeAttrs(s.page, 0), { min: '64', max: '512', step: '8', value: '128' });
+      assert.deepEqual(await rangeAttrs(s.page, 1), { min: '16', max: '128', step: '4', value: '64' });
+      assert.deepEqual(await rangeAttrs(s.page, 2), { min: '16', max: '512', step: '8', value: '64' });
+      const l = await labels(s.page);
+      for (const want of ['efConstruction: 128', 'maxConnections: 64', 'ef: 64']) assert.ok(l.includes(want), `label ${want} in ${JSON.stringify(l)}`);
+      await fillNth(s.page, 'input[type=range]', 0, 256);
+      assert.ok((await labels(s.page)).includes('efConstruction: 256'));
+    } },
+    { name: 'Choosing Flat removes the HNSW sliders and choosing HNSW brings them back', open: open(), async run(s) {
+      await waitText(s.page, A);
+      await press(s.page, '+ New Collection');
+      await fillNth(s.page, '.fixed select', 0, 'flat');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 0, 'the sliders to go');
+      await fillNth(s.page, '.fixed select', 0, 'hnsw');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 3, 'the sliders to return');
+    } },
+    { name: 'Create sends the typed name, the chosen index, distance and slider values, then closes and reloads the list', open: (() => {
+      let lists = 0;
+      return open({ 'GET /api/collections': () => { lists++; return json(200, { collections: lists === 1 ? COLS : [...COLS, { name: 'VfyUiNew', object_count: 0, index_type: 'hnsw', distance_metric: 'dot', created_at: null, hnsw_config: null }] }); },
+                    'POST /api/collections': json(201, { name: 'VfyUiNew' }) });
+    })(), async run(s) {
+      await waitText(s.page, A);
+      await press(s.page, '+ New Collection');
+      await fill(s.page, '.fixed input:not([type=range])', 'VfyUiNew');
+      await fillNth(s.page, '.fixed select', 1, 'dot');
+      await fillNth(s.page, 'input[type=range]', 0, 256);
+      await fillNth(s.page, 'input[type=range]', 1, 32);
+      await fillNth(s.page, 'input[type=range]', 2, 96);
+      await press(s.page, 'Create');
+      await waitText(s.page, 'VfyUiNew');
+      const posts = callsTo(s, 'POST', '/api/collections');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { name: 'VfyUiNew', index_type: 'hnsw', distance_metric: 'dot', hnsw_config: { efConstruction: 256, maxConnections: 32, ef: 96 } });
+      assert.equal(await modalOpen(s.page), false);
+      assert.equal(callsTo(s, 'GET', '/api/collections').length, 2);
+    } },
+  ];
+}
+
+function importCases() {
+  const open = (role = 'engineer', routes = {}) => ({ role, path: '/import', routes: base(routes) });
+  const strategyIs = (page, value) => fillNth(page, 'select', 1, value);
+  const ready = async page => { await waitSelected(page, 0); };
+  return [
+    { name: 'Import queued list shows each file, removes only the one chosen, and Start Ingest follows the queue', open: open(), async run(s) {
+      await ready(s.page);
+      assert.equal((await buttonState(s.page, 'Start Ingest')).disabled, true);
+      await queueFiles(s.page, ['one.txt', 'two.txt']);
+      const names = () => s.page.evaluate(() => [...document.querySelectorAll('ul li span')].map(x => x.textContent.trim()));
+      assert.deepEqual(await names(), ['one.txt', 'two.txt']);
+      assert.equal((await buttonState(s.page, 'Start Ingest')).disabled, false);
+      await press(s.page, CROSS);
+      await waitFor(s.page, () => document.querySelectorAll('ul li').length === 1, 'one file removed');
+      assert.deepEqual(await names(), ['two.txt']);
+      await press(s.page, CROSS);
+      await waitFor(s.page, () => document.querySelectorAll('ul li').length === 0, 'no files left');
+      assert.equal((await buttonState(s.page, 'Start Ingest')).disabled, true);
+    } },
+    { name: 'Import page lists the collections, selects the first and shows the default sliders', open: open(), async run(s) {
+      await ready(s.page);
+      assert.deepEqual(await selectOptions(s.page, 0), [A, B]);
+      assert.equal(await selected(s.page, 0), A);
+      const l = await labels(s.page);
+      for (const want of ['Chunk Size: 1000', 'Overlap: 200', 'Min Chunk Size: 100']) assert.ok(l.includes(want), `${want} in ${JSON.stringify(l)}`);
+      assert.ok(!l.some(x => x.startsWith('Similarity Threshold')));
+    } },
+    { name: 'Engineer sees Overlap for fixed, overlap and language, and Similarity Threshold only for semantic', open: open(), async run(s) {
+      await ready(s.page);
+      const has = async prefix => (await labels(s.page)).some(x => x.startsWith(prefix));
+      for (const strategy of ['fixed', 'overlap', 'language']) {
+        await strategyIs(s.page, strategy);
+        await waitText(s.page, strategy === 'language' ? 'natural sentence' : strategy === 'fixed' ? 'equal-sized' : 'shares some text');
+        assert.equal(await has('Overlap:'), true, strategy + ' shows Overlap');
+        assert.equal(await has('Similarity Threshold'), false, strategy + ' hides Similarity');
+      }
+      await strategyIs(s.page, 'context_aware');
+      await waitText(s.page, 'headings, paragraphs');
+      assert.equal(await has('Overlap:'), false);
+      assert.equal(await has('Similarity Threshold'), false);
+      await strategyIs(s.page, 'semantic');
+      await waitText(s.page, 'same topic');
+      assert.equal(await has('Overlap:'), false);
+      assert.equal(await has('Similarity Threshold: 0.85'), true);
+    } },
+    { name: 'Developer never sees Similarity Threshold, not even for semantic', open: open('developer'), async run(s) {
+      await ready(s.page);
+      await strategyIs(s.page, 'semantic');
+      await waitText(s.page, 'same topic');
+      assert.equal((await labels(s.page)).some(x => x.startsWith('Similarity Threshold')), false);
+      assert.equal((await labels(s.page)).some(x => x.startsWith('Overlap:')), false);
+    } },
+    { name: 'Lowering Chunk Size pulls Overlap down to Chunk Size minus 50 and caps the Overlap slider', open: open(), async run(s) {
+      await ready(s.page);
+      await fillNth(s.page, 'input[type=range]', 0, 150);
+      await waitFor(s.page, () => [...document.querySelectorAll('label')].some(l => l.textContent.trim() === 'Overlap: 100'), 'Overlap 100');
+      assert.ok((await labels(s.page)).includes('Chunk Size: 150'));
+      assert.equal((await rangeAttrs(s.page, 1)).max, '100');
+      await fillNth(s.page, 'input[type=range]', 0, 3000);
+      await waitFor(s.page, () => [...document.querySelectorAll('label')].some(l => l.textContent.trim() === 'Chunk Size: 3000'), 'Chunk Size 3000');
+      assert.equal((await rangeAttrs(s.page, 1)).max, '2000');
+      assert.ok((await labels(s.page)).includes('Overlap: 100'), 'overlap is not raised again');
+    } },
+    { name: 'Start Ingest sends the collection, strategy and slider values as the form fields', open: open('engineer', {
+      'POST /api/ingest/upload': json(202, { job_id: 'vfyjob', status: 'queued', files_queued: 1, collection: B }),
+      'GET /api/ingest/job/*': json(200, { job_id: 'vfyjob', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 1, errors: [] }) }), async run(s) {
+      await ready(s.page);
+      await queueFiles(s.page, ['doc.txt']);
+      await fillNth(s.page, 'select', 0, B);
+      await strategyIs(s.page, 'semantic');
+      await waitText(s.page, 'same topic');
+      await fillNth(s.page, 'input[type=range]', 0, 2000);
+      await fillNth(s.page, 'input[type=range]', 1, 40);
+      await fillNth(s.page, 'input[type=range]', 2, 0.5);
+      await press(s.page, 'Start Ingest');
+      await waitFor(s.page, () => window.__forms.length === 1, 'the upload');
+      const [form] = await forms(s.page);
+      const get = k => form.filter(([n]) => n === k).map(([, v]) => v);
+      assert.deepEqual(get('files'), ['file:doc.txt']);
+      assert.deepEqual(get('collection'), [B]);
+      assert.deepEqual(get('strategy'), ['semantic']);
+      assert.deepEqual(get('chunk_size'), ['2000']);
+      assert.deepEqual(get('min_chunk_size'), ['40']);
+      assert.deepEqual(get('similarity_threshold'), ['0.5']);
+      assert.deepEqual(get('chunk_overlap'), ['200']);
+    } },
+    { name: 'Import "+ New" modal ignores a blank name, creates with cosine and the default HNSW values, selects the new collection, and Cancel sends nothing', open: (() => {
+      let lists = 0;
+      return open('engineer', { 'GET /api/collections': () => { lists++; return json(200, { collections: lists === 1 ? COLS : [...COLS, { name: 'VfyUiNew', object_count: 0, index_type: 'flat', distance_metric: 'cosine', created_at: null, hnsw_config: null }] }); },
+                                'POST /api/collections': json(201, { name: 'VfyUiNew' }) });
+    })(), async run(s) {
+      await ready(s.page);
+      await press(s.page, '+ New');
+      await waitFor(s.page, () => !!document.querySelector('.fixed.inset-0'), 'the modal');
+      await press(s.page, 'Create');
+      await fill(s.page, '.fixed input', '   ');
+      await press(s.page, 'Create');
+      assert.equal(callsTo(s, 'POST', '/api/collections').length, 0);
+      assert.equal(await modalOpen(s.page), true);
+      await press(s.page, 'Cancel');
+      assert.equal(await modalOpen(s.page), false);
+      assert.equal(callsTo(s, 'POST', '/api/collections').length, 0);
+      await press(s.page, '+ New');
+      await fill(s.page, '.fixed input', 'VfyUiNew');
+      await fill(s.page, '.fixed select', 'flat');
+      await press(s.page, 'Create');
+      await waitFor(s.page, () => document.querySelectorAll('select')[0].value === 'VfyUiNew', 'the new collection selected');
+      const posts = callsTo(s, 'POST', '/api/collections');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { name: 'VfyUiNew', index_type: 'flat', distance_metric: 'cosine', hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 } });
+      assert.equal(await modalOpen(s.page), false);
+    } },
+  ];
+}
+
+function navigationCases() {
+  const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
+  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer']);
+    } },
+    { name: 'Developer is sent back to Q&A from /collections and /health, but can open /transfer and /help/transfer', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      for (const p of ['/collections', '/health']) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+      await goto(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitPath(s.page, '/transfer');
+      await goto(s.page, '/help/transfer');
+      await waitText(s.page, 'Export and Import');
+      await waitPath(s.page, '/help/transfer');
+    } },
+    { name: 'End User opening a Developer page directly is sent to Q&A (gating is client-side only until #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
+      for (const p of [...gated, '/collections', '/health']) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+    } },
+    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Choosing ${badge[role]} on the landing page opens /qa with that role badge and stores the role`, open: { role: null, path: '/', routes: base() }, async run(s) {
+      await waitText(s.page, 'Select your role to continue');
+      assert.equal(await s.page.evaluate(label => {
+        const b = [...document.querySelectorAll('button')].find(x => x.querySelector('h2')?.textContent.trim() === label);
+        if (!b) return false; b.click(); return true;
+      }, badge[role]), true);
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim()), badge[role]);
+      assert.deepEqual(JSON.parse(await s.page.evaluate(() => sessionStorage.getItem('rag_role'))), { role });
+    } })),
+    { name: 'Switch Role returns to the role chooser, forgets the role, and a later /qa visit goes back to it', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await press(s.page, 'Switch Role');
+      await waitPath(s.page, '/');
+      await waitText(s.page, 'Select your role to continue');
+      assert.equal(await s.page.evaluate(() => sessionStorage.getItem('rag_role')), null);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await goto(s.page, '/qa');
+      await waitText(s.page, 'Select your role to continue');
+      await waitPath(s.page, '/');
+    } },
+  ];
+}
+
+function qaCases() {
+  return [
+    { name: 'Ask is disabled for empty and blank questions and enabled for text', open: qaOpen('engineer'), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal((await buttonState(s.page, 'Ask')).disabled, true);
+      await fill(s.page, 'textarea', '   ');
+      assert.equal((await buttonState(s.page, 'Ask')).disabled, true);
+      await fill(s.page, 'textarea', 'a question');
+      assert.equal((await buttonState(s.page, 'Ask')).disabled, false);
+    } },
+    { name: 'Ctrl+Enter submits the question once, and does nothing on an empty box', open: qaOpen('engineer'), async run(s) {
+      await waitSelected(s.page, 0);
+      await ctrlEnter(s.page);
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'POST', '/api/query').length, 0);
+      await fill(s.page, 'textarea', 'What is inert?');
+      await ctrlEnter(s.page);
+      await waitText(s.page, 'A plain answer.');
+      const posts = callsTo(s, 'POST', '/api/query');
+      assert.equal(posts.length, 1);
+      assert.equal(posts[0].body.question, 'What is inert?');
+      assert.equal(posts[0].body.collection, A);
+    } },
+    { name: 'Plain Enter inserts a newline and does not submit', open: qaOpen('engineer'), async run(s) {
+      await waitSelected(s.page, 0);
+      await s.page.focus('textarea');
+      await s.page.keyboard.type('line one');
+      await s.page.keyboard.press('Enter');
+      await s.page.keyboard.type('line two');
+      assert.equal(await s.page.evaluate(() => document.querySelector('textarea').value), 'line one\nline two');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'POST', '/api/query').length, 0);
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'While a question is answered the button reads Thinking and is disabled, then Ask returns', open: qaOpen('engineer', { 'POST /api/query': () => h }), async run(s) {
+        await askQuestion(s.page);
+        await waitText(s.page, 'Thinking' + ELLIPSIS);
+        assert.equal((await buttonState(s.page, 'Thinking' + ELLIPSIS)).disabled, true);
+        h.release(json(200, queryReply()));
+        await waitText(s.page, 'A plain answer.');
+        assert.equal((await buttonState(s.page, 'Ask')).disabled, false);
+      } };
+    })(),
+    { name: 'With citations off the query asks for none and no Sources panel shows, even if the reply carries some', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ citations: CITATIONS })) }), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[type=checkbox]').checked), false);
+      await askQuestion(s.page);
+      await waitText(s.page, 'A plain answer.');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.include_citations, false);
+      assert.equal(await bodyHas(s.page, 'Sources'), false);
+    },},
+    { name: 'With citations on the query asks for them and the Sources panel lists file, chunk, score (n/a when null) and excerpt', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ citations: CITATIONS })) }), async run(s) {
+      await waitSelected(s.page, 0);
+      await s.page.click('input[type=checkbox]');
+      await askQuestion(s.page);
+      await waitText(s.page, 'Sources');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.include_citations, true);
+      const panel = await s.page.evaluate(() => [...document.querySelectorAll('h3')].find(h => h.textContent.trim() === 'Sources')?.parentElement.innerText.replace(/\s+/g, ' '));
+      for (const want of ['alpha.txt', `chunk 2 ${DOT} score 0.123`, 'First excerpt.', 'beta.txt', `chunk 0 ${DOT} score n/a`, 'Second excerpt.']) assert.ok(panel.includes(want), `${want} in ${panel}`);
+    } },
+    { name: 'Unchecking the citations box hides the panel of the answer on screen and checking it brings it back without a new query', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ citations: CITATIONS })) }), async run(s) {
+      await waitSelected(s.page, 0);
+      await s.page.click('input[type=checkbox]');
+      await askQuestion(s.page);
+      await waitText(s.page, 'Sources');
+      await s.page.click('input[type=checkbox]');
+      await waitText(s.page, 'Sources', true);
+      await s.page.click('input[type=checkbox]');
+      await waitText(s.page, 'Sources');
+      assert.equal(callsTo(s, 'POST', '/api/query').length, 1);
+    } },
+    { name: 'The answer renders markdown and the latency line shows both times', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ answer: 'This is **bold words** here.\n\n- first item\n- second item', retrieval_latency_ms: 12, llm_latency_ms: 345 })) }), async run(s) {
+      await askQuestion(s.page);
+      await waitText(s.page, 'bold words');
+      const dom = await s.page.evaluate(() => ({
+        strong: [...document.querySelectorAll('.prose strong')].map(x => x.textContent),
+        items: [...document.querySelectorAll('.prose li')].map(x => x.textContent.trim()),
+      }));
+      assert.deepEqual(dom.strong, ['bold words']);
+      assert.deepEqual(dom.items, ['first item', 'second item']);
+      assert.equal(await bodyHas(s.page, '**'), false);
+      assert.equal(await bodyHas(s.page, `Retrieved in 12ms ${DOT} Generated in 345ms`), true);
+    } },
+    (() => {
+      let n = 0;
+      return { name: 'A failed query shows the API message with no answer or latency line, and asking again clears it', open: qaOpen('engineer', { 'POST /api/query': () => (++n === 1 ? apiError(500, 'INTERNAL_ERROR', 'Synthetic query failure.') : json(200, queryReply())) }), async run(s) {
+        await askQuestion(s.page);
+        await waitText(s.page, 'Synthetic query failure.');
+        assert.equal(await bodyHas(s.page, 'Retrieved in'), false);
+        assert.equal(await bodyHas(s.page, 'A plain answer.'), false);
+        assert.equal((await buttonState(s.page, 'Ask')).disabled, false);
+        await ctrlEnter(s.page);
+        await waitText(s.page, 'A plain answer.');
+        assert.equal(await bodyHas(s.page, 'Synthetic query failure.'), false);
+        assert.equal(await bodyHas(s.page, 'Retrieved in'), true);
+      } };
+    })(),
+    { name: 'End User sees no method display and the query asks for response_format end_user', open: qaOpen('end_user'), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select').length), 1);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select[disabled]').length), 0);
+      await askQuestion(s.page);
+      await waitText(s.page, 'A plain answer.');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.response_format, 'end_user');
+    } },
+    ...['engineer', 'developer'].map(role => ({ name: `${role === 'engineer' ? 'Engineer' : 'Developer'} sees the method display and the query asks for response_format engineer`, open: qaOpen(role), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select').length), 2);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select[disabled]').length), 1);
+      await askQuestion(s.page);
+      await waitText(s.page, 'A plain answer.');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.response_format, 'engineer');
+    } })),
+  ];
+}
+
+function retrievalCases() {
+  const saved = over => ({ 'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop(), over)) });
+  const open = routes => ({ role: 'engineer', path: '/retrieval', routes: base(routes) });
+  const alphaLabel = page => page.evaluate(() => [...document.querySelectorAll('label')].find(l => l.textContent.includes('Meaning:'))?.textContent.trim() || null);
+  return [
+    { name: 'Retrieval page says the settings shown are the saved ones', open: open(saved({ retrieval_mode: 'semantic', top_k: 9, is_default: false })), async run(s) {
+      await waitText(s.page, 'Showing the settings saved for this collection.');
+      assert.equal(await bodyHas(s.page, 'showing defaults'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[name=mode][value=semantic]').checked), true);
+      assert.ok(await bodyHas(s.page, 'Top-K Results: 9'));
+    } },
+    { name: 'Retrieval page says defaults are shown when nothing is saved', open: open(saved({ is_default: true })), async run(s) {
+      await waitText(s.page, `No settings saved for this collection yet ${DASH} showing defaults.`);
+      assert.equal(await bodyHas(s.page, 'Showing the settings saved'), false);
+    } },
+    { name: 'The alpha slider shows for Hybrid only, starts at the saved value, and the changed value is saved', open: open({ ...saved({ retrieval_mode: 'hybrid', alpha: 0.25, top_k: 7, is_default: false }),
+        'POST /api/retrieval/config': call => json(200, { ...call.body, is_default: false }) }), async run(s) {
+      await waitText(s.page, 'Showing the settings saved');
+      assert.equal(await alphaLabel(s.page), `Keyword \u2190 Balance \u2192 Meaning: 0.25`);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('input[type=range]').length), 2);
+      await s.page.click('input[name=mode][value=semantic]');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 1, 'the alpha slider to go (semantic)');
+      assert.equal(await alphaLabel(s.page), null);
+      await s.page.click('input[name=mode][value=hnsw]');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 1, 'no alpha slider (vector)');
+      await s.page.click('input[name=mode][value=hybrid]');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 2, 'the alpha slider to return');
+      await fillNth(s.page, 'input[type=range]', 1, 0.4);
+      await waitFor(s.page, () => [...document.querySelectorAll('label')].some(l => l.textContent.trim().endsWith('Meaning: 0.4')), 'alpha 0.4');
+      await press(s.page, 'Save for this collection');
+      await waitText(s.page, 'Saved!');
+      const posts = callsTo(s, 'POST', '/api/retrieval/config');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { collection: A, retrieval_mode: 'hybrid', top_k: 7, alpha: 0.4, ef: null, response_format: 'engineer' });
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'Save is disabled and the page says Loading while the saved settings are read, then it is enabled', open: open({ 'GET /api/retrieval/config/*': () => h }), async run(s) {
+        await waitText(s.page, 'Loading saved settings' + ELLIPSIS);
+        assert.equal((await buttonState(s.page, 'Save for this collection')).disabled, true);
+        h.release(json(200, retrievalConfig(A)));
+        await waitText(s.page, 'Loading saved settings' + ELLIPSIS, true);
+        assert.equal((await buttonState(s.page, 'Save for this collection')).disabled, false);
+      } };
+    })(),
+  ];
+}
+
+// The proxy answers some errors itself, as HTML; the client turns them into text
+// (ui/src/api/client.ts). Driven through the Import page's upload.
+function proxyCases() {
+  const one = (name, answer, want) => ({ name, open: { role: 'engineer', path: '/import', routes: base({ 'POST /api/ingest/upload': answer }) }, async run(s) {
+    await waitSelected(s.page, 0);
+    await queueFiles(s.page, ['doc.txt']);
+    await press(s.page, 'Start Ingest');
+    await waitText(s.page, want);
+    const shown = await s.page.evaluate(() => document.querySelector('p.text-red-600')?.textContent.trim());
+    assert.equal(shown, want);
+    assert.ok(!/JSON|Unexpected token|<html/i.test(shown), 'no parser text: ' + shown);
+  } });
+  return [
+    one('A proxy 413 page is shown as the upload limit message', html(413, 'Request Entity Too Large'), 'The upload is larger than the 512 MB limit. Split it into smaller batches.'),
+    one('A proxy 502 page is shown as "the API is not responding"', html(502, 'Bad Gateway'), 'The API is not responding. It may still be starting; try again in a minute.'),
+    one('A proxy 504 page is shown as "the API took too long"', html(504, 'Gateway Time-out'), 'The API took too long to respond.'),
+    one('An HTML error page with no special text is shown as its status', html(500, 'Internal Server Error'), 'HTTP 500'),
+    one('A 200 that is not JSON is reported as unreadable', { status: 200, type: 'text/html', body: '<html><body>not json</body></html>' }, 'The server sent a response the UI could not read.'),
+    one("The API's own JSON message wins over the status text", apiError(413, 'PAYLOAD_TOO_LARGE', 'Synthetic API message.'), 'Synthetic API message.'),
+  ];
+}
+
+async function runUiControlTests(browser, baseUrl, reporter) {
+  S.BASE = baseUrl;
+  const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
+  await run('Collections table and create modal (#400)', collectionsCases());
+  await run('Import queue, sliders and "+ New" modal (#400)', importCases());
+  await run('Navigation, roles and redirects; gating is client-side only until #25 (#400)', navigationCases());
+  await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
+  await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
+  await run('Client handling of the proxy error pages (#400)', proxyCases());
+}
+
+module.exports = { runUiControlTests };
+if (require.main === module) (async () => {
+  const { makeReporter } = require('./lib');
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runUiControlTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/ui_pages.js
+
+```javascript
+// UI pages whose controls had no browser check (#400): Gold Standard generate and
+// review, the Transfer page's export and import controls, the Help page and the
+// Health latency display. Every API call is answered by the check (see stub.js).
+// Non-ASCII UI text is written as \u escapes. The Transfer polling and /tune
+// failure labels are checked by transfer_page.js (#382) and not repeated here.
+const assert = require('node:assert/strict');
+const S = require('./stub');
+const { json, apiError, html, hold, callsTo, waitFor, waitText, press, fill, fillNth, buttonState, waitPath } = S;
+
+const A = 'VfyUiA', B = 'VfyUiB';
+const DOT = '\u00b7', DASH = '\u2014', ELLIPSIS = '\u2026', ARROW = '\u2192';
+const COLS = [
+  { name: A, object_count: 12, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null },
+  { name: B, object_count: 0, index_type: 'flat', distance_metric: 'dot', created_at: null, hnsw_config: null },
+];
+const bodyHas = (page, want) => page.evaluate(w => document.body.innerText.replace(/\s+/g, ' ').includes(w), want);
+const tune = (name, fidelity = 'with-sources') => ({ collection: name, fidelity, source_document_count: 2, can_rechunk: fidelity === 'with-sources', can_reembed: true, can_reindex: true, note: '' });
+const common = (extra = {}) => ({
+  'GET /api/collections': json(200, { collections: COLS }),
+  'GET /api/packages': json(200, { packages: [] }),
+  'GET /api/tune/*': call => json(200, tune(call.path.split('/').pop())),
+  'GET /api/help/transfer': json(200, { topic: 'transfer', markdown: '# Help\n\nSome text.' }),
+  ...extra,
+});
+const waitSelected = (page, i) => waitFor(page, n => !!document.querySelectorAll('select')[n]?.value, 'the collection select to be filled', i);
+
+// -- Gold Standard -----------------------------------------------------------
+const SID = 'gs_vfyui01';
+const pair = (id, status, question = 'Question ' + id) => ({ pair_id: id, question, answer: 'Answer ' + id, contexts: ['Context ' + id], ground_truth: 'Truth ' + id, source_file: id + '.txt', chunk_index: 0, status });
+const session = (pairs, over = {}) => ({ session_id: SID, collection: A, status: 'completed', pairs_total: pairs.length, pairs_attempted: pairs.length, pairs_completed: pairs.length, pairs_failed: 0, pairs, ...over });
+const reviewPairs = () => [pair('p1', 'pending'), pair('p2', 'approved'), pair('p3', 'edited'), pair('p4', 'rejected')];
+const SESSION = '/api/goldstandard/session/' + SID;
+
+// Loads a retained session by id, which shows the review phase without generating.
+async function loadSession(page) {
+  await waitSelected(page, 0);
+  await fill(page, '#retained-session', SID);
+  await press(page, 'Load / refresh session');
+  await waitText(page, 'Phase 2');
+}
+const summary = page => page.evaluate(() => [...document.querySelectorAll('p')].find(p => /approved .* pending/.test(p.textContent))?.textContent.replace(/\s+/g, ' ').trim());
+const pairControl = (page, question, title) => page.evaluate((q, t) => {
+  const d = [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q);
+  const b = d?.querySelector(`button[title=${t}]`);
+  if (!b) return false; b.click(); return true;
+}, question, title);
+const detailsOpen = (page, question) => page.evaluate(q => [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q)?.open, question);
+const statusOf = (page, question) => page.evaluate(q => [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q)?.querySelector('summary span.rounded')?.textContent.trim(), question);
+
+function goldCases() {
+  const gold = (routes = {}, over = {}) => ({ role: 'engineer', path: '/goldstandard', ...over, routes: common(routes) });
+  // A small server: the page polls the session once after loading, so the answers
+  // must follow the changes the page makes.
+  const review = (routes = {}, pairs = reviewPairs()) => gold({
+    ['GET ' + SESSION]: () => json(200, session(pairs)),
+    ['PATCH ' + SESSION + '/pair/*']: call => {
+      const i = pairs.findIndex(p => p.pair_id === call.path.split('/').pop());
+      pairs[i] = { ...pairs[i], ...call.body };
+      return json(200, pairs[i]);
+    },
+    'POST /api/goldstandard/regenerate': call => {
+      const i = pairs.findIndex(p => p.pair_id === call.body.pair_id);
+      pairs[i] = { ...pairs[i], question: 'Regenerated question', answer: 'New answer', status: 'pending' };
+      return json(200, pairs[i]);
+    },
+    ...routes,
+  });
+  let confirmAnswer = false;
+  return [
+    { name: 'Gold Standard lists the collections with the first selected, and the sample size input is 1 to 100 starting at 20', open: gold(), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('select option')].map(o => o.value)), [A, B]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select').value), A);
+      assert.deepEqual(await s.page.evaluate(() => { const i = document.querySelector('input[type=number]'); return { min: i.min, max: i.max, value: i.value }; }), { min: '1', max: '100', value: '20' });
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'Generate sends the chosen collection and sample size once and is disabled until the start is answered', open: gold({
+        'POST /api/goldstandard/generate': () => h,
+        ['GET ' + SESSION]: json(200, session([], { status: 'generating', pairs_total: 4, pairs_attempted: 0, pairs_completed: 0 })) }), async run(s) {
+        await waitSelected(s.page, 0);
+        await fillNth(s.page, 'select', 0, B);
+        await fill(s.page, 'input[type=number]', 5);
+        await press(s.page, 'Generate Pairs');
+        await waitFor(s.page, () => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Generate Pairs')?.disabled === true, 'Generate Pairs to be disabled');
+        h.release(json(202, { session_id: SID, status: 'generating', pairs_total: 4, pairs_completed: 0 }));
+        await waitFor(s.page, () => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Generate Pairs')?.disabled === false, 'Generate Pairs to be enabled');
+        const posts = callsTo(s, 'POST', '/api/goldstandard/generate');
+        assert.equal(posts.length, 1);
+        assert.deepEqual(posts[0].body, { collection: B, sample_size: 5 });
+      } };
+    })(),
+    (() => {
+      let phase = 'generating';
+      return { name: 'Generating shows attempted/total with a matching bar, and the review phase appears when the session completes', open: gold({
+        'POST /api/goldstandard/generate': json(202, { session_id: SID, status: 'generating', pairs_total: 4, pairs_completed: 0 }),
+        ['GET ' + SESSION]: () => json(200, phase === 'generating' ? session([pair('p1', 'pending')], { status: 'generating', pairs_total: 4, pairs_attempted: 1, pairs_completed: 1 }) : session(reviewPairs())) }, { fastPolls: true }), async run(s) {
+        await waitSelected(s.page, 0);
+        await press(s.page, 'Generate Pairs');
+        await waitText(s.page, `Generating${ELLIPSIS} 1/4 pairs`);
+        assert.equal(await s.page.evaluate(() => document.querySelector('.bg-blue-500.h-2').style.width), '25%');
+        assert.equal(await bodyHas(s.page, 'Phase 2'), true);
+        phase = 'done';
+        await waitText(s.page, 'Generating', true);
+        await waitText(s.page, 'Phase 2');
+        assert.equal(await summary(s.page), `1 approved ${DOT} 1 edited ${DOT} 1 rejected ${DOT} 1 pending`);
+      } };
+    })(),
+    { name: 'A refused generate shows the API message and leaves Generate enabled', open: gold({ 'POST /api/goldstandard/generate': apiError(409, 'GENERATION_BUSY', 'Synthetic generate refusal.') }), async run(s) {
+      await waitSelected(s.page, 0);
+      await press(s.page, 'Generate Pairs');
+      await waitText(s.page, 'Synthetic generate refusal.');
+      assert.equal((await buttonState(s.page, 'Generate Pairs')).disabled, false);
+    } },
+    { name: 'Generate with a session already shown asks first: Cancel sends nothing, OK starts a new one', open: Object.assign(gold({
+        'POST /api/goldstandard/generate': json(202, { session_id: SID, status: 'completed', pairs_total: 4, pairs_completed: 4 }),
+        ['GET ' + SESSION]: json(200, session(reviewPairs())) }), { onDialog: async d => { confirmAnswer ? await d.accept() : await d.dismiss(); } }), async run(s) {
+      await loadSession(s.page);
+      let dialogs = 0;
+      s.page.on('dialog', d => { dialogs++; assert.match(d.message(), /Start a new session\?/); });
+      confirmAnswer = false;
+      await press(s.page, 'Generate Pairs');
+      await waitFor(s.page, () => true, 'a tick');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(dialogs, 1);
+      assert.equal(callsTo(s, 'POST', '/api/goldstandard/generate').length, 0);
+      confirmAnswer = true;
+      await press(s.page, 'Generate Pairs');
+      await waitFor(s.page, () => true, 'a tick');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(dialogs, 2);
+      assert.equal(callsTo(s, 'POST', '/api/goldstandard/generate').length, 1);
+    } },
+    { name: 'The summary bar counts approved, edited, rejected and pending pairs', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await summary(s.page), `1 approved ${DOT} 1 edited ${DOT} 1 rejected ${DOT} 1 pending`);
+    } },
+    { name: 'Approve and Reject send the pair status, update the row and the summary, and leave the row closed', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Approve'), true);
+      await waitFor(s.page, () => /2 approved .* 0 pending/.test(document.body.innerText), 'p1 approved');
+      assert.equal(await statusOf(s.page, 'Question p1'), 'approved');
+      assert.equal(await detailsOpen(s.page, 'Question p1'), false);
+      assert.equal(await pairControl(s.page, 'Question p2', 'Reject'), true);
+      await waitFor(s.page, () => /1 approved .* 2 rejected/.test(document.body.innerText.replace(/\s+/g, ' ')), 'p2 rejected');
+      assert.equal(await statusOf(s.page, 'Question p2'), 'rejected');
+      assert.equal(await detailsOpen(s.page, 'Question p2'), false);
+      const patches = s.calls.filter(c => c.method === 'PATCH');
+      assert.deepEqual(patches.map(c => [c.path, c.body]), [[SESSION + '/pair/p1', { status: 'approved' }], [SESSION + '/pair/p2', { status: 'rejected' }]]);
+    } },
+    { name: 'Regenerate sends the session and pair and replaces only that pair', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p3', 'Regenerate'), true);
+      await waitText(s.page, 'Regenerated question');
+      assert.equal(await bodyHas(s.page, 'Question p3'), false);
+      for (const q of ['Question p1', 'Question p2', 'Question p4']) assert.equal(await bodyHas(s.page, q), true, q);
+      const posts = callsTo(s, 'POST', '/api/goldstandard/regenerate');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { session_id: SID, pair_id: 'p3' });
+      assert.equal(await detailsOpen(s.page, 'Regenerated question'), false);
+    } },
+    { name: 'Edit opens the pair, Cancel sends nothing and Save sends status edited with the three fields', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Edit'), true);
+      await waitText(s.page, 'Edit Pair');
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('.fixed textarea')].map(t => t.value)), ['Question p1', 'Answer p1', 'Truth p1']);
+      await press(s.page, 'Cancel');
+      await waitText(s.page, 'Edit Pair', true);
+      assert.equal(s.calls.filter(c => c.method === 'PATCH').length, 0);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Edit'), true);
+      await waitText(s.page, 'Edit Pair');
+      await fillNth(s.page, '.fixed textarea', 0, 'Edited question');
+      await fillNth(s.page, '.fixed textarea', 1, 'Edited answer');
+      await fillNth(s.page, '.fixed textarea', 2, 'Edited truth');
+      await press(s.page, 'Save');
+      await waitText(s.page, 'Edited question');
+      const patches = s.calls.filter(c => c.method === 'PATCH');
+      assert.deepEqual(patches.map(c => c.body), [{ status: 'edited', question: 'Edited question', answer: 'Edited answer', ground_truth: 'Edited truth' }]);
+      assert.equal(await statusOf(s.page, 'Edited question'), 'edited');
+      assert.equal(await summary(s.page), `1 approved ${DOT} 2 edited ${DOT} 1 rejected ${DOT} 0 pending`);
+    } },
+    { name: 'A failed review action shows the API message and keeps the pair as it was', open: review({ ['PATCH ' + SESSION + '/pair/*']: apiError(500, 'INTERNAL_ERROR', 'Synthetic patch failure.') }), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Approve'), true);
+      await waitText(s.page, 'Synthetic patch failure.');
+      assert.equal(await statusOf(s.page, 'Question p1'), 'pending');
+      assert.equal(await summary(s.page), `1 approved ${DOT} 1 edited ${DOT} 1 rejected ${DOT} 1 pending`);
+    } },
+    { name: 'Export Approved is enabled only while some pair is approved or edited', open: review({}, [pair('p1', 'pending'), pair('p4', 'rejected')]), async run(s) {
+      await loadSession(s.page);
+      assert.equal((await buttonState(s.page, 'Export Approved')).disabled, true);
+    } },
+    { name: 'Export Approved is enabled when a pair is approved', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal((await buttonState(s.page, 'Export Approved')).disabled, false);
+    } },
+  ];
+}
+
+// -- Transfer: export and import controls ------------------------------------
+const PKG_OK = 'ragpkg-vfyuia-20261021-0000-abcd1234.tar.gz', PKG_BAD = 'ragpkg-broken-20261021-0000-ffff0000.tar.gz';
+const PACKAGES = [
+  { filename: PKG_OK, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true },
+  { filename: PKG_BAD, size_bytes: 10, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: false },
+];
+const exportJob = (status, extra = {}) => json(200, { job_id: 'vfyexp', status, collection: A, chunks_written: 0, filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null, retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null, ...extra });
+const importJob = (status, extra = {}) => json(200, { job_id: 'vfyimp', status, filename: PKG_OK, on_conflict: 'abort', collection: null, original_collection: null, chunks_written: 0, fidelity: null, renamed: false, notes: [], error: null, error_code: null, error_detail: null, ...extra });
+const optionTexts = (page, i) => page.evaluate(n => [...document.querySelectorAll('select')[n].options].map(o => o.textContent.trim()), i);
+
+function transferCases() {
+  const xfer = (routes = {}) => ({ role: 'developer', path: '/transfer', fastPolls: true, routes: common(routes) });
+  const pkgs = { 'GET /api/packages': json(200, { packages: PACKAGES }) };
+  return [
+    { name: 'Export lists each collection with its chunk count, selects the first and looks up the fidelity of a newly chosen one', open: xfer(), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.deepEqual(await optionTexts(s.page, 0), [`${A} (12 chunks)`, `${B} (0 chunks)`]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select').value), A);
+      await waitFor(s.page, () => true, 'a tick');
+      assert.equal(callsTo(s, 'GET', '/api/tune/' + A).length, 1);
+      await fillNth(s.page, 'select', 0, B);
+      await waitFor(s.page, () => true, 'a tick');
+      await new Promise(r => setTimeout(r, 200));
+      assert.equal(callsTo(s, 'GET', '/api/tune/' + B).length, 1);
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'The fidelity line reads "reading" while looked up, then names with-sources and the documents that travel', open: xfer({ 'GET /api/tune/*': () => h }), async run(s) {
+        await waitText(s.page, `Fidelity: reading${ELLIPSIS}`);
+        h.release(json(200, tune(A)));
+        await waitText(s.page, `Fidelity: with-sources ${DASH} 2 original document(s) will travel with the package.`);
+        assert.equal(await bodyHas(s.page, 'reading'), false);
+      } };
+    })(),
+    { name: 'A metadata-only collection says no original documents were kept', open: xfer({ 'GET /api/tune/*': call => json(200, tune(call.path.split('/').pop(), 'metadata-only')) }), async run(s) {
+      await waitText(s.page, `Fidelity: metadata-only ${DASH} No original documents were retained, so the package cannot be re-chunked after import.`);
+    } },
+    { name: 'The include-models box starts unchecked and its state is sent with the export', open: xfer({
+        'POST /api/export': json(202, { job_id: 'vfyexp', status: 'queued', collection: A }),
+        'GET /api/export/job/vfyexp': exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz', size_bytes: 1000, fidelity: 'with-sources', models_bundled: false, retrieve_script: true }) }), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[type=checkbox]').checked), false);
+      await press(s.page, 'Export');
+      await waitText(s.page, 'Done.');
+      await s.page.click('input[type=checkbox]');
+      await press(s.page, 'Export');
+      await waitFor(s.page, () => true, 'a tick');
+      await waitFor(s.page, () => window.__forms !== undefined, 'page');
+      await new Promise(r => setTimeout(r, 300));
+      const posts = callsTo(s, 'POST', '/api/export');
+      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false }, { collection: A, include_models: true }]);
+    } },
+    (() => {
+      let phase = 'running';
+      return { name: 'A running export shows its chunk count with the button busy, then the file, size and options when done, plus warnings', open: xfer({
+        'POST /api/export': json(202, { job_id: 'vfyexp', status: 'queued', collection: A }),
+        'GET /api/export/job/vfyexp': () => (phase === 'running' ? exportJob('running', { chunks_written: 5 })
+          : exportJob('completed', { chunks_written: 9, filename: 'ragpkg-vfy.tar.gz', size_bytes: 2500000, fidelity: 'with-sources', models_bundled: true, retrieve_script: true, warnings: ['Synthetic export warning.'] })) }), async run(s) {
+        await waitSelected(s.page, 0);
+        await press(s.page, 'Export');
+        await waitText(s.page, `Writing${ELLIPSIS} 5 chunks so far.`);
+        assert.equal((await buttonState(s.page, `Exporting${ELLIPSIS}`)).disabled, true);
+        phase = 'done';
+        await waitText(s.page, 'Done.');
+        await waitText(s.page, 'ragpkg-vfy.tar.gz');
+        assert.equal(await bodyHas(s.page, '(2.5 MB, with-sources, models included, with retrieve.py)'), true);
+        assert.equal(await bodyHas(s.page, 'Synthetic export warning.'), true);
+        assert.equal((await buttonState(s.page, 'Export')).disabled, false);
+      } };
+    })(),
+  ];
+}
+
+function packageCases() {
+  const xfer = (routes = {}) => ({ role: 'developer', path: '/transfer', fastPolls: true, routes: common(routes) });
+  const withPkgs = (routes = {}) => xfer({ 'GET /api/packages': json(200, { packages: PACKAGES }), ...routes });
+  const pick = (page, name) => fillNth(page, 'select', 1, name);
+  const start = async (page, name = PKG_OK) => { await waitFor(page, n => [...document.querySelectorAll('select')[1].options].length > 1, 'the packages'); await pick(page, name); await press(page, 'Import'); };
+  return [
+    { name: 'A readable package shows its collection, chunks, fidelity and size; an unreadable one says so', open: withPkgs(), async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      assert.deepEqual(await optionTexts(s.page, 1), ['Select a package' + ELLIPSIS, `${PKG_OK} ${DASH} ${A}, 3 chunks, with-sources, 2 KB`, `${PKG_BAD} ${DASH} unreadable`]);
+      assert.equal(await bodyHas(s.page, 'Nothing in ./exports yet'), false);
+    } },
+    (() => {
+      let lists = 0;
+      return { name: 'With no packages the empty hint shows, and Refresh asks again and lists what appeared', open: xfer({ 'GET /api/packages': () => json(200, { packages: ++lists === 1 ? [] : PACKAGES }) }), async run(s) {
+        await waitText(s.page, 'Nothing in ./exports yet. Copy a package there and press Refresh.');
+        await press(s.page, 'Refresh');
+        await waitText(s.page, 'Nothing in ./exports yet', true);
+        assert.equal(callsTo(s, 'GET', '/api/packages').length, 2);
+        assert.equal((await optionTexts(s.page, 1)).length, 3);
+      } };
+    })(),
+    { name: 'Import is disabled until a package is chosen; Abort is the default conflict choice and the chosen one is sent', open: withPkgs({
+        'POST /api/import': json(202, { job_id: 'vfyimp', status: 'queued', filename: PKG_OK }),
+        'GET /api/import/job/vfyimp': importJob('completed', { collection: A + '_2', original_collection: A, renamed: true, chunks_written: 3, fidelity: 'with-sources', notes: ['Synthetic import note.'] }) }), async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      assert.equal((await buttonState(s.page, 'Import')).disabled, true);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[name=conflict]:checked').value), 'abort');
+      await pick(s.page, PKG_OK);
+      assert.equal((await buttonState(s.page, 'Import')).disabled, false);
+      await s.page.click('input[name=conflict][value=rename]');
+      await press(s.page, 'Import');
+      await waitText(s.page, `Imported as ${A}_2 (renamed from ${A}) ${DASH} 3 chunks, with-sources`);
+      assert.equal(await bodyHas(s.page, 'Synthetic import note.'), true);
+      const posts = callsTo(s, 'POST', '/api/import');
+      assert.deepEqual(posts.map(c => c.body), [{ filename: PKG_OK, on_conflict: 'rename' }]);
+    } },
+    { name: 'A failed import shows Failed, its error code and message, and Import is enabled again', open: withPkgs({
+        'POST /api/import': json(202, { job_id: 'vfyimp', status: 'queued', filename: PKG_OK }),
+        'GET /api/import/job/vfyimp': importJob('failed', { error_code: 'PACKAGE_CORRUPT', error: 'Synthetic package failure.' }) }), async run(s) {
+      await start(s.page);
+      await waitText(s.page, 'Failed.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('p.text-red-600 code')?.textContent.trim()), 'PACKAGE_CORRUPT');
+      assert.equal(await bodyHas(s.page, 'Synthetic package failure.'), true);
+      assert.equal((await buttonState(s.page, 'Import')).disabled, false);
+    } },
+    { name: 'An import the API refuses to start shows its message and leaves Import enabled', open: withPkgs({ 'POST /api/import': apiError(409, 'COLLECTION_EXISTS', 'Synthetic import refusal.') }), async run(s) {
+      await start(s.page);
+      await waitText(s.page, 'Synthetic import refusal.');
+      assert.equal((await buttonState(s.page, 'Import')).disabled, false);
+      assert.equal(callsTo(s, 'GET', '/api/import/job/vfyimp').length, 0);
+    } },
+  ];
+}
+
+function helpCases() {
+  return [
+    { name: 'A failed help request shows the reason and a hint, with no Loading text left behind', open: { role: 'developer', path: '/help/transfer', routes: common({ 'GET /api/help/transfer': apiError(500, 'INTERNAL_ERROR', 'Synthetic help failure.') }) }, async run(s) {
+      await waitText(s.page, 'Could not load the help content (Synthetic help failure.). The API may be starting up.');
+      assert.equal(await bodyHas(s.page, `Loading${ELLIPSIS}`), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('article').length), 0);
+    } },
+    { name: 'A proxy error page on the help request is shown as its readable message', open: { role: 'developer', path: '/help/transfer', routes: common({ 'GET /api/help/transfer': html(502, 'Bad Gateway') }) }, async run(s) {
+      await waitText(s.page, 'Could not load the help content (The API is not responding. It may still be starting; try again in a minute.). The API may be starting up.');
+    } },
+    { name: 'The help page and the Transfer page link to each other', open: { role: 'developer', path: '/help/transfer', routes: common() }, async run(s) {
+      await waitText(s.page, 'Some text.');
+      await press(s.page, `Go to Transfer ${ARROW}`, 'a');
+      await waitPath(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await press(s.page, `How export and import work ${ARROW}`, 'a');
+      await waitPath(s.page, '/help/transfer');
+      await waitText(s.page, 'Some text.');
+    } },
+  ];
+}
+
+// -- Health: latency stat row, charts and empty state ------------------------
+const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' } } } });
+const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection: A, retrieval_mode: 'hnsw', retrieval_ms: r, llm_ms: l, total_ms: r + l });
+const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
+
+function healthCases() {
+  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
+  return [
+    { name: 'Health shows the latency trend heading, a P50/P95/P99 row per stage in whole ms, and a chart with its three series', open: open(metrics([record(1, 10, 100), record(2, 12, 110), record(3, 14, 120)])), async run(s) {
+      await waitText(s.page, 'Latency Trends (3 queries in ring buffer)');
+      const boxes = await s.page.evaluate(() => [...document.querySelectorAll('.border.rounded.p-3')].map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+      assert.deepEqual(boxes, [`RETRIEVAL P50: 10ms ${DOT} P95: 21ms ${DOT} P99: 30ms`, `LLM P50: 100ms ${DOT} P95: 201ms ${DOT} P99: 300ms`, `TOTAL P50: 111ms ${DOT} P95: 221ms ${DOT} P99: 332ms`]);
+      await waitFor(s.page, () => document.querySelectorAll('.recharts-line').length === 3, 'three chart lines');
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('.recharts-legend-item-text')].map(t => t.textContent.trim()).sort()), ['LLM', 'Retrieval', 'Total']);
+      assert.equal(await bodyHas(s.page, 'No query data yet'), false);
+    } },
+    { name: 'Health with no queries recorded shows the empty message and no chart', open: open(metrics([], { total_records: 0 })), async run(s) {
+      await waitText(s.page, 'No query data yet. Run some Q&A queries to populate charts.');
+      assert.equal(await bodyHas(s.page, 'Latency Trends'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('.recharts-wrapper').length), 0);
+      assert.equal(await bodyHas(s.page, 'RETRIEVAL'), false);
+    } },
+  ];
+}
+
+async function runUiPageTests(browser, base, reporter) {
+  const run = (section, cases) => S.runCases(browser, base, reporter, section, cases);
+  await run('Gold Standard generate and review actions (#400)', goldCases());
+  await run('Transfer export controls (#400)', transferCases());
+  await run('Transfer package list and import (#400)', packageCases());
+  await run('Help page error state and cross-links (#400)', helpCases());
+  await run('Health latency stat row, chart and empty state (#400)', healthCases());
+}
+
+module.exports = { runUiPageTests };
+if (require.main === module) (async () => {
+  const { makeReporter } = require('./lib');
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runUiPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
   finally { await browser.close(); }
   process.exitCode = reporter.summary() ? 0 : 1;
 })().catch(e => { console.error(e); process.exitCode = 2; });

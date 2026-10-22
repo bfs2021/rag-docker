@@ -111,7 +111,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -515,12 +515,15 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
+| `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
-| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
@@ -545,7 +548,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -572,7 +575,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -688,6 +691,20 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Health page refresh checks
+
+`browser/health_page.js` (#415), registered in `06_ui.sh` through `ui_criteria.js`,
+stubs every API call the Health page makes and holds each health and metrics answer
+until the check releases it, driving each refresh through the captured 30 s timer. Ten
+cases cover a failed metrics call (an API error, and no answer) keeping the charts last
+shown; a 200 without a health body (JSON of another shape, an empty body, text) and a 503
+carrying the API's error envelope, each shown as "Service health could not be read:" with
+no cards; and late responses from an older refresh, which never replace a newer health
+result (success or failure) or newer charts, while a late metrics result after a newer
+failed one is still shown. Every case also fails on a React page error. These fixtures
+make no backend calls; like the other modules, the file runs standalone with
+`RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
@@ -704,6 +721,38 @@ on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
 node scripts/verify/browser/transfer_page.js
+```
+
+## UI control browser checks
+
+`browser/ui_controls.js` and `browser/ui_pages.js`, registered in `06_ui.sh` through
+`ui_criteria.js` (#400), check the page controls that had no browser check. They share
+`browser/stub.js`, which opens the built UI in a fresh browser context and answers every
+`/api/` request itself; a request a case did not stub is answered 599 and fails the case, so
+nothing reaches the backend or a model. 67 cases:
+
+- `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
+  modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
+  queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
+  form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
+  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
+  the latency and error lines and the End User view with `response_format`; the Retrieval page's
+  saved and default texts, alpha slider and Save while loading; and the client's handling of
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+- `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
+  (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
+  export controls (collection selector, fidelity line, include-models payload, progress and
+  result), the package list, the empty hint, Refresh, conflict choice and import failure display;
+  the Help page error state and its links to and from Transfer; and the Health latency stat row,
+  chart and empty state.
+
+The Transfer polling and `/tune` failure labels stay with `transfer_page.js` (#382). Like
+`query_config.js`, each module can run on its own against a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_controls.js
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_pages.js
 ```
 
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
@@ -731,8 +780,10 @@ Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends 
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
-`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
-names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+`error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
+together (all three `error`), each with its latency, model names and `resources`; and 200
+`ok` when everything is up, also with memory below the recommendation or unreadable
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
 stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
@@ -751,6 +802,39 @@ JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logge
 checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
 the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
 
+Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
+runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
+temporary folder: an upload with no supported file answers 400 `NO_SUPPORTED_FILES` with the
+exact message listing a direct file and a ZIP member it skipped, and leaves no job, staging
+folder or registration; an unknown ingest job answers 404 `JOB_NOT_FOUND`; a `/query` body
+with only `question` and `collection` reaches the pipeline with the defaults (`hnsw`, `top_k`
+5, `alpha` 0.75, no citations, `end_user`), and through the real pipeline runs a top-5 vector
+search with the end-user prompt; the reformulation, end-user and engineer prompts and their
+`[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
+successful query records one metric; a saved retrieval config missing newer keys is filled
+from the defaults, and one that isn't JSON or can't be read gives the defaults with
+`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
+instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+checked for its statistics against hand-worked percentiles, its exact-match `collection` and
+`retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
+Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
+`/proc/meminfo` reports memory `unknown` with a note while `/health` stays 200. On the host,
+`scripts/tests/test_ollama_entrypoint.py` runs `ollama/entrypoint.sh` with stub `ollama`,
+`timeout` and `sleep` commands: models already listed are not pulled, a missing one is pulled
+as `timeout 7200 ollama pull`, a failed or timed-out pull is retried after 15 s, and the fifth
+failure exits 1 with its error. Then, on the verify stack: the upload and job errors through
+the proxy; a new collection's schema has BM25 off for `source_file`, `source_type` and
+`chunk_strategy` and refuses an insert with an undeclared property; the running proxy's
+loaded configuration (`nginx -T`) reads `/api/` for 300 s and connects for 10 s; the metrics
+route's shape, `history_limit=0` and the 422. Unless `RAG_SKIP_SLOW=1`, a query with the
+defaults on a text of more than five chunks retrieves 5 chunks without citations and records
+one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
+and that metric read back unchanged after the API restarts, and then a first start: `down -v`
+(the model copy is external and kept) and `up -d --wait` must bring every service healthy
+within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
+SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
+internet. It removes the verify project's data, so it runs last in suite 01.
+
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
 It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
@@ -768,8 +852,9 @@ Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
 `scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
 the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
 `1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
-first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
-`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+first; a missing distance, a missing hybrid score and a config with no metric or an unknown
+one give `null` (a distance of 0 is a real value); the metric is read again on every query; a
+failed metric read answers 503 `SERVICE_UNAVAILABLE` in each distance mode; the pipeline
 rounds numbers and passes `null` through, and `/query` returns it. It also checks the
 `IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
 project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
