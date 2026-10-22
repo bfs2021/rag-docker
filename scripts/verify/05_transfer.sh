@@ -1152,14 +1152,16 @@ check_eq "#372: an upload to '$SL' answers the stored name" \
   "$(jfield "['collection']" < /tmp/vfy_sp_up.json)" "$SC"
 check_eq "#372: the upload completes" \
   "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_sp_up.json)" 900)" "completed"
-api_get "/tune/$SL" > /tmp/vfy_sp_tune.json
-check_eq "#372: the originals are found under the stored name (re-chunk offered)" \
+# Read back under the stored name: an upload under the typed spelling used to
+# file its originals where the stored name never looked.
+api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
+check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
   "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
-api_post "/export" "{\"collection\":\"$SL\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
 spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
-check_eq "#372: the export of '$SL' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
+check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
 api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
-check_eq "#372: the export carries its retained originals" \
+check_eq "#372: the export of '$SC' carries the originals uploaded as '$SL'" \
   "$(jfield "['fidelity']" < /tmp/vfy_sp_expjob.json)" "with-sources"
 sppkg=$(jfield "['filename']" < /tmp/vfy_sp_expjob.json)
 api_post "/tune/rechunk" "{\"collection\":\"$SL\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_sp_tj.json

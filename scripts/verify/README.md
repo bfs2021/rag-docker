@@ -696,9 +696,10 @@ and the job workers mocked, it sends each route that takes a collection name a l
 spelling (`myDocs`) and checks that the registry, the 201 and 202 answers, the ingest and
 retrieval settings files, the query metric and the metrics filter, retained originals found by
 `GET /tune`, and the export, tune, ingest and generation workers all get the stored name
-(`MyDocs`). It fails on the code before #372. Suite 05 then creates, ingests, exports and
-re-chunks a lowercase-first name on the verify stack and, unless `RAG_SKIP_SLOW=1`, checks a
-query's metrics under both spellings.
+(`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
+ingests under a lowercase-first name, reads the tuning options and exports under the stored
+name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
+metrics under both spellings.
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
