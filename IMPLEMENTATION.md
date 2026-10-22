@@ -9833,6 +9833,11 @@ def _metrics_path() -> Path:
     return _METRICS_FILE
 
 
+def _metrics_file_name() -> Path:
+    """The metrics file's path for log messages, known even when creating its folder failed."""
+    return _METRICS_FILE or Path(settings.upload_dir) / "metrics.jsonl"
+
+
 def _read_tail(path: Path) -> tuple[list[str], bool]:
     """The last MAX_RECORDS valid lines of `path`, read from at most its last
     _TAIL_BYTES, and whether they are all the file holds."""
@@ -9894,7 +9899,7 @@ def load_from_disk() -> None:
                 return
             lines, whole = _read_tail(p)
         except Exception:                                 # noqa: BLE001
-            _log.exception("Could not load the query metrics from %s", _METRICS_FILE)
+            _log.exception("Could not load the query metrics from %s", _metrics_file_name())
             return
         for line in lines:
             _ring.append(json.loads(line))
@@ -9949,7 +9954,8 @@ async def record(
         await asyncio.to_thread(_append_sync, json.dumps(entry))
     except Exception:                                     # noqa: BLE001
         _log.warning("Could not write the query metrics record for %r to %s; "
-                     "the answer is still returned", collection, _METRICS_FILE, exc_info=True)
+                     "the answer is still returned", collection, _metrics_file_name(),
+                     exc_info=True)
 
 
 def _percentile(data: list[float], p: int) -> float:
@@ -13436,7 +13442,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `03_query.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -13869,7 +13875,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -14030,14 +14036,20 @@ Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
 It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
 app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
-record can't be written (an unusable file, a full volume), with the failure logged; that a
-line left unfinished by a failed write doesn't cost the next record; that `metrics.jsonl`
-never holds more than 1,000 lines and keeps the newest records; that a compaction whose
-temporary write or replace fails leaves the old file whole and no temporary file, and is
-tried again; that 1,100 concurrent records all land; and that a restart restores the last 500
-records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
-files a crash left, and starts when the file can't be read or compacted. It also checks the
-`IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+record can't be written (an unusable file, a full volume, an `UPLOAD_DIR` that can't be
+created), with the failure logged naming the metrics file and the record still counted by
+`GET /metrics/latency`; that a line left unfinished by a failed write doesn't cost the next
+record; that an append bringing `metrics.jsonl` to 1,000 lines compacts it and the newest
+records are kept; that a compaction whose temporary write or replace fails leaves the old file
+whole and no temporary file, and is tried again; that 1,100 concurrent records all land; and
+that a restart restores the last 500 records, loads a file within the bound without rewriting
+it, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, loads nothing from a
+last 1 MiB with no line break, removes temporary files a crash left, and starts when the file
+can't be read or compacted or `UPLOAD_DIR` can't be created. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`. With `RAG_ALLOW_RESTART=1`, suite 03
+also restarts the API after its LLM queries and checks that `GET /metrics/latency` reports
+the same records afterwards (#374); a `RAG_SKIP_SLOW=1` run has no queries to reload and
+doesn't reach it.
 
 Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
 `scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
@@ -17010,6 +17022,30 @@ done
 [ "$eu_total" -lt "$en_total" ]
 check "end_user answers are shorter than engineer on average" $? \
   "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
+
+# ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
+# The queries above wrote metrics records; a restart goes through the
+# lifespan's load_from_disk, so GET /metrics/latency must report the same records.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "query metrics reload after an API restart (#374)" 1 "$restart_refusal"
+  else
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_before.json
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_after.json
+    python3 -c "
+import json,sys
+b=json.load(open('/tmp/vfy_metrics_before.json')); a=json.load(open('/tmp/vfy_metrics_after.json'))
+sys.exit(0 if b['total_records'] > 0 and a['history'] == b['history'] else 1)"
+    check "query metrics reload after an API restart (#374)" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "query metrics reload after an API restart (#374)" "set RAG_ALLOW_RESTART=1 to include it"
+fi
 
 drop_collection "$C"
 cleanup_prefixed

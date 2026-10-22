@@ -95,6 +95,16 @@ class MetricsTestCase(unittest.TestCase):
     def leftovers(self):
         return sorted(p.name for p in self.dir.iterdir() if p.name != "metrics.jsonl")
 
+    def unmakeable_upload_dir(self):
+        """Point UPLOAD_DIR below a regular file, so creating it fails; the metrics
+        file's path there."""
+        blocker = self.dir / "blocker"
+        blocker.write_text("")
+        upload_dir = patch.object(settings, "upload_dir", str(blocker / "uploads"))
+        upload_dir.start()
+        self.addCleanup(upload_dir.stop)
+        return blocker / "uploads" / "metrics.jsonl"
+
 
 class FailedWriteTests(MetricsTestCase):
     """S1: the query keeps its answer when its metrics record can't be written."""
@@ -102,20 +112,44 @@ class FailedWriteTests(MetricsTestCase):
     def ask(self):
         client = TestClient(app, raise_server_exceptions=False)
         self.addCleanup(client.close)
+        # Capture the log without assertLogs, so that on code that doesn't log the
+        # failure the status assertion below still runs and shows the 500.
+        class Capture(logging.Handler):
+            def __init__(self):
+                super().__init__(logging.WARNING)
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(record)
+        logs = Capture()
+        logger = logging.getLogger("services.metrics")
+        logger.addHandler(logs)
+        self.addCleanup(logger.removeHandler, logs)
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.WARNING)
+        self.addCleanup(setattr, logger, "propagate", logger.propagate)
+        logger.propagate = False        # as assertLogs does: keep the traceback off stderr
         with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
-                patch.object(rag_pipeline, "run_query", AsyncMock(return_value=dict(ANSWER))), \
-                self.assertLogs("services.metrics", "WARNING") as logs:
+                patch.object(rag_pipeline, "run_query", AsyncMock(return_value=dict(ANSWER))):
             response = client.post("/query", json=QUESTION)
         return response, logged(logs)
 
     def assert_answered(self, response, log):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), ANSWER)
+        self.assertTrue(log, "the failed write is logged")
         self.assertIn("metrics.jsonl", log)
         self.assertNotIn(QUESTION["question"], log)
         self.assertNotIn(ANSWER["answer"], log)
         # The record still counts in the ring and in GET /metrics/latency.
         self.assertEqual(len(metrics._ring), 1)
+        client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(client.close)
+        latency = client.get("/metrics/latency", params={"collection": QUESTION["collection"]})
+        self.assertEqual(latency.status_code, 200, latency.text)
+        self.assertEqual(latency.json()["total_records"], 1)
+        self.assertEqual(latency.json()["history"][0]["retrieval_ms"],
+                         ANSWER["retrieval_latency_ms"])
 
     def test_an_unusable_metrics_file_still_returns_the_answer(self):
         self.path.mkdir()           # opening it to append raises IsADirectoryError
@@ -130,6 +164,13 @@ class FailedWriteTests(MetricsTestCase):
             response, log = self.ask()
         self.assert_answered(response, log)
         self.assertIn("No space left on device", log)
+
+    def test_an_upload_folder_that_cannot_be_made_still_returns_the_answer(self):
+        path = self.unmakeable_upload_dir()
+        response, log = self.ask()
+        self.assert_answered(response, log)
+        # The log names the file it couldn't write, not "None".
+        self.assertIn(f"to {path};", log)
 
 
 class TornLineTests(MetricsTestCase):
@@ -247,11 +288,43 @@ class RestartTests(MetricsTestCase):
         self.assertEqual(self.ring_numbers(), [1])
         self.assertEqual(self.leftovers(), [".other.json.abc123.tmp"])
 
+    def test_a_whole_file_is_not_rewritten_at_startup(self):
+        # A file within the bound is loaded as it is, not compacted.
+        self.path.write_text("".join(json.dumps(entry(n)) + "\n" for n in range(300)))
+        before = os.stat(self.path)
+        metrics.load_from_disk()
+        after = os.stat(self.path)
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+        self.assertEqual(self.ring_numbers(), list(range(300)))
+        # The line count carries over: the 700th further append compacts the file.
+        record_all(range(300, 999))
+        self.assertEqual(len(self.lines()), 999)
+        record_all([999])
+        self.assertEqual(self.file_numbers(), list(range(500, 1000)))
+
+    def test_a_tail_without_a_line_break_loads_nothing_and_startup_goes_on(self):
+        # The last 1 MiB is one unfinished line; nothing in it is a record.
+        self.path.write_text(json.dumps(entry(1)) + "\n" + "x" * (2 * 1024 * 1024))
+        metrics.load_from_disk()
+        self.assertEqual(len(metrics._ring), 0)
+        self.assertEqual(self.path.read_bytes(), b"")
+        self.assertEqual(self.leftovers(), [])
+        record_all([2])
+        self.assertEqual(self.file_numbers(), [2])
+
     def test_an_unreadable_file_is_logged_and_startup_goes_on(self):
         self.path.mkdir()
         with self.assertLogs("services.metrics", "ERROR") as logs:
             metrics.load_from_disk()
         self.assertIn("metrics.jsonl", logged(logs))
+        self.assertEqual(len(metrics._ring), 0)
+
+    def test_an_upload_folder_that_cannot_be_made_is_logged_and_startup_goes_on(self):
+        path = self.unmakeable_upload_dir()
+        with self.assertLogs("services.metrics", "ERROR") as logs:
+            metrics.load_from_disk()
+        # The log names the file it couldn't load, not "None".
+        self.assertIn(f"Could not load the query metrics from {path}\n", logged(logs))
         self.assertEqual(len(metrics._ring), 0)
 
     def test_a_failed_startup_compaction_is_logged_and_startup_goes_on(self):
