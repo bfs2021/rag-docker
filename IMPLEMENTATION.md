@@ -8972,6 +8972,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9002,20 +9004,51 @@ def _registry_path() -> Path:
     return _REGISTRY_FILE
 
 
+class _RegistryUnreadable(Exception):
+    """The registry file exists but can't be read as a JSON object (#388)."""
+
+
 def _load_registry() -> dict:
+    """The registry, or {} when the file doesn't exist yet. A file that exists but
+    can't be read, isn't JSON or isn't an object raises _RegistryUnreadable, so it
+    is never taken for an empty registry and overwritten by the next save (#388)."""
     p = _registry_path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return {}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RegistryUnreadable(f"{p} can't be read: {exc}") from exc
+    try:
+        reg = json.loads(text)
+    except ValueError as exc:
+        raise _RegistryUnreadable(f"{p} isn't valid JSON: {exc}") from exc
+    if not isinstance(reg, dict):
+        raise _RegistryUnreadable(f"{p} isn't a JSON object")
+    return reg
 
 
 def _save_registry(reg: dict) -> None:
+    """Publish the whole registry atomically (#388): a uniquely named temporary file
+    in the same folder, fsynced, then os.replace. A failure at any step leaves the
+    old file whole and no temporary file, and raises. Callers hold _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(reg, indent=2))
+    payload = json.dumps(reg, indent=2)
+    # mkstemp creates the file 0600, like the job and session files.
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 @router.get("", response_model=CollectionsResponse)
@@ -9028,7 +9061,13 @@ async def list_collections():
         return api_error(503, "SERVICE_UNAVAILABLE",
                          "Cannot list the collections: Weaviate could not be read. "
                          "Try again when Weaviate is available.")
-    registry = await asyncio.to_thread(_load_registry)
+    try:
+        registry = await asyncio.to_thread(_load_registry)
+    except _RegistryUnreadable as exc:
+        # Listed without created_at; the file is left for someone to fix (#388).
+        _log.warning("The collection registry can't be read, so created_at is null "
+                     "for every collection: %s", exc)
+        registry = {}
     items = [
         CollectionInfo(
             name=c["name"],
@@ -9067,9 +9106,16 @@ async def create_collection(body: CreateCollectionRequest):
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        registry[body.name] = datetime.now(timezone.utc).isoformat()
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten with this one entry (#388).
+            _log.exception("Collection %r was created, but its created_at was not recorded: "
+                           "the collection registry can't be read and is left unchanged",
+                           body.name)
+        else:
+            registry[body.name] = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(_save_registry, registry)
 
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
@@ -9123,10 +9169,17 @@ async def delete_collection(name: str, confirm: str | None = None):
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        for spelling in aliases(name):
-            registry.pop(spelling, None)
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten without its other entries (#388).
+            _log.exception("Collection %r was deleted, but its created_at was not removed: "
+                           "the collection registry can't be read and is left unchanged",
+                           name)
+        else:
+            for spelling in aliases(name):
+                registry.pop(spelling, None)
+            await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
 ```
@@ -13820,6 +13873,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -14025,6 +14079,18 @@ service red and the others green, that a proxy 502, a refused connection and a 5
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
 refresh whatever health answers.
+
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -15653,6 +15719,9 @@ check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
