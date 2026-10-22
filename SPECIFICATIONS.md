@@ -2076,9 +2076,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Roles:** Engineer only
 
 - Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
-- When health can't be read (no answer from the API, a proxy error page, or any other error without a health body), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
+- When health can't be read (no answer from the API, a proxy error page, any other error without a health body, or a 200 without a health body (#415)), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
 - Latency trend charts (from the `history` field of `GET /metrics/latency`, bounded by `history_limit`, default 100): line chart of `total_ms` over time alongside `retrieval_ms` and `llm_ms`. Summary stat row shows P50/P95/P99 for each component from the `retrieval_latency`, `llm_latency` and `total_latency` objects.
 - Health and latency metrics load separately: a degraded or failed health call doesn't stop the charts from loading. A failed metrics call keeps the charts last shown.
+- A slow response from an older refresh never replaces a newer one's: a health result (cards or message) is shown only if no later refresh's health result is already shown, and the same for latency metrics (#415). A failed metrics call changes nothing, so a late metrics result from an older refresh is still shown when no later one has been.
 - Auto-refreshes every 30 seconds.
 
 ---
@@ -2691,7 +2692,14 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health` with a
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
-      for a missing model and an unreachable Ollama or Weaviate.*
+      for a missing model and an unreachable Ollama or Weaviate.
+      `scripts/verify/browser/health_page.js` (suite 06, #415) holds each stubbed answer and
+      checks that a failed metrics call keeps the charts, that a 200 without a health body (JSON
+      of another shape, empty or not JSON) and a 503 error envelope show a message, not cards,
+      and that a late response from an older refresh never replaces a newer health result or
+      newer charts; its JSON-200, empty-200 and three late-response checks fail on the code before
+      #415. `test_health.py` also checks Weaviate and Ollama down together, and that memory below
+      the recommendation or unreadable leaves `/health` at 200 `ok`.*
 - [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, and shows a failed package list (#382).
       *Evidence: `scripts/verify/browser/transfer_page.js` (suite 06, through `ui_criteria.js`)
       stubs every API call in the browser: proxy 502s while polling either half, a poll in
