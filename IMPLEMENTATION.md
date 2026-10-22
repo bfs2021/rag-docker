@@ -4206,6 +4206,17 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
+def _is_macos_metadata(logical: str) -> bool:
+    """Whether a ZIP member is macOS metadata rather than a document (#378).
+
+    Finder's Compress stores each file's resource fork and extended attributes
+    as an AppleDouble file, __MACOSX/<folder>/._<name>, and other macOS tools
+    write ._<name> beside the file. Either keeps the real file's suffix, so the
+    suffix check would queue it as a document of its own."""
+    path = PurePosixPath(logical)
+    return path.parts[0] == "__MACOSX" or path.name.startswith("._")
+
+
 def _limit_text(limit: int) -> str:
     mib = 1024 * 1024
     if limit >= mib and limit % mib == 0:
@@ -4232,7 +4243,8 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
-    them; nothing is repaired, and nothing from it is ingested (#290).
+    them; nothing is repaired, and nothing from it is ingested (#290). macOS
+    metadata members (__MACOSX/, ._*) are skipped like unsupported ones (#378).
 
     The request's ZIPs may expand to at most the budget (#298): the sizes this
     ZIP declares are checked before anything is read, then the bytes actually
@@ -4298,6 +4310,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
         for member, logical in members:
             basename = PurePosixPath(logical).name
+            if _is_macos_metadata(logical):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} (macOS metadata (AppleDouble), not a document)")
+                continue
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
                     or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
@@ -4506,11 +4522,17 @@ SYNTHESIS_ENGINEER_SYSTEM = (
 
 
 class ServiceUnavailable(Exception):
-    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+    """Ollama or Weaviate failed during a query; `service` names which (#373).
 
-    def __init__(self, service: str):
+    `embedder` names the service that embeds the question for `service`, when it
+    does so itself: in hybrid and semantic modes Weaviate embeds through Ollama,
+    so an Ollama failure there comes back as a Weaviate error (#411).
+    """
+
+    def __init__(self, service: str, embedder: str | None = None):
         super().__init__(f"{service} failed during the query")
         self.service = service
+        self.embedder = embedder
 
 
 async def _from_ollama(call):
@@ -4521,12 +4543,12 @@ async def _from_ollama(call):
         raise ServiceUnavailable("Ollama") from exc
 
 
-async def _from_weaviate(call):
+async def _from_weaviate(call, embedder: str | None = None):
     """Await a Weaviate query; any error from it is ServiceUnavailable."""
     try:
         return await call
     except Exception as exc:                          # noqa: BLE001
-        raise ServiceUnavailable("Weaviate") from exc
+        raise ServiceUnavailable("Weaviate", embedder) from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -4566,9 +4588,11 @@ async def run_query(
         vector = await _from_ollama(ollama.embed(reformulated))
         chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
     elif retrieval_mode == "hybrid":
-        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
+        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k),
+                                      embedder="Ollama")
     elif retrieval_mode == "semantic":
-        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
+        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k),
+                                      embedder="Ollama")
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
@@ -6191,7 +6215,7 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
             wanted = [settings.embed_model, settings.llm_model]
             if not model_bundle.store_available():
@@ -6206,7 +6230,8 @@ def build(
                     except (OSError, ValueError) as exc:
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model.split(":")[0])
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -6252,9 +6277,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -6268,18 +6293,6 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -6303,7 +6316,6 @@ def build(
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
@@ -7369,20 +7381,23 @@ def _check_embedding(manifest: dict) -> None:
 
     if pkg_model != our_model:
         fidelity = manifest.get("fidelity")
-        remedy = ("This package is `with-sources`, so it can be re-embedded after "
-                  "import once that is supported."
+        # Nothing re-embeds a refused package, whatever its fidelity (#390).
+        remedy = (f"Use an instance running '{pkg_model}', or re-export from one."
                   if fidelity == "with-sources" else
                   "This package is `chunks-only`, so it cannot be re-embedded from "
                   "the original documents. Use an instance running "
                   f"'{pkg_model}', or re-export from one.")
+        actual = _probe_dimensions()
+        ours = (f"{actual} dimensions" if actual is not None else
+                "whose dimension count couldn't be read from Ollama")
         raise PackageError(
             "EMBEDDING_MISMATCH",
             f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
-            f"but this instance uses '{our_model}'. Vectors from a different model "
-            f"are meaningless here, not merely different, so the import is refused. "
-            + remedy,
+            f"but this instance uses '{our_model}' ({ours}). Vectors from a different "
+            f"model are meaningless here, not merely different, so the import is "
+            f"refused. " + remedy,
             {"package_model": pkg_model, "package_dimensions": pkg_dims,
-             "instance_model": our_model})
+             "instance_model": our_model, "instance_dimensions": actual})
 
     # Same model name but a different width means one side is not what it claims.
     if pkg_dims is not None:
@@ -7520,7 +7535,16 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Could not install bundled model '{name}': {exc}",
                 {"model": name}) from exc
-        if not model_bundle.is_installed(model):
+        # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
+        reported = _ollama_reports(model)
+        if reported is None:
+            raise PackageError(
+                "IMPORT_FAILED",
+                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"confirm it is there. Check that the ollama service is running, "
+                f"then import again.",
+                {"model": name})
+        if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
@@ -8380,6 +8404,18 @@ def _nothing_to_rebuild(collection: str) -> PackageError:
         {"collection": collection})
 
 
+# An invalid retained source index (sources.load_index raises ValueError) is
+# refused before a job is created too, as the tuning options already report it
+# (#389). Re-embedding from stored chunks and re-indexing never read it.
+def _source_index_invalid(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCE_INDEX_INVALID",
+        f"Cannot re-chunk '{collection}': its retained source index is invalid. "
+        "Repair it before re-chunking; re-embedding from stored chunks and "
+        "re-indexing remain available.",
+        {"collection": collection})
+
+
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
@@ -8390,16 +8426,17 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
 
 
 def _refuse_nothing_to_rebuild(collection: str) -> None:
-    """The one re-chunk refusal made before a job is created (#328).
+    """The re-chunk refusals made before a job is created: an invalid
+    retained source index (#389) and nothing to rebuild (#328).
 
-    The other refusals, and an invalid index, are still reported by the job.
-    A Weaviate failure during the walk raises ServiceUnavailableError, which
-    the router answers with 503 rather than a bare 500 (#340).
+    The other refusals are still reported by the job. A Weaviate failure
+    during the walk raises ServiceUnavailableError, which the router answers
+    with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
-    except ValueError:
-        return
+    except ValueError as exc:
+        raise _source_index_invalid(collection) from exc
     if not documents:
         return
     try:
@@ -8757,8 +8794,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guards; the store removes the record.
     try:
-        # A re-chunk with nothing to rebuild is refused here, before any job
-        # exists (#328); the walk runs off the event loop too.
+        # A re-chunk with an invalid source index (#389) or nothing to rebuild
+        # (#328) is refused here, before any job exists; the walk runs off the
+        # event loop too.
         if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
             await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
         await _jobs.create(job_id, {
@@ -8972,6 +9010,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -9002,20 +9042,51 @@ def _registry_path() -> Path:
     return _REGISTRY_FILE
 
 
+class _RegistryUnreadable(Exception):
+    """The registry file exists but can't be read as a JSON object (#388)."""
+
+
 def _load_registry() -> dict:
+    """The registry, or {} when the file doesn't exist yet. A file that exists but
+    can't be read, isn't JSON or isn't an object raises _RegistryUnreadable, so it
+    is never taken for an empty registry and overwritten by the next save (#388)."""
     p = _registry_path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return {}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RegistryUnreadable(f"{p} can't be read: {exc}") from exc
+    try:
+        reg = json.loads(text)
+    except ValueError as exc:
+        raise _RegistryUnreadable(f"{p} isn't valid JSON: {exc}") from exc
+    if not isinstance(reg, dict):
+        raise _RegistryUnreadable(f"{p} isn't a JSON object")
+    return reg
 
 
 def _save_registry(reg: dict) -> None:
+    """Publish the whole registry atomically (#388): a uniquely named temporary file
+    in the same folder, fsynced, then os.replace. A failure at any step leaves the
+    old file whole and no temporary file, and raises. Callers hold _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(reg, indent=2))
+    payload = json.dumps(reg, indent=2)
+    # mkstemp creates the file 0600, like the job and session files.
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 @router.get("", response_model=CollectionsResponse)
@@ -9028,7 +9099,13 @@ async def list_collections():
         return api_error(503, "SERVICE_UNAVAILABLE",
                          "Cannot list the collections: Weaviate could not be read. "
                          "Try again when Weaviate is available.")
-    registry = await asyncio.to_thread(_load_registry)
+    try:
+        registry = await asyncio.to_thread(_load_registry)
+    except _RegistryUnreadable as exc:
+        # Listed without created_at; the file is left for someone to fix (#388).
+        _log.warning("The collection registry can't be read, so created_at is null "
+                     "for every collection: %s", exc)
+        registry = {}
     items = [
         CollectionInfo(
             name=c["name"],
@@ -9067,9 +9144,16 @@ async def create_collection(body: CreateCollectionRequest):
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        registry[body.name] = datetime.now(timezone.utc).isoformat()
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten with this one entry (#388).
+            _log.exception("Collection %r was created, but its created_at was not recorded: "
+                           "the collection registry can't be read and is left unchanged",
+                           body.name)
+        else:
+            registry[body.name] = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(_save_registry, registry)
 
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
@@ -9123,10 +9207,17 @@ async def delete_collection(name: str, confirm: str | None = None):
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        for spelling in aliases(name):
-            registry.pop(spelling, None)
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten without its other entries (#388).
+            _log.exception("Collection %r was deleted, but its created_at was not removed: "
+                           "the collection registry can't be read and is left unchanged",
+                           name)
+        else:
+            for spelling in aliases(name):
+                registry.pop(spelling, None)
+            await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
 ```
@@ -9267,6 +9358,22 @@ router = APIRouter(prefix="/query")
 _log = logging.getLogger(__name__)
 
 
+def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
+    """The 503 for a dependency failure, naming the embedder too when there is one (#411)."""
+    service, embedder = exc.service, exc.embedder
+    if embedder is None:
+        _log.exception("Query on %r failed: %s did not answer", collection, service)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error. Try again when {service} is available.")
+    else:
+        _log.exception("Query on %r failed: %s (or %s, embedding the question for it) "
+                       "did not answer", collection, service, embedder)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error, or {embedder} could not embed the "
+                   f"question for it. Try again when {service} and {embedder} are available.")
+    return api_error(503, "SERVICE_UNAVAILABLE", message, detail={"collection": collection})
+
+
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
     try:
@@ -9290,12 +9397,7 @@ async def run_query(body: QueryRequest):
         )
     except rag_pipeline.ServiceUnavailable as exc:
         # The cause is logged, not sent (#373).
-        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
-        return api_error(503, "SERVICE_UNAVAILABLE",
-                         f"The question was not answered: {exc.service} could not be reached, "
-                         f"timed out or returned an error. Try again when {exc.service} "
-                         f"is available.",
-                         detail={"collection": body.collection})
+        return _unavailable(body.collection, exc)
 
     await metrics.record(
         collection=body.collection,
@@ -11732,6 +11834,9 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The status the upload was accepted with, shown with the job ID until the
+  // first poll answers, so the page responds at once rather than 3 s later (#394).
+  const [queuedStatus, setQueuedStatus] = useState('')
   const [error, setError] = useState('')
   // A failed status poll, shown instead of ignored (#290). Polling carries on,
   // and the next successful poll clears it.
@@ -11821,9 +11926,15 @@ export default function ImportPage() {
   }
 
   async function startIngest() {
-    if (!files.length || !collection) return
+    if (!files.length) return
     setError('')
     setPollError('')
+    // With no collection selected (none exist, or the list failed to load),
+    // say so instead of doing nothing (#394).
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -11844,6 +11955,7 @@ export default function ImportPage() {
     try {
       const res = await api.uploadFiles(form)
       setJobId(res.job_id)
+      setQueuedStatus(res.status)
       setJob(null)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -11923,6 +12035,13 @@ export default function ImportPage() {
         Start Ingest
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {jobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{jobId}</span></p>}
+      {jobId && !job && (
+        <div className="mt-4 p-4 border rounded bg-gray-50 flex justify-between text-sm">
+          <span>Waiting for the first progress update</span>
+          <span className="text-blue-600">{queuedStatus}</span>
+        </div>
+      )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
@@ -13467,7 +13586,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the four controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13511,6 +13630,15 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
+an import job of a digest-valid package embedded with another model is refused
+`EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
+and both dimension counts (or saying this instance's count couldn't be read), with
+no promise of re-embedding; a same-name package of another width is refused too.
+It also checks that a model installed from a package is confirmed through Ollama's
+model list: reported, not reported, and Ollama unreachable. Only Ollama is
+replaced. `05_transfer.sh` runs it in the verify project's API container.
+
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
 wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
@@ -13526,6 +13654,10 @@ in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
 (suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
 failing status poll, and that a new ingest and the next successful poll clear that error.
+Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
+queued panel show as soon as an upload is accepted, before the first poll, and stay through a
+failed poll; that the first answered poll replaces the panel while the job ID stays; and that
+"Start Ingest" with no collection selected says so and sends nothing.
 
 `scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
 upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
@@ -13683,7 +13815,11 @@ same-named inputs don't collide. Admission: a name twice in one request keeps th
 repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
 keep the last and list each earlier one in `skipped`; members in different folders stay
 separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
-names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling.
+macOS metadata in a ZIP (#378): a Finder-style ZIP queues its file and lists the
+`__MACOSX/` AppleDouble member in `skipped`, a `._*` file beside its file and any other
+`__MACOSX/` member are skipped the same way, names that only look like them are queued, and a
+ZIP of nothing else is refused with `NO_SUPPORTED_FILES`. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
 marking failure fails only that file and changes nothing; a failed lookup of the later files
@@ -13715,8 +13851,9 @@ the JSON 503 reaches the client (#369).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
-names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
-with one filename. With a real gold-standard session planted for the collection, it checks
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, a Finder-style
+ZIP (it completes with no errors, stores only its file and lists the AppleDouble member in
+`skipped`, #378), and two parts with one filename. With a real gold-standard session planted for the collection, it checks
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
@@ -13821,7 +13958,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -13840,7 +13979,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -13857,6 +13996,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
+| `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
 | `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 `10_validity.sh` is called by suite05 (and thus all.sh). It runs
@@ -14023,6 +14163,13 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+It also checks (#411) that other HTTP errors keep FastAPI's own answer (a malformed
+multipart upload is FastAPI's 400 with `detail`, not the envelope), that the engineer-format
+synthesis failing is the Ollama 503, that a Weaviate failure in `hybrid` and `semantic`
+modes names Ollama too (Weaviate embeds the question through it there), and that a help
+template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+checks the envelope through the proxy on the running stack: an unknown route answers 404
+`NOT_FOUND` and `PUT /query` answers `METHOD_NOT_ALLOWED`.
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
@@ -14035,6 +14182,18 @@ service red and the others green, that a proxy 502, a refused connection and a 5
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
 refresh whatever health answers.
+
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -15656,15 +15815,28 @@ section "§10.5 Infrastructure"
 check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Both distribution scripts in a scratch git repository, docker stubbed (#384).
+python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
+check "Distribution archives hold only the tracked files of HEAD (#384)" $?
 python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
 check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# The same envelope through the proxy on the running stack (#373).
+check_eq "an unknown API route answers 404 through the proxy (#373)" \
+  "$(api_code "$API/no-such-route-373")" "404"
+check_eq "  ... in the envelope, code NOT_FOUND" \
+  "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
+check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
+  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -16440,6 +16612,40 @@ print(sorted(names))
 sys.exit(0 if ok else 1)
 ENDPY
 check "ZIP members with one basename in two folders stay two documents, named by path" $?
+
+# A Finder "Compress" ZIP (#378): __MACOSX/finder/._report.txt is the file's
+# AppleDouble resource fork with the same suffix, and was queued as a document.
+python3 - "$RIFIX/finder.zip" <<'ENDPY'
+import sys, zipfile
+double = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for name, data in [("finder/", b""), ("finder/report.txt",
+                        b"Finder report. The pool closes at eight on Sundays."),
+                       ("__MACOSX/", b""), ("__MACOSX/finder/", b""),
+                       ("__MACOSX/finder/._report.txt", double)]:
+        z.writestr(zipfile.ZipInfo(name), data)
+ENDPY
+ingest "$RI" fixed 200 40 "$RIFIX/finder.zip"
+cp /tmp/vfy_job.json /tmp/vfy_ri_finder.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_finder.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+checks = {
+    "completed": job["status"] == "completed",
+    "no errors": job["errors"] == [],
+    "one file": job["files_total"] == 1,
+    "skipped names the AppleDouble member": job["skipped"] == [
+        "finder.zip:__MACOSX/finder/._report.txt (macOS metadata (AppleDouble), not a document)"],
+    "real file stored": "Finder report" in names.get("finder/report.txt", ""),
+    "no metadata stored": not any("__MACOSX" in n or "/._" in n for n in names),
+}
+print({k: v for k, v in checks.items() if not v} or "ok", sorted(names))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a Finder ZIP stores its file, not the __MACOSX AppleDouble member, which is listed in skipped" $? \
+  "$(head -c 300 /tmp/vfy_ri_finder.json)"
 
 # Two parts with one filename: the second's bytes are stored, the first reported.
 ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
@@ -17294,6 +17500,9 @@ do
   code=$(api_post_code /goldstandard/generate "$body")
   check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
+section "Gold-standard API paths without a model (#398)"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_api_paths.py)
+check "empty-collection outcome, reply parser, 409 GENERATION_IN_PROGRESS, 502 PAIR_GENERATION_FAILED" $?
 summary
 ```
 
@@ -17702,6 +17911,8 @@ check "evaluation import and generated-session regressions" $?
 check "retained-source index boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
+check "E12 embedding mismatch and post-install Ollama check regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
@@ -18239,9 +18450,23 @@ for mode in abs link; do
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
-  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
-  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
-    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  RECHUNK="{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation refuses the source-dependent starts with
+    # the typed 409, before any job is created (#389).
+    for route in rechunk reembed; do
+      check_eq "E29: $route with chunking on an on-disk abs entry is HTTP 409" \
+        "$(api_post_code "/tune/$route" "$RECHUNK")" "409"
+      api_post "/tune/$route" "$RECHUNK" > /tmp/vfy_tj.json
+      check_eq "E29: ... with error code SOURCE_INDEX_INVALID and no job ($route)" \
+        "$(jfield "['error']['code']" < /tmp/vfy_tj.json) $(jfield ".get('job_id')" < /tmp/vfy_tj.json)" \
+        "SOURCE_INDEX_INVALID None"
+    done
+  else
+    api_post "/tune/rechunk" "$RECHUNK" > /tmp/vfy_tj.json
+    check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
   if [ "$mode" = abs ]; then
     # An index that fails validation is a typed 409, not a 500, and doesn't
@@ -20430,6 +20655,92 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
+    }
+  }
+
   // ── re-ingest progress (#22) ───────────────────────────────────────────────
   // The progress panel reports replaced chunks, and the skipped heading no
   // longer claims every skip is an unsupported type: a later file with the
@@ -20937,9 +21248,13 @@ re-downloads the models, so it needs internet.
 # Invoke with `bash package.sh` rather than `./package.sh` so the script does
 # not depend on its own executable bit surviving a file transfer.
 #
-# What the archive contains: source, Dockerfiles, compose file, both lock files
+# What the archive contains: the files git tracks in the current commit (HEAD),
+# built with `git archive`: source, Dockerfiles, compose file, both lock files
 # (ui/package-lock.json and api/requirements.txt) and the docs. That is
-# everything needed to rebuild the stack from scratch.
+# everything needed to rebuild the stack from scratch. Untracked and ignored
+# files never go in -- offline tars, .env files, node_modules/, previous
+# archives, the contents of ingest-inbox/ and exports/ -- and neither do
+# uncommitted changes, so commit first. Run it in a git checkout (#384).
 #
 # What it deliberately does NOT contain: Docker images, the Weaviate index, and
 # the Ollama model weights. Those are rebuilt or re-downloaded on the target
@@ -20954,39 +21269,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. In an extracted archive there is no repository, and in a
+# subdirectory of another one git archive would take only that subtree.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
+
 OUT="${1:-rag-docker.zip}"
 rm -f "$OUT"
 
-zip -r -q "$OUT" . \
-  -x '*.DS_Store' \
-  -x '__MACOSX/*' \
-  -x '*/node_modules/*' \
-  -x '*/__pycache__/*' \
-  -x '*.pyc' \
-  -x '*.pyo' \
-  -x '*/dist/*' \
-  -x '*/.venv/*' \
-  -x '*/venv/*' \
-  -x '*/.pytest_cache/*' \
-  -x '*/.mypy_cache/*' \
-  -x '*/.ruff_cache/*' \
-  -x '*/uploads/*' \
-  -x 'ingest-inbox/*' \
-  -x 'exports/*' \
-  -x '.env' \
-  -x '*/.env' \
-  -x '*/.env.*' \
-  -x '.git/*' \
-  -x '*.zip'
-
-# The blanket ingest-inbox exclusion also drops the directory itself. Add the
-# placeholder back so the bind-mount target exists on the target machine; without
-# it Docker creates the directory as root and the user cannot drop files in.
-zip -q "$OUT" ingest-inbox/.gitkeep
-# Same for ./exports: it is the bind mount export packages are written to.
-# Its contents are somebody's corpus and never belong in a source archive,
-# but the directory itself must exist or Docker creates it as root.
-zip -q "$OUT" exports/.gitkeep
+# Tracked files only. ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so
+# both bind-mount targets exist on the target machine; without them Docker
+# creates the directories as root and the user cannot drop files in.
+git archive --format=zip -o "$OUT" HEAD
 
 echo "Created $OUT ($(du -h "$OUT" | cut -f1))"
 echo
@@ -21016,7 +21314,9 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 # Unlike package.sh (source only, ~150 KB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
-#   * the source tree
+#   * the source tree: the files git tracks in the current commit (HEAD),
+#     built with `git archive`, exactly as package.sh does. Untracked and
+#     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
 #   * the Ollama model weights (phi3.5 + nomic-embed-text)
 #
@@ -21026,6 +21326,14 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. Checked first, before any image or volume is touched.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package-offline.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
 
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
@@ -21059,26 +21367,11 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/rag-docker/offline"
 
-echo "==> Copying source"
-tar cf - \
-  --exclude='./.DS_Store' --exclude='*/.DS_Store' \
-  --exclude='*/node_modules/*' --exclude='*/__pycache__/*' \
-  --exclude='*.pyc' --exclude='*/dist/*' \
-  --exclude='*/.venv/*' --exclude='*/venv/*' \
-  --exclude='./.env' --exclude='*/.env' --exclude='*/.env.*' \
-  --exclude='./.git/*' --exclude='*.tar' --exclude='*.zip' \
-  --exclude='./offline/*' \
-  --exclude='./ingest-inbox/*' \
-  --exclude='./exports/*' \
-  . | ( cd "$STAGE/rag-docker" && tar xf - )
-
-# Both zip and tar drop a directory once all its contents are excluded, so the
-# mount target is recreated explicitly. Without it Docker creates ./ingest-inbox
-# as root on the target machine and the user cannot drop files into it.
-mkdir -p "$STAGE/rag-docker/ingest-inbox"
-touch "$STAGE/rag-docker/ingest-inbox/.gitkeep"
-mkdir -p "$STAGE/rag-docker/exports"
-touch "$STAGE/rag-docker/exports/.gitkeep"
+echo "==> Copying source (tracked files of the current commit)"
+# ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so both mount targets
+# exist on the target machine; without them Docker creates the directories as
+# root and the user cannot drop files into ./ingest-inbox.
+git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
@@ -21159,6 +21452,169 @@ echo
 echo "If all five services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
+```
+
+### scripts/tests/test_package_archives.py
+
+Host-side check that both distribution scripts hold exactly the tracked files
+of `HEAD` (#384), run in a scratch git repository with `docker` stubbed.
+
+```python
+"""Distribution archives hold only the tracked files of HEAD (#384).
+
+Host-side, no stack: each script runs in a scratch git repository, and
+package-offline.sh talks to a stub `docker` first on PATH, never to a daemon.
+
+Run: python3 scripts/tests/test_package_archives.py
+"""
+import os
+import shutil
+import stat
+import subprocess
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ('package.sh', 'package-offline.sh')
+REFUSAL = 'not the top level of a git checkout'
+COMMITTED_README = 'Scratch project.\n'
+GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
+       '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+
+# Answers what package-offline.sh asks of docker, and logs each call.
+STUB_DOCKER = r'''#!/usr/bin/env bash
+echo "$*" >> "$STUB_DOCKER_LOG"
+case "$1 $2" in
+  "compose config") echo '{"name":"scratch"}' ;;
+  "image inspect"|"volume inspect") ;;
+  save*) printf 'stub image layers' ;;
+  run*)
+    while [ $# -gt 0 ]; do
+      case "$1" in -v) case "$2" in *:/out) touch "${2%:/out}/ollama_models.tar.gz" ;; esac; shift ;; esac
+      shift
+    done ;;
+  *) echo "stub docker: unexpected call: $*" >&2; exit 1 ;;
+esac
+'''
+
+# Untracked or ignored content that must never reach an archive.
+UNTRACKED = (
+    '.env', '.env.local', 'tools/.env.production', 'rag-docker-offline.tar', 'old.zip',
+    'offline/images.tar.gz', '.claude/worktrees/fix-1/README.md', 'dev-docs/issue-1/analysis.md',
+    '0', '.DS_Store', 'notes.txt', 'ingest-inbox/doc.pdf', 'exports/pkg.tar.gz',
+)
+EXECUTABLE = ('install-offline.sh', 'tools/run.sh')
+
+
+def write(path, text, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(mode)
+
+
+class PackageArchiveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name).resolve()
+        self.repo = self.tmp / 'project'
+        self.repo.mkdir()
+        for name in SCRIPTS + ('.gitignore',):
+            shutil.copy(ROOT / name, self.repo / name)
+        write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
+        write(self.repo / 'README.md', COMMITTED_README)
+        write(self.repo / 'ingest-inbox' / '.gitkeep', '')
+        write(self.repo / 'exports' / '.gitkeep', '')
+        write(self.repo / 'tools' / 'run.sh', '#!/usr/bin/env bash\n', 0o755)
+        write(self.repo / 'tools' / 'data.txt', 'data\n')
+        self.git('init', '-q')
+        self.git('add', '-A')
+        self.git('add', '-f', 'ingest-inbox/.gitkeep', 'exports/.gitkeep')
+        self.git('commit', '-q', '-m', 'scratch')
+        self.tracked = set(self.git('ls-files').split())
+        for name in UNTRACKED:
+            write(self.repo / name, 'must not ship\n')
+        with open(self.repo / 'README.md', 'a') as handle:
+            handle.write('UNCOMMITTED EDIT\n')
+        self.assertEqual(set(self.git('ls-files').split()), self.tracked)
+        bin_dir = self.tmp / 'bin'
+        write(bin_dir / 'docker', STUB_DOCKER, 0o755)
+        self.log = self.tmp / 'docker.log'
+        self.env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log), GIT_CONFIG_NOSYSTEM='1')
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, check=True,
+                              capture_output=True, text=True).stdout
+
+    def run_script(self, directory, script, out):
+        return subprocess.run(['bash', str(directory / script), str(out)], cwd=self.tmp, env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def assert_ran(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_zip_holds_exactly_the_tracked_files(self):
+        out = self.tmp / 'out.zip'
+        self.assert_ran(self.run_script(self.repo, 'package.sh', out))
+        with zipfile.ZipFile(out) as archive:
+            infos = {i.filename: i for i in archive.infolist() if not i.filename.endswith('/')}
+            self.assertEqual(set(infos), self.tracked)
+            self.assertEqual(archive.read('README.md').decode(), COMMITTED_README)
+        for name in EXECUTABLE:
+            with self.subTest(executable=name):
+                self.assertTrue((infos[name].external_attr >> 16) & stat.S_IXUSR)
+
+    def test_offline_bundle_holds_tracked_files_and_offline_payload(self):
+        out = self.tmp / 'bundle.tar'
+        self.assert_ran(self.run_script(self.repo, 'package-offline.sh', out))
+        expected = {'rag-docker/' + name for name in self.tracked}
+        expected |= {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'}
+        with tarfile.open(out) as archive:
+            files = {m.name: m for m in archive.getmembers() if m.isfile()}
+            self.assertEqual(set(files), expected)
+            self.assertEqual(archive.extractfile('rag-docker/README.md').read().decode(), COMMITTED_README)
+        for name in EXECUTABLE:
+            with self.subTest(executable=name):
+                self.assertTrue(files['rag-docker/' + name].mode & stat.S_IXUSR)
+
+    def test_refuses_outside_a_git_top_level(self):
+        plain = self.tmp / 'extracted'
+        nested = self.repo / 'tools' / 'copy'
+        for directory in (plain, nested):
+            directory.mkdir(parents=True)
+            for script in SCRIPTS:
+                shutil.copy(ROOT / script, directory / script)
+                out = self.tmp / f'{directory.name}-{script}.out'
+                with self.subTest(directory=directory.name, script=script):
+                    result = self.run_script(directory, script, out)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(REFUSAL, result.stderr)
+                    self.assertFalse(out.exists())
+        calls = self.log.read_text() if self.log.exists() else ''
+        self.assertEqual(calls, '', 'docker was called before the refusal')
+
+
+class EmbeddedCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        text = (ROOT / 'IMPLEMENTATION.md').read_text()
+        for name in SCRIPTS + ('scripts/verify/01_infrastructure.sh', 'scripts/verify/README.md',
+                               'scripts/tests/test_package_archives.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n'
+                start = text.index(header) + len(header)
+                start = text.index(f'{fence}{language}\n', start) + len(fence + language) + 1
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (ROOT / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
 ```
 
 ### scripts/verify/session_persistence_cases.py
@@ -24687,6 +25143,66 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(result['warnings'].count(warning), 1)
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
+
+    def build_with_models(self, failing):
+        """Export with both models requested; models named in `failing` cannot bundle."""
+        blob = self.root / 'model-blob'
+        blob.write_text('inert model bytes')
+
+        def export_model(model, stage):
+            if model in failing:
+                raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
+            return [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
+            mocks.enter_context(patch.object(settings, 'llm_model', 'chat:v2'))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=True))
+            mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
+            result = packager.build('Corpus', include_models=True)
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
+                          and m.name.count('/') == 1)
+            manifest = json.load(archive.extractfile(member))
+        return result, manifest
+
+    def test_manifest_lists_only_models_actually_bundled(self):
+        for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
+                                  (set(), ['chat', 'embed']), ({'embed:v1', 'chat:v2'}, [])]:
+            with self.subTest(failing=sorted(failing)):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(failing)
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(manifest['models_bundled'], bool(expected))
+                self.assertEqual(result['models_bundled'], bool(expected))
+                for name in ('embed', 'chat'):
+                    self.assertEqual(f'models/{name}/manifest.json' in manifest['files'],
+                                     name in expected)
+                for model in sorted(failing):
+                    self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
+                                        for w in manifest['warnings']))
+
+    def test_package_readme_contents_come_from_the_partial(self):
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        partial = (packager._TEMPLATE_DIR / 'partials' / 'contents.md').read_text().rstrip('\n')
+        self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
+        self.assertNotIn('@@', readme)
 
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:

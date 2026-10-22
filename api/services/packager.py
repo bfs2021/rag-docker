@@ -420,7 +420,7 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
             wanted = [settings.embed_model, settings.llm_model]
             if not model_bundle.store_available():
@@ -435,7 +435,8 @@ def build(
                     except (OSError, ValueError) as exc:
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model.split(":")[0])
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -481,9 +482,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -497,18 +498,6 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -532,7 +521,6 @@ def build(
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is

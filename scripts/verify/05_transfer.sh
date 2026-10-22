@@ -21,6 +21,8 @@ check "evaluation import and generated-session regressions" $?
 check "retained-source index boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
+check "E12 embedding mismatch and post-install Ollama check regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
@@ -558,9 +560,23 @@ for mode in abs link; do
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
-  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
-  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
-    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  RECHUNK="{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation refuses the source-dependent starts with
+    # the typed 409, before any job is created (#389).
+    for route in rechunk reembed; do
+      check_eq "E29: $route with chunking on an on-disk abs entry is HTTP 409" \
+        "$(api_post_code "/tune/$route" "$RECHUNK")" "409"
+      api_post "/tune/$route" "$RECHUNK" > /tmp/vfy_tj.json
+      check_eq "E29: ... with error code SOURCE_INDEX_INVALID and no job ($route)" \
+        "$(jfield "['error']['code']" < /tmp/vfy_tj.json) $(jfield ".get('job_id')" < /tmp/vfy_tj.json)" \
+        "SOURCE_INDEX_INVALID None"
+    done
+  else
+    api_post "/tune/rechunk" "$RECHUNK" > /tmp/vfy_tj.json
+    check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
   if [ "$mode" = abs ]; then
     # An index that fails validation is a typed 409, not a 500, and doesn't
