@@ -853,9 +853,10 @@ retrieval order, best match first, so their scores don't increase down the list.
 
 The metric is read from Weaviate on every query, so a collection deleted and recreated with
 another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
-(or no hybrid score), or when the collection's metric can't be read or isn't one of the three
-above; it is never replaced by 0.0. Non-null scores are rounded to 4 decimals. Scores rank the
-chunks of one answer; they aren't comparable across modes or metrics.
+(or no hybrid score), or when the collection's config has no metric or a metric that isn't one
+of the three above; it is never replaced by 0.0. A failed read of the metric is a Weaviate
+failure: the query answers the 503 below (#373). Non-null scores are rounded to 4 decimals.
+Scores rank the chunks of one answer; they aren't comparable across modes or metrics.
 
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
@@ -2546,8 +2547,8 @@ now lives once, in `api/services/ingest_config.py`.
       *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
       dot and l2-squared collections give the documented similarities of known vectors, and a
       collection recreated with another metric is converted by the new one. Controlled tests
-      cover a missing distance or hybrid score (`null`) and an unknown metric; the Q&A page shows
-      `n/a` for a `null` score.*
+      cover a missing distance or hybrid score (`null`), an unknown metric, and a failed metric
+      read answering 503; the Q&A page shows `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
@@ -2676,6 +2677,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
 - [x] Citations toggle correctly hides/shows citation panel.
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
+      interception and checks that the box starts unchecked and the query sends
+      `include_citations` false with no Sources panel, even when the reply carries citations; that
+      checked, it sends true and the panel lists file, chunk, score (`n/a` for null) and excerpt; and
+      that unchecking and checking it again hides and shows the panel of the answer on screen
+      without a new query.*
 - [x] Chunking strategy selection updates the explanation panel without page reload.
       *All five strategies render distinct text; zero navigations.*
 - [x] Health dashboard shows per-service latency; auto-refreshes every 30 seconds.
@@ -2724,6 +2731,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
+      *Evidence for the proxy pages: `ui_controls.js` (suite 06) answers the Import upload with
+      nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON error, and checks the
+      message shown for each (the 512 MB limit text for a 413, "HTTP 500" for a plain 500, and
+      never a JSON syntax error).*
 
 - [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
   *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
