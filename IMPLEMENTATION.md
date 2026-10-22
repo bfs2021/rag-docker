@@ -13989,6 +13989,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
+| `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
 | `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 `10_validity.sh` is called by suite05 (and thus all.sh). It runs
@@ -17477,6 +17478,9 @@ do
   code=$(api_post_code /goldstandard/generate "$body")
   check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
+section "Gold-standard API paths without a model (#398)"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_api_paths.py)
+check "empty-collection outcome, reply parser, 409 GENERATION_IN_PROGRESS, 502 PAIR_GENERATION_FAILED" $?
 summary
 ```
 
