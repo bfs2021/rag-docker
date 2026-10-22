@@ -853,9 +853,10 @@ retrieval order, best match first, so their scores don't increase down the list.
 
 The metric is read from Weaviate on every query, so a collection deleted and recreated with
 another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
-(or no hybrid score), or when the collection's metric can't be read or isn't one of the three
-above; it is never replaced by 0.0. Non-null scores are rounded to 4 decimals. Scores rank the
-chunks of one answer; they aren't comparable across modes or metrics.
+(or no hybrid score), or when the collection's config has no metric or a metric that isn't one
+of the three above; it is never replaced by 0.0. A failed read of the metric is a Weaviate
+failure: the query answers the 503 below (#373). Non-null scores are rounded to 4 decimals.
+Scores rank the chunks of one answer; they aren't comparable across modes or metrics.
 
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
@@ -2545,8 +2546,8 @@ now lives once, in `api/services/ingest_config.py`.
       *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
       dot and l2-squared collections give the documented similarities of known vectors, and a
       collection recreated with another metric is converted by the new one. Controlled tests
-      cover a missing distance or hybrid score (`null`) and an unknown metric; the Q&A page shows
-      `n/a` for a `null` score.*
+      cover a missing distance or hybrid score (`null`), an unknown metric, and a failed metric
+      read answering 503; the Q&A page shows `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
