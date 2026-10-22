@@ -327,6 +327,17 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
+The registry is written atomically (#388): each create or delete writes the whole registry to a
+uniquely named temporary file in the same folder, fsyncs it and replaces
+`collection_registry.json` with it, under one lock in the API process, so a crash or a failed
+write (for example on a full `ingest_uploads` volume) leaves the old file whole. The file is
+owner-only (mode 0600). A registry that exists but can't be read (it can't be opened, isn't
+UTF-8 JSON, or isn't a JSON object) is never treated as empty: it is left unchanged and logged.
+`GET /collections` then answers with `created_at` `null` for every collection, and
+`POST /collections` and `DELETE /collections/{name}` still create or delete the collection and
+answer as usual, without recording or removing its entry, until the file is fixed or removed.
+A missing file is an empty registry.
+
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to list the collections
 (unreachable, timed out or any other error) (#373): "Cannot list the collections: Weaviate
 could not be read. Try again when Weaviate is available." `detail` is `null`. The cause is
@@ -558,6 +569,17 @@ most 512 MB decompressed, nothing decompressed written to disk). Each line becom
 as described in §5.1; chunks have `source_type` `jsonl`, and the retained original is the file
 as uploaded.
 
+**macOS metadata in ZIPs (#378).** A ZIP made with the macOS Finder holds, beside each file, an
+AppleDouble file with its resource fork and extended attributes, `__MACOSX/<folder>/._<name>`,
+which keeps the file's suffix; other macOS tools write `._<name>` beside the file. These are not
+documents. A ZIP member whose logical name (below) has `__MACOSX` as its first folder, or whose
+file name starts with `._`, is not queued, whatever its suffix, and is listed in the job's
+`skipped` as `<zip filename>:<member path> (macOS metadata (AppleDouble), not a document)`, not
+left out silently. The match is exact and case-sensitive, so names that only contain these
+strings (`_report.txt`, `notes._v2.txt`, `.hidden.txt`, `__MACOSX_notes.txt`,
+`docs/__MACOSX/readme.txt`) are queued as usual. Such members are still validated like any
+member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPPORTED_FILES`.
+
 **Logical names and re-ingesting (#22).** Every file is stored under a logical name: the
 `source_file` of its chunks and the filename in its retained-source index entry.
 
@@ -638,7 +660,8 @@ three counts change in one update (#324). Job records written before
 these two fields existed read back with both `null`, not `0`, which would be untrue (#302).
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
-ingested, each with its reason: an unsupported type, or a later input with the same name.
+ingested, each with its reason: an unsupported type, macOS metadata in a ZIP (#378), or a
+later input with the same name.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -820,6 +843,20 @@ When `include_citations` is `true`:
 }
 ```
 
+A citation's `score` is higher-is-better in every retrieval mode (#376). Citations are listed in
+retrieval order, best match first, so their scores don't increase down the list.
+
+| Mode | `score` |
+|---|---|
+| `hnsw`, `flat`, `semantic` | A similarity converted from Weaviate's distance by the collection's distance metric: `cosine`: `1 - distance` (the cosine similarity, -1 to 1); `dot`: `-distance` (the dot product); `l2-squared`: `1 / (1 + distance)` (0 to 1). |
+| `hybrid` | Weaviate's fusion score, unchanged. |
+
+The metric is read from Weaviate on every query, so a collection deleted and recreated with
+another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
+(or no hybrid score), or when the collection's metric can't be read or isn't one of the three
+above; it is never replaced by 0.0. Non-null scores are rounded to 4 decimals. Scores rank the
+chunks of one answer; they aren't comparable across modes or metrics.
+
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
@@ -831,6 +868,11 @@ the pipeline (#373): an Ollama call (the reformulation, the query embedding or t
 that can't connect, times out or answers an error status, or a Weaviate retrieval call that
 raises. The message names the service: "The question was not answered: Ollama could not be
 reached, timed out or returned an error. Try again when Ollama is available." (or Weaviate).
+In `hybrid` and `semantic` modes Weaviate embeds the question itself through Ollama, so an
+Ollama failure there comes back as a Weaviate error; a Weaviate failure in those modes names
+both (#411): "The question was not answered: Weaviate could not be reached, timed out or
+returned an error, or Ollama could not embed the question for it. Try again when Weaviate and
+Ollama are available."
 `detail` is `{"collection": "<name>"}`, no metrics record is written, and the cause is logged,
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
@@ -1023,7 +1065,7 @@ Updates the status or edited content of one pair. Called by the UI when the user
 }
 ```
 
-`status` must be one of `"approved"`, `"edited"`, `"rejected"`, `"pending"`. Providing `question`, `answer`, or `ground_truth` fields without setting `status: "edited"` is a 422 error. All text fields are optional — only provided fields are updated.
+`status` must be one of `"approved"`, `"edited"`, `"rejected"`, `"pending"`. Providing `question`, `answer`, or `ground_truth` fields without setting `status: "edited"` is a 422 error. A provided `question`, `answer` or `ground_truth` must contain text: an empty or whitespace-only value is refused with 422 `INVALID_PARAMETER`, since `save` would export it as an empty RAGAS field. Other values are stored as sent. All text fields are optional — only provided fields are updated. The body is validated before the session is looked up.
 
 **Response 200:** Returns the updated pair object.
 
@@ -1055,7 +1097,7 @@ Regenerates one specific pair. Preserves all other pairs in the session.
 
 **Response 200:** Returns the single regenerated pair object (same schema as above). The regenerated pair's `status` is reset to `"pending"`.
 
-**Response 404** if the session or pair ID does not exist (same error format as PATCH above).
+**Response 404** if the session or pair ID does not exist (same error format as PATCH above): `SESSION_NOT_FOUND` for an unknown session, `PAIR_NOT_FOUND` for an unknown pair in an existing session. Neither calls the model.
 
 **Response 409** (`SESSION_BUSY`) if called while the session's `status` is still `"generating"`.
 
@@ -1478,6 +1520,11 @@ ingest default.
   they list has stored chunks (every file produced no chunks at ingest), so there
   is nothing to rebuild (#328). No job is created. The other `SOURCES_REQUIRED`
   refusals below still come through the job.
+- **409 `SOURCE_INDEX_INVALID`** from `/tune/rechunk`, and from `/tune/reembed`
+  with chunking fields, when the collection's retained source index is invalid
+  (#389). No job is created; repair the index before re-chunking. Re-embedding
+  without chunking fields and re-indexing don't read the retained sources, so
+  they still start.
 - **503 `SERVICE_UNAVAILABLE`** from those same requests when Weaviate can't be
   read for that check (#340). No job is created; try again when Weaviate is
   available. The cause is logged, not returned.
@@ -1647,7 +1694,7 @@ Flat (KNN) index has no tunable parameters.
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -1863,7 +1910,7 @@ Visible on all pages post-role-selection. Contents vary by role:
 - Question text input (multi-line, submit via "Ask" button or Ctrl+Enter; plain Enter inserts a newline).
 - Citations toggle (checkbox, off by default, labeled "Show source citations").
 - Answer display area (markdown-rendered).
-- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score, excerpt.
+- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score (higher is better, 3 decimals; `n/a` when the API returns `null`, #376), excerpt.
 - Latency display (small, below answer): `Retrieved in Xms · Generated in Xms`.
 - Retrieval mode selector — visible to Engineer and Developer roles only. Hidden for End User. Read-only: it displays the mode saved for the selected collection, which is changed on the Retrieval Config page. The settings are fetched from `GET /retrieval/config/{collection}` whenever the selected collection changes; if nothing is saved for that collection the API returns the defaults (`hnsw`, `top_k: 5`).
 
@@ -1901,7 +1948,7 @@ settings, regardless of when a prior collection's save completes.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
-- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
+- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
 - Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
@@ -2045,18 +2092,25 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Collection selector (from `GET /collections`).
 - **Fidelity shown before the export runs**, from `GET /tune/{collection}`:
   `with-sources` with the document count, or `chunks-only` with what that costs.
-  The choice is informed rather than discovered afterwards in the manifest.
+  The choice is informed rather than discovered afterwards in the manifest. The
+  line is never hidden: it reads "Fidelity: reading…" while the lookup runs, and
+  "Fidelity: unknown — it could not be read:" with the reason when the lookup
+  fails (409 `SOURCE_INDEX_INVALID`, 503, 404 or a proxy error). It always belongs
+  to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
 - Progress while the job runs, then the filename, size, fidelity, whether models
   were bundled and whether `retrieve.py` was generated. Warnings from the job are
-  shown in full.
+  shown in full. A failed export shows its `error_code` (for example
+  `EMBEDDING_MISMATCH`) before the error, as the import half does.
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
   chunk count, fidelity and size. Unreadable files are listed too, marked as
-  such, so nothing silently disappears.
+  such, so nothing silently disappears. A failed `GET /packages` shows "Could not
+  list the packages in ./exports:" with the reason, instead of the empty-folder
+  hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
   consequence spelled out. There is no default in the API, and the page makes the
   difference explicit because the wrong choice can delete a collection.
@@ -2065,7 +2119,14 @@ A retained session can be loaded/refreshed by its session ID, including when its
   sessions restored).
 
 Both halves poll their job endpoint every 2s and stop polling when the job
-finishes or the page unmounts.
+finishes or the page unmounts; a poll in flight at unmount, or a start answered
+after it, schedules nothing. A failed poll is shown ("Could not check the
+export's progress, retrying:" with the reason) and retried at the same interval,
+with the button still busy; the next good poll clears the message. After 30
+failed polls in a row (about a minute, enough for an API restart) the half stops
+watching the job, says so with the last error and that the job may still be
+running, and enables its button again, so the page never stays stuck until a
+reload (#382).
 
 ### 7.11 Transfer Help Page
 
@@ -2455,6 +2516,14 @@ now lives once, in `api/services/ingest_config.py`.
       against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
       archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
       `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
+- [x] A ZIP's macOS metadata (`__MACOSX/` members and `._*` AppleDouble files) is not ingested and is listed in `skipped` with its reason; names that only look like it are ingested (#378).
+      *A Finder ZIP's `__MACOSX/._report.pdf` kept `.pdf` and was queued as a document of
+      its own. `test_reingest.py` covers a Finder-style ZIP (only the file queued, the
+      AppleDouble member in `skipped`), a `._*` file beside its file, other `__MACOSX/`
+      members whatever their suffix, look-alike names that are still queued, and a ZIP of
+      only metadata refused with `NO_SUPPORTED_FILES`. `02_ingest.sh` ingests a Finder-style
+      ZIP through the proxy: the job completes with no errors, stores only the file's
+      chunks and lists the AppleDouble member in `skipped`.*
 - [x] Two ingest jobs that replace one logical name in one collection run one at a time: afterwards exactly one job's version is stored, whole (its full chunk set, its `chunks_replaced` equal to the other job's `chunks_stored`, one retained digest naming the name, the winner's); which job runs last is not promised (#22).
       *`02_ingest.sh` sends two uploads of one name, with different content, at once
       through the proxy and checks that both jobs complete, exactly one version's text is
@@ -2472,6 +2541,12 @@ now lives once, in `api/services/ingest_config.py`.
       *hnsw, flat, hybrid and semantic each returned chunks and an answer.*
 - [x] `include_citations: true` returns citation objects with source_file and score.
       *Each citation carries source_file, chunk_index, score and excerpt.*
+- [x] A citation's score is higher-is-better in every mode, and `null` when missing (#376).
+      *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
+      dot and l2-squared collections give the documented similarities of known vectors, and a
+      collection recreated with another metric is converted by the new one. Controlled tests
+      cover a missing distance or hybrid score (`null`) and an unknown metric; the Q&A page shows
+      `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
@@ -2479,9 +2554,9 @@ now lives once, in `api/services/ingest_config.py`.
       end_user prompt now asks for a short answer without technical detail, so
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
-- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373).
+- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373). In `hybrid` and `semantic` modes, where Weaviate embeds the question through Ollama, a Weaviate failure names both Weaviate and Ollama (#411).
 - [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged; the file never holds more than 1,000 lines, is compacted atomically to its last 500 records, and those reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
-      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call and each retrieval mode's Weaviate call; it fails on the code before #373.*
+      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call (the synthesis in both response formats) and each retrieval mode's Weaviate call; it fails on the code before #373, and its hybrid and semantic wording on the code before #411.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
@@ -2527,6 +2602,9 @@ now lives once, in `api/services/ingest_config.py`.
       status still read "pending" — an export could ship text nobody approved
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
+- [x] PATCH and regenerate answer 404 `SESSION_NOT_FOUND` for an unknown session and 404 `PAIR_NOT_FOUND` for an unknown pair in an existing session. PATCH refuses an empty or whitespace-only `question`, `answer` or `ground_truth` with 422 `INVALID_PARAMETER` and leaves the pair unchanged.
+      *Evidence: `04_goldstandard.sh` runs `scripts/tests/test_goldstandard_review.py` (all four 404 cases, nothing written and no model call; the empty-field refusal for each field, before the session lookup; accepted-edit controls) and checks the unknown-session codes through the proxy, and in the LLM section the unknown-pair code and an empty question on a generated pair.*
+      *Originally an unknown session answered `PAIR_NOT_FOUND` on both endpoints, and an empty edit was stored and exported as an empty RAGAS field (#381).*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`). Startup settles interrupted generations as failed, preserving completed pairs, counters and validity metadata; ordinary scans leave active generation alone.
       *Evidence: `session_persistence_cases.py` covers fresh-process settlement, mixed completed/interrupted sessions with edits and stale/orphan metadata, worker refusal without cache/file mutation, plain reason persisted without a false storage error, successful regeneration and on-disk retry after write failure. `04_goldstandard.sh` includes a guarded disposable API hard-stop and regeneration check when a retained pair is available.*
 - [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
@@ -2607,6 +2685,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
       for a missing model and an unreachable Ollama or Weaviate.*
+- [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, and shows a failed package list (#382).
+      *Evidence: `scripts/verify/browser/transfer_page.js` (suite 06, through `ui_criteria.js`)
+      stubs every API call in the browser: proxy 502s while polling either half, a poll in
+      flight and an export start answered after the page is left, 409, 503 and 404 from
+      `/tune`, a late fidelity answer for another collection, an `EMBEDDING_MISMATCH` export
+      and a 500 from `/packages`. 13 of its 14 checks fail on the code before #382.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
@@ -2664,6 +2748,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *10 collections with identical object counts.*
 - [x] `collection_registry.json` and `ingest_configs/` persist across restarts; `GET /collections` reflects correct `created_at` after restart.
       *`created_at`, index type and distance metric all preserved.*
+- [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
+      *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
@@ -2672,8 +2758,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
-- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned.
-  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373.*
+- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
+  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373. Suite 01 also checks through the proxy on the running stack that an unknown route answers 404 `NOT_FOUND` and a wrong method `METHOD_NOT_ALLOWED` (#411).*
 
 ---
 
@@ -2712,9 +2798,14 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
 
-Both archives MUST exclude `.DS_Store`, `node_modules/`, `__pycache__/`,
-`dist/`, `.env*` and previous archives. Neither carries the Weaviate index or
-uploaded files; those are created empty on first start.
+Both archives MUST hold exactly the files git tracks in the current commit
+(`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
+not `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, `.env*`, `*.tar`,
+`offline/`, previous archives, `.claude/` or `dev-docs/`, nor the contents of
+`ingest-inbox/` and `exports/` (their tracked `.gitkeep` keeps the directories).
+Uncommitted changes are not included. Both scripts MUST refuse to run unless
+their directory is the top level of a git checkout (#384). Neither carries the
+Weaviate index or uploaded files; those are created empty on first start.
 
 ### 11.3 Offline bundle contents
 
@@ -2722,7 +2813,7 @@ uploaded files; those are created empty on first start.
 
 ```
 rag-docker/
-├── <the full source tree>
+├── <the files git tracks in HEAD, as package.sh>
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
