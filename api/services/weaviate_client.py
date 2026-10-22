@@ -469,7 +469,8 @@ def _distance_to_score(coll):
 
     The metric is read on every query, not cached, so a collection deleted and
     recreated with another metric is converted by its new one. A missing
-    distance, or a metric that can't be read or has no conversion, gives None.
+    distance, or a config with no metric or a metric with no conversion, gives
+    None. A failed config read raises, and the query answers the #373 503.
     """
     vector_config = coll.config.get().vector_index_config
     convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
