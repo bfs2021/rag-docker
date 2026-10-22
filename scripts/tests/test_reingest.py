@@ -7,6 +7,7 @@ Runs with the API's dependencies, inside the verify project's API container:
 Weaviate and gold-standard sessions are mocked; nothing reaches a backend.
 """
 import asyncio
+import contextlib
 import hashlib
 import io
 import json
@@ -713,8 +714,15 @@ class RechunkTests(unittest.TestCase):
         from fastapi.testclient import TestClient
         from main import app
         from services import collection_writes
+        import anyio.from_thread
         client = TestClient(app)  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
+        # #389 (reviewer): one event loop for every request. With TestClient's
+        # per-request loop, a started job's task could be cancelled before it
+        # reached _run, leaving the tune guard held for the next request.
+        stack = contextlib.ExitStack()
+        client.portal = stack.enter_context(anyio.from_thread.start_blocking_portal())
+        self.addCleanup(stack.close)
 
         def run(job_id, collection, *args, **kwargs):
             collection_writes.end_job("tune", job_id)
@@ -744,6 +752,43 @@ class RechunkTests(unittest.TestCase):
         self.assertEqual(set(tuning._jobs) - before, set(started))
         self.assertEqual(len(started), 6)
         self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_the_guards_answer_before_an_invalid_source_index(self):
+        # #389 (reviewer): the invalid-index refusal runs after the guards, so a
+        # busy or deleting collection still answers TUNE_IN_PROGRESS or
+        # COLLECTION_DELETING, and the refusal leaves the other tune's guard alone.
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        body = {"collection": "Coll", "chunking_strategy": "fixed", "chunk_size": 80}
+        before = set(tuning._jobs)
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(wc, "get_client") as get_client:
+            for form in self.invalid_indexes():
+                for path in ("/tune/rechunk", "/tune/reembed"):
+                    with self.subTest(form=form, path=path, guard="tune"):
+                        with tuning._lock:
+                            tuning._active.add("Coll")
+                        try:
+                            response = client.post(path, json=body)
+                            self.assertEqual(tuning._active, {"Coll"})
+                        finally:
+                            with tuning._lock:
+                                tuning._active.discard("Coll")
+                        self.assertEqual(response.status_code, 409, response.text)
+                        self.assertEqual(response.json()["error"]["code"], "TUNE_IN_PROGRESS")
+                    with self.subTest(form=form, path=path, guard="delete"), \
+                            patch.object(collection_writes, "register_job",
+                                         side_effect=collection_writes.CollectionDeletingError("Coll")):
+                        response = client.post(path, json=body)
+                        self.assertEqual(response.status_code, 409, response.text)
+                        self.assertEqual(response.json()["error"]["code"], "COLLECTION_DELETING")
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                     (set(), []))
+            self.assertEqual(get_client.call_count, 0)
 
     def test_a_weaviate_error_in_the_up_front_check_is_a_503(self):
         # #340: a Weaviate failure while the start reads the collection was a
