@@ -146,6 +146,28 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual([c["score"] for c in response.json()["citations"]], [0.91, None])
 
+    def test_unreadable_metric_config_is_a_503(self):
+        # The metric read happens inside the Weaviate query, so its failure takes the #373 path.
+        for mode in ("hnsw", "flat", "semantic"):
+            with self.subTest(mode=mode):
+                weaviate = client_for(VectorDistances.COSINE, [obj(0, 0.1)])
+                coll = weaviate.collections.get.return_value
+                coll.config.get.side_effect = RuntimeError("config read failed")
+                client = TestClient(app, raise_server_exceptions=False)
+                self.addCleanup(client.close)
+                with patch.object(wc, "get_client", return_value=weaviate), \
+                        patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                        patch.object(rag_pipeline.ollama, "chat", AsyncMock(return_value="Controlled")), \
+                        patch.object(rag_pipeline.ollama, "embed", AsyncMock(return_value=[0.1, 0.2])), \
+                        patch.object(metrics, "record", AsyncMock()):
+                    response = client.post("/query", json={"question": "q", "collection": "Coll",
+                                                           "retrieval_mode": mode, "include_citations": True})
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(response.json()["error"]["code"], "SERVICE_UNAVAILABLE")
+                self.assertNotIn("config read failed", response.text)
+                coll.query.near_vector.assert_not_called()
+                coll.query.near_text.assert_not_called()
+
 
 class ImplementationCopyTests(unittest.TestCase):
     def test_embedded_copies_match(self):

@@ -115,10 +115,11 @@ code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
 check_eq "a status-only change is accepted" "$code" "200"
-code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"edited","question":""}')
-check_eq "an empty question is refused" "$code" "422"
+check_eq "an empty question is refused with 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "422 INVALID_PARAMETER"
 code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/p_unknown" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
