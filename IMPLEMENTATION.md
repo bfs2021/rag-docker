@@ -13573,7 +13573,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -13977,6 +13977,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
+| `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -14027,7 +14030,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -14250,6 +14253,39 @@ JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logge
 200 with `created_at` `null`, with updates resuming once the file is readable again. It also
 checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
 the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
+
+Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
+runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
+temporary folder: an upload with no supported file answers 400 `NO_SUPPORTED_FILES` with the
+exact message listing a direct file and a ZIP member it skipped, and leaves no job, staging
+folder or registration; an unknown ingest job answers 404 `JOB_NOT_FOUND`; a `/query` body
+with only `question` and `collection` reaches the pipeline with the defaults (`hnsw`, `top_k`
+5, `alpha` 0.75, no citations, `end_user`), and through the real pipeline runs a top-5 vector
+search with the end-user prompt; the reformulation, end-user and engineer prompts and their
+`[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
+successful query records one metric; a saved retrieval config missing newer keys is filled
+from the defaults, and one that isn't JSON or can't be read gives the defaults with
+`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
+instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+checked for its statistics against hand-worked percentiles, its exact-match `collection` and
+`retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
+Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
+`/proc/meminfo` reports memory `unknown` with a note while `/health` stays 200. On the host,
+`scripts/tests/test_ollama_entrypoint.py` runs `ollama/entrypoint.sh` with stub `ollama`,
+`timeout` and `sleep` commands: models already listed are not pulled, a missing one is pulled
+as `timeout 7200 ollama pull`, a failed or timed-out pull is retried after 15 s, and the fifth
+failure exits 1 with its error. Then, on the verify stack: the upload and job errors through
+the proxy; a new collection's schema has BM25 off for `source_file`, `source_type` and
+`chunk_strategy` and refuses an insert with an undeclared property; the running proxy's
+loaded configuration (`nginx -T`) reads `/api/` for 300 s and connects for 10 s; the metrics
+route's shape, `history_limit=0` and the 422. Unless `RAG_SKIP_SLOW=1`, a query with the
+defaults on a text of more than five chunks retrieves 5 chunks without citations and records
+one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
+and that metric read back unchanged after the API restarts, and then a first start: `down -v`
+(the model copy is external and kept) and `up -d --wait` must bring every service healthy
+within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
+SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
+internet. It removes the verify project's data, so it runs last in suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -16198,8 +16234,228 @@ finally:
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
 
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
+
 drop_collection "$C"
 cleanup_prefixed
+summary
+```
+
+### scripts/verify/16_api_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Ingest, query, metrics and health API paths no other check covers (#399).
+#
+# Run by 01_infrastructure.sh, after its own checks: the opt-in first-start check
+# at the end removes the verify project's volumes. The query checks need an LLM
+# (skipped with RAG_SKIP_SLOW=1); the restart and first-start checks are opt-in
+# (RAG_ALLOW_RESTART=1) and never reach the live rag-docker project.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+C="${PREFIX}ApiPaths"
+
+RAG_PATHS_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-paths.XXXXXX") || exit 2
+export RAG_PATHS_TMP
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_PATHS_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
+
+section "API paths: controlled (#399)"
+# Through the app with Weaviate and Ollama mocked, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_api_paths.py)
+check "ingest, query, retrieval-config, metrics and health paths through the app" $?
+python3 "$REPO_ROOT/scripts/tests/test_ollama_entrypoint.py"
+check "the Ollama entrypoint skips present models, pulls under a timeout and retries" $?
+
+section "API paths: ingest errors and schema rules"
+drop_collection "$C"; make_collection "$C"
+printf 'not a supported type\n' > "$RAG_PATHS_TMP/notes.xyz"
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/unsupported.json" -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "files=@$RAG_PATHS_TMP/notes.xyz")
+check_eq "an upload with no supported file answers 400" "$code" "400"
+check_eq "it carries NO_SUPPORTED_FILES" "$(jfield "['error']['code']" < "$RAG_PATHS_TMP/unsupported.json")" "NO_SUPPORTED_FILES"
+check_eq "its message lists what was skipped" "$(jfield "['error']['message']" < "$RAG_PATHS_TMP/unsupported.json")" \
+  "No supported files found in upload. Skipped: notes.xyz (unsupported type '.xyz')"
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/nojob.json" -w '%{http_code}' "$API/ingest/job/vfy-no-such-job")
+check_eq "an unknown ingest job answers 404" "$code" "404"
+check_eq "it carries JOB_NOT_FOUND and names the job" \
+  "$(jfield "['error']['code'] + ' ' + d['error']['message']" < "$RAG_PATHS_TMP/nojob.json")" \
+  "JOB_NOT_FOUND Job 'vfy-no-such-job' not found."
+
+# The schema as Weaviate holds it, and an insert carrying a property it doesn't declare.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+client = wc.get_client()
+try:
+    collection = client.collections.get(name)
+    properties = {p.name: p for p in collection.config.get().properties}
+    out = {"searchable": {n: properties[n].index_searchable
+                          for n in ("content", "source_file", "source_type", "chunk_strategy")}}
+    try:
+        collection.data.insert(properties={"content": "undeclared property check",
+                                           "undeclared_prop": "x"},
+                               vector=[0.01] * 768)
+        out["insert"] = "accepted"
+    except Exception as exc:                          # noqa: BLE001
+        out["insert"] = "refused"
+    out["declared"] = "undeclared_prop" in {p.name for p in collection.config.get().properties}
+    out["objects"] = collection.aggregate.over_all(total_count=True).total_count
+    print(json.dumps(out))
+finally:
+    wc.close_client()
+ENDPY
+) > "$RAG_PATHS_TMP/schema.json"
+check_eq "BM25 is off for source_file, source_type and chunk_strategy, on for content" \
+  "$(jfield "['searchable']" < "$RAG_PATHS_TMP/schema.json")" \
+  "{'content': True, 'source_file': False, 'source_type': False, 'chunk_strategy': False}"
+check_eq "an insert with an undeclared property is refused, adding no property or object" \
+  "$(jfield "['insert'] + ' ' + str(d['declared']) + ' ' + str(d['objects'])" < "$RAG_PATHS_TMP/schema.json")" \
+  "refused False 0"
+
+section "API paths: proxy timeout and metrics route"
+# The configuration the running proxy loaded, not only the file.
+(cd "$REPO_ROOT" && docker compose exec -T proxy nginx -T 2>/dev/null) > "$RAG_PATHS_TMP/nginx.txt"
+python3 - "$RAG_PATHS_TMP/nginx.txt" <<'ENDPY'
+import re, sys
+text = open(sys.argv[1]).read()
+start = text.index("location /api/ {")
+block = text[start:text.index("}", start)]
+ok = (re.search(r"^\s*proxy_read_timeout\s+300s;", block, re.M)
+      and re.search(r"^\s*proxy_connect_timeout\s+10s;", block, re.M))
+sys.exit(0 if ok else 1)
+ENDPY
+check "the proxy's /api/ location reads for 300 s and connects for 10 s" $?
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency.json" -w '%{http_code}' "$API/metrics/latency?history_limit=0")
+check_eq "GET /metrics/latency answers 200" "$code" "200"
+python3 - "$RAG_PATHS_TMP/latency.json" <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+stats = ("p50", "p95", "p99", "mean", "count")
+ok = (set(d) == {"total_records", "retrieval_latency", "llm_latency", "total_latency", "history"}
+      and all(set(d[k]) == set(stats) for k in ("retrieval_latency", "llm_latency", "total_latency"))
+      and d["history"] == [])
+sys.exit(0 if ok else 1)
+ENDPY
+check "it reports the three latency summaries, and history_limit=0 an empty history" $?
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency501.json" -w '%{http_code}' "$API/metrics/latency?history_limit=501")
+check_eq "history_limit above 500 answers 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < "$RAG_PATHS_TMP/latency501.json")" "422 INVALID_PARAMETER"
+
+section "API paths: a query with the defaults (LLM)"
+queried=0
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "a default query and its metric" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  python3 - "$RAG_PATHS_TMP/overtime.txt" <<'ENDPY'
+import sys
+topics = ["overtime approval", "holiday requests", "expense claims", "travel booking",
+          "remote work", "sick leave", "training budgets", "equipment loans",
+          "parking permits", "visitor badges", "parental leave", "jury duty"]
+with open(sys.argv[1], "w") as f:
+    for t in topics:
+        f.write(f"The policy on {t} says a manager must approve every request about {t} "
+                f"before the end of the month, and the HR team records the decision.\n\n")
+ENDPY
+  _rag_require_lock_owner
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$RAG_PATHS_TMP/overtime.txt" > "$RAG_PATHS_TMP/ingest.json"
+  job=$(jfield "['job_id']" < "$RAG_PATHS_TMP/ingest.json")
+  check_eq "a text of more than five chunks is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+  api_post "/query" "{\"question\":\"who approves overtime?\",\"collection\":\"$C\"}" > "$RAG_PATHS_TMP/answer.json"
+  check_eq "a query with only question and collection retrieves the default 5 chunks, without citations" \
+    "$(jfield "['chunks_retrieved'], d['citations'], bool(d['answer'].strip())" < "$RAG_PATHS_TMP/answer.json")" \
+    "5 None True"
+  api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/latency_c.json"
+  python3 - "$RAG_PATHS_TMP/latency_c.json" "$RAG_PATHS_TMP/answer.json" <<'ENDPY'
+import json, sys
+d, a = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+h = d["history"]
+ok = (d["total_records"] == 1 and len(h) == 1 and h[0]["retrieval_mode"] == "hnsw"
+      and h[0]["retrieval_ms"] == a["retrieval_latency_ms"] and h[0]["llm_ms"] == a["llm_latency_ms"]
+      and h[0]["total_ms"] == a["retrieval_latency_ms"] + a["llm_latency_ms"])
+sys.exit(0 if ok else 1)
+ENDPY
+  check "the query recorded one hnsw metric with its latencies" $? "$(cat "$RAG_PATHS_TMP/latency_c.json")"
+  queried=1
+fi
+
+section "API paths: restart and first start (opt-in)"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "retrieval settings and metrics across a restart, and the first start" "set RAG_ALLOW_RESTART=1 to include them"
+elif [ -n "$restart_refusal" ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_refusal"
+elif [ "$restart_limit_ok" != 0 ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_limit"
+else
+  project="$COMPOSE_PROJECT_NAME"
+  saved="{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.3,\"ef\":null,\"response_format\":\"engineer\"}"
+  api_post "/retrieval/config" "$saved" > /dev/null
+  api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_before.json"
+  [ "$queried" = 1 ] && api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_before.json"
+  started=$(python3 -c "import time;print(time.time())")
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  if [ -z "$elapsed" ]; then
+    check "the API is healthy again after the restart" 1 "not healthy after $((restart_limit * 2))s"
+  else
+    api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_after.json"
+    python3 - "$RAG_PATHS_TMP/retrieval_before.json" "$RAG_PATHS_TMP/retrieval_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+want = {"retrieval_mode": "hybrid", "top_k": 7, "alpha": 0.3, "ef": None,
+        "response_format": "engineer", "is_default": False}
+ok = all(before.get(k) == v for k, v in want.items()) and after == before
+sys.exit(0 if ok else 1)
+ENDPY
+    check "saved retrieval settings survive an API restart" $? "$(cat "$RAG_PATHS_TMP/retrieval_after.json")"
+    if [ "$queried" = 1 ]; then
+      api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_after.json"
+      python3 - "$RAG_PATHS_TMP/metrics_before.json" "$RAG_PATHS_TMP/metrics_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+sys.exit(0 if before["total_records"] == 1 and after["history"] == before["history"] else 1)
+ENDPY
+      check "the query's metric survives an API restart" $? "$(cat "$RAG_PATHS_TMP/metrics_after.json")"
+    else
+      skip "the query's metric across a restart" "set RAG_SKIP_SLOW=0 to include model calls"
+    fi
+
+    # First start: no volumes but the model copy, which is external and kept by
+    # `down -v`. The model pull isn't timed: the verify project copies the models.
+    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+    up_ok=$?
+    took=$(python3 -c "import time;print(int(time.time()-$started))")
+    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+    # It started from nothing: the collection made above is gone with its volume.
+    check_eq "that first start began with no collections" \
+      "$(api_get "/collections" | jfield "['collections']")" "[]"
+  fi
+fi
+
+drop_collection "$C"
 summary
 ```
 
