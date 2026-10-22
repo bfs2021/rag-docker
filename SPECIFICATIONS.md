@@ -2766,9 +2766,14 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
 
-Both archives MUST exclude `.DS_Store`, `node_modules/`, `__pycache__/`,
-`dist/`, `.env*` and previous archives. Neither carries the Weaviate index or
-uploaded files; those are created empty on first start.
+Both archives MUST hold exactly the files git tracks in the current commit
+(`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
+not `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, `.env*`, `*.tar`,
+`offline/`, previous archives, `.claude/` or `dev-docs/`, nor the contents of
+`ingest-inbox/` and `exports/` (their tracked `.gitkeep` keeps the directories).
+Uncommitted changes are not included. Both scripts MUST refuse to run unless
+their directory is the top level of a git checkout (#384). Neither carries the
+Weaviate index or uploaded files; those are created empty on first start.
 
 ### 11.3 Offline bundle contents
 
@@ -2776,7 +2781,7 @@ uploaded files; those are created empty on first start.
 
 ```
 rag-docker/
-├── <the full source tree>
+├── <the files git tracks in HEAD, as package.sh>
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
