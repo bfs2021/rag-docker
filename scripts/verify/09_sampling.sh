@@ -23,4 +23,7 @@ do
   code=$(api_post_code /goldstandard/generate "$body")
   check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
+section "Gold-standard API paths without a model (#398)"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_api_paths.py)
+check "empty-collection outcome, reply parser, 409 GENERATION_IN_PROGRESS, 502 PAIR_GENERATION_FAILED" $?
 summary
