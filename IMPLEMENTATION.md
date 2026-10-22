@@ -2762,7 +2762,8 @@ def _distance_to_score(coll):
 
     The metric is read on every query, not cached, so a collection deleted and
     recreated with another metric is converted by its new one. A missing
-    distance, or a metric that can't be read or has no conversion, gives None.
+    distance, or a config with no metric or a metric with no conversion, gives
+    None. A failed config read raises, and the query answers the #373 503.
     """
     vector_config = coll.config.get().vector_index_config
     convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
@@ -13823,7 +13824,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
-| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
@@ -14043,8 +14044,9 @@ Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
 `scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
 the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
 `1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
-first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
-`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+first; a missing distance, a missing hybrid score and a config with no metric or an unknown
+one give `null` (a distance of 0 is a real value); the metric is read again on every query; a
+failed metric read answers 503 `SERVICE_UNAVAILABLE` in each distance mode; the pipeline
 rounds numbers and passes `null` through, and `/query` returns it. It also checks the
 `IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
 project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
