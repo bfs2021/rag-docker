@@ -21,6 +21,10 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
 
+  await require('./ui_controls').runUiControlTests(browser, BASE, r);
+
+  await require('./ui_pages').runUiPageTests(browser, BASE, r);
+
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
   {

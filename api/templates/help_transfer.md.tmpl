@@ -69,7 +69,7 @@ choice can delete a collection.
 |---|---|
 | `abort` | Fail if a collection of that name already exists. |
 | `rename` | Import alongside it as `<name>_imported_<id8>`. |
-| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact. |
+| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`). |
 
 Replacing a collection keeps its gold-standard sessions and marks them orphaned,
 and the import result reports how many. They are never deleted silently.
@@ -86,8 +86,10 @@ and the import result reports how many. They are never deleted silently.
 
 `GET /api/tune/<collection>` reports which of these a given collection can do.
 
-Every rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failed tune leaves the collection as it was.
+Every rebuild is staged into a temporary collection and verified before the
+original is touched, so a failure before cutover leaves the collection as it was.
+A failure during the final replacement can leave its name missing or partial, with
+the data kept in a recovery collection named in the error (`recovered_as`).
 
 **Gold-standard sessions are flagged, never deleted or remapped.** Re-chunking or
 re-embedding changes which chunks exist, so evaluation pairs built against the
