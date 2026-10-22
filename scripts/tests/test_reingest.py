@@ -143,6 +143,51 @@ class AdmissionTests(unittest.TestCase):
         staged = [p for p in Path(paths[0]).parents[1].rglob("*") if p.is_file()]
         self.assertEqual(staged, paths)
 
+    # A Finder "Compress" ZIP (#378): each file's resource fork and extended
+    # attributes as an AppleDouble file under __MACOSX/, keeping the file's suffix.
+    APPLEDOUBLE = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+    MACOS_SKIP = "(macOS metadata (AppleDouble), not a document)"
+
+    def test_finder_zip_queues_the_file_not_its_appledouble_member(self):
+        job, queued, _ = self.admit(upload("finder.zip", zip_bytes(
+            [("docs/", ""), ("docs/report.txt", "the real report"), ("__MACOSX/", ""),
+             ("__MACOSX/docs/", ""), ("__MACOSX/docs/._report.txt", self.APPLEDOUBLE)])))
+        self.assertEqual(queued, [("docs/report.txt", "finder.zip:docs/report.txt",
+                                   "the real report")])
+        self.assertEqual(job["files_total"], 1)
+        self.assertEqual(job["skipped"],
+                         [f"finder.zip:__MACOSX/docs/._report.txt {self.MACOS_SKIP}"])
+
+    def test_bare_dot_underscore_and_other_macosx_members_are_skipped(self):
+        # ditto and copies to non-Mac volumes write ._<name> beside the file;
+        # under __MACOSX/ the macOS reason wins over an unsupported suffix.
+        job, queued, _ = self.admit(upload("u.zip", zip_bytes(
+            [("notes.md", "notes"), ("._notes.md", self.APPLEDOUBLE),
+             ("a/._b.pdf", self.APPLEDOUBLE), ("__MACOSX/._tool.exe", self.APPLEDOUBLE),
+             ("__MACOSX/readme.txt", "x")])))
+        self.assertEqual(queued, [("notes.md", "u.zip:notes.md", "notes")])
+        self.assertEqual(job["skipped"], [
+            f"u.zip:._notes.md {self.MACOS_SKIP}", f"u.zip:a/._b.pdf {self.MACOS_SKIP}",
+            f"u.zip:__MACOSX/._tool.exe {self.MACOS_SKIP}",
+            f"u.zip:__MACOSX/readme.txt {self.MACOS_SKIP}"])
+
+    def test_names_that_only_look_like_macos_metadata_are_queued(self):
+        names = ["_report.txt", "notes._v2.txt", ".hidden.txt", "__MACOSX_notes.txt",
+                 "docs/__MACOSX.txt", "docs/__MACOSX/readme.txt", "__macosx/lower.txt"]
+        job, queued, _ = self.admit(upload("u.zip", zip_bytes([(n, n) for n in names])))
+        self.assertEqual(sorted(name for name, _, _ in queued), sorted(names))
+        self.assertEqual(job["skipped"], [])
+
+    def test_zip_of_only_macos_metadata_has_no_supported_files(self):
+        response = asyncio.run(ingest.ingest_upload(
+            collection="Coll", strategy="fixed", chunk_size="200", chunk_overlap="0",
+            similarity_threshold="0.85", min_chunk_size="0",
+            files=[upload("only.zip", zip_bytes([("__MACOSX/._r.txt", self.APPLEDOUBLE)]))]))
+        self.assertEqual(response.status_code, 400)
+        error = json.loads(response.body)["error"]
+        self.assertEqual(error["code"], "NO_SUPPORTED_FILES")
+        self.assertIn(f"only.zip:__MACOSX/._r.txt {self.MACOS_SKIP}", error["message"])
+
 
 class FakeCollection:
     """Chunks by name, with the replacement helpers' contract."""
