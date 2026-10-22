@@ -1503,6 +1503,11 @@ ingest default.
   they list has stored chunks (every file produced no chunks at ingest), so there
   is nothing to rebuild (#328). No job is created. The other `SOURCES_REQUIRED`
   refusals below still come through the job.
+- **409 `SOURCE_INDEX_INVALID`** from `/tune/rechunk`, and from `/tune/reembed`
+  with chunking fields, when the collection's retained source index is invalid
+  (#389). No job is created; repair the index before re-chunking. Re-embedding
+  without chunking fields and re-indexing don't read the retained sources, so
+  they still start.
 - **503 `SERVICE_UNAVAILABLE`** from those same requests when Weaviate can't be
   read for that check (#340). No job is created; try again when Weaviate is
   available. The cause is logged, not returned.
