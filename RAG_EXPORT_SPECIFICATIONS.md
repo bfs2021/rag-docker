@@ -113,7 +113,9 @@ anywhere in the UI.
 Collections ingested before this change have no source directory. They are not
 reconstructed. Their exports are `chunks-only` (§4.3) and the UI MUST label them
 as such wherever export is offered, so the lower fidelity is visible before the
-user ships the package, not after.
+user ships the package, not after. When the UI cannot read a collection's fidelity
+(`GET /tune/{collection}` fails), it MUST say the fidelity is unknown and why,
+never hide the label.
 
 ### 2.5 Disk
 

@@ -646,6 +646,10 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
+# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
+check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.

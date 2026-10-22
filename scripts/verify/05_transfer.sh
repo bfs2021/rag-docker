@@ -1060,6 +1060,9 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
+    # The build directory this export is writing; the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -1081,12 +1084,20 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
-    # The killed build's leftovers are the container's (root, mode 0700): remove
-    # only the build directories that appeared during this export.
-    builds_after=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
+    # The killed build's leftovers (root, mode 0700) are the startup sweep's to
+    # remove (#377): its build directory and any temporary archive must be gone,
+    # and the completed package from the top of this suite still there.
+    check "the interrupted export had a build directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
-    (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
+        if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
+      done; echo checked' sh $killed)
+    check "the restart removes the interrupted export's build directory and temporary archive" \
+      "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
+    check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
+      "$EXPORTS/$PKG is gone"
   fi
 
   # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
