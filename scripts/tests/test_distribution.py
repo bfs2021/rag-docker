@@ -36,12 +36,17 @@ PLANTED = {
     "ui/node_modules/react/index.js": "module", "api/__pycache__/main.cpython-312.pyc": "bytecode",
     "api/stray.pyc": "bytecode", "ui/dist/index.html": "built", "api/.venv/bin/python": "venv",
     "api/venv/bin/python": "venv", ".env": "SECRET=1", "api/.env": "SECRET=1",
-    "ui/.env.local": "SECRET=1", ".git/HEAD": "ref: refs/heads/develop",
+    "ui/.env.local": "SECRET=1",
     "ingest-inbox/report.txt": "corpus", "exports/ragpkg-corpus.tar.gz": "corpus",
 }
 PLANTED_ZIP = {"api/uploads/upload.txt": "upload", "old-build.zip": "archive"}
 PLANTED_TAR = {"old-bundle.tar": "archive", "offline/stale-images.tar.gz": "old"}
 # section 11.2 excludes `.env*`; a top-level `.env.<suffix>` is checked on its own (see below).
+# Planted files are untracked and gitignored, as in a real checkout: `git archive` must leave them out.
+# Git ignores the user's and the system's configuration, and takes its identity from the environment.
+GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+           "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid"}
 TOP_LEVEL_ENV = ".env.local"
 
 STUB_DOCKER = r"""#!/bin/bash
@@ -81,11 +86,6 @@ printf 'sleep %s\\n' "$*" >> "$STUB_LOG"
 """
 
 
-def bsd_tar():
-    out = subprocess.run(["tar", "--version"], capture_output=True, text=True)
-    return "bsdtar" in out.stdout
-
-
 def offline_images():
     """The IMAGES array of package-offline.sh, as written."""
     text = (ROOT / "package-offline.sh").read_text()
@@ -112,7 +112,7 @@ class Workspace(unittest.TestCase):
         for name, text in (("docker", STUB_DOCKER), ("sleep", STUB_SLEEP)):
             (stub / name).write_text(text)
             (stub / name).chmod(0o755)
-        self.env = dict(os.environ, PATH=f"{stub}:{os.environ['PATH']}",
+        self.env = dict(os.environ, **GIT_ENV, PATH=f"{stub}:{os.environ['PATH']}",
                         STUB_LOG=str(self.log), STUB_MODELS=str(self.temp / "models"))
 
     def calls(self):
@@ -123,11 +123,22 @@ class Workspace(unittest.TestCase):
         if files is None:
             self.skipTest("needs a git checkout")
         tree = self.temp / "src"
+        tree.mkdir()
         for name in files:
             target = tree / name
             target.parent.mkdir(parents=True, exist_ok=True)
             if (ROOT / name).is_file():
                 shutil.copy2(ROOT / name, target)
+        # package.sh and package-offline.sh run `git archive HEAD`: make the copy a repository
+        # with the tracked files committed, then plant the excluded files (untracked) on top.
+        git = dict(os.environ, **GIT_ENV)
+        listed = "\0".join(name for name in files if (ROOT / name).is_file()) + "\0"
+        for args, data in ((["init", "-q", "--template="], None),
+                           (["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], listed),
+                           (["commit", "-q", "-m", "tracked files"], None)):
+            done = subprocess.run(["git", "-C", str(tree), *args], input=data, text=True,
+                                  capture_output=True, env=git)
+            self.assertEqual(done.returncode, 0, done.stderr)
         for name, text in planted.items():
             (tree / name).parent.mkdir(parents=True, exist_ok=True)
             (tree / name).write_text(text)
@@ -168,9 +179,6 @@ class PackageTests(Workspace):
         names, files = self.build(planted)
         self.assert_contents(names, files, "", planted)
 
-    # Found by #387 and reported: package.sh's `*/.env.*` pattern needs a folder before it,
-    # so a top-level `.env.local` ships, though section 11.2 excludes `.env*`.
-    @unittest.expectedFailure
     def test_a_top_level_env_file_is_excluded(self):
         names, _files = self.build({TOP_LEVEL_ENV: "SECRET=1"})
         self.assertNotIn(TOP_LEVEL_ENV, names)
@@ -212,18 +220,12 @@ class OfflinePackageTests(Workspace):
         self.assertIn("rag-docker_ollama_models:/models:ro", run)
         self.assertIn("ollama/ollama:0.3.14", run)
 
-    # Found by #387 and reported: with a BSD tar (macOS, where the bundle is built) the
-    # `*/.env.*` exclusion does not match a top-level `.env.local`, though section 11.2 excludes `.env*`.
     def test_a_top_level_env_file_is_excluded(self):
         result, out, _files = self.build({TOP_LEVEL_ENV: "SECRET=1"})
         self.assertEqual(result.returncode, 0, result.stderr)
         with tarfile.open(out) as bundle:
             names = bundle.getnames()
         self.assertNotIn("rag-docker/" + TOP_LEVEL_ENV, names)
-
-    if bsd_tar():
-        test_a_top_level_env_file_is_excluded = unittest.expectedFailure(
-            test_a_top_level_env_file_is_excluded)
 
     def test_a_missing_image_stops_before_anything_is_saved(self):
         result, out, _files = self.build({}, STUB_MISSING_IMAGES="nginx:1.29-alpine")
