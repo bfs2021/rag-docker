@@ -327,6 +327,17 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
+The registry is written atomically (#388): each create or delete writes the whole registry to a
+uniquely named temporary file in the same folder, fsyncs it and replaces
+`collection_registry.json` with it, under one lock in the API process, so a crash or a failed
+write (for example on a full `ingest_uploads` volume) leaves the old file whole. The file is
+owner-only (mode 0600). A registry that exists but can't be read (it can't be opened, isn't
+UTF-8 JSON, or isn't a JSON object) is never treated as empty: it is left unchanged and logged.
+`GET /collections` then answers with `created_at` `null` for every collection, and
+`POST /collections` and `DELETE /collections/{name}` still create or delete the collection and
+answer as usual, without recording or removing its entry, until the file is fixed or removed.
+A missing file is an empty registry.
+
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to list the collections
 (unreachable, timed out or any other error) (#373): "Cannot list the collections: Weaviate
 could not be read. Try again when Weaviate is available." `detail` is `null`. The cause is
@@ -820,6 +831,20 @@ When `include_citations` is `true`:
 }
 ```
 
+A citation's `score` is higher-is-better in every retrieval mode (#376). Citations are listed in
+retrieval order, best match first, so their scores don't increase down the list.
+
+| Mode | `score` |
+|---|---|
+| `hnsw`, `flat`, `semantic` | A similarity converted from Weaviate's distance by the collection's distance metric: `cosine`: `1 - distance` (the cosine similarity, -1 to 1); `dot`: `-distance` (the dot product); `l2-squared`: `1 / (1 + distance)` (0 to 1). |
+| `hybrid` | Weaviate's fusion score, unchanged. |
+
+The metric is read from Weaviate on every query, so a collection deleted and recreated with
+another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
+(or no hybrid score), or when the collection's metric can't be read or isn't one of the three
+above; it is never replaced by 0.0. Non-null scores are rounded to 4 decimals. Scores rank the
+chunks of one answer; they aren't comparable across modes or metrics.
+
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
@@ -1023,7 +1048,7 @@ Updates the status or edited content of one pair. Called by the UI when the user
 }
 ```
 
-`status` must be one of `"approved"`, `"edited"`, `"rejected"`, `"pending"`. Providing `question`, `answer`, or `ground_truth` fields without setting `status: "edited"` is a 422 error. All text fields are optional — only provided fields are updated.
+`status` must be one of `"approved"`, `"edited"`, `"rejected"`, `"pending"`. Providing `question`, `answer`, or `ground_truth` fields without setting `status: "edited"` is a 422 error. A provided `question`, `answer` or `ground_truth` must contain text: an empty or whitespace-only value is refused with 422 `INVALID_PARAMETER`, since `save` would export it as an empty RAGAS field. Other values are stored as sent. All text fields are optional — only provided fields are updated. The body is validated before the session is looked up.
 
 **Response 200:** Returns the updated pair object.
 
@@ -1055,7 +1080,7 @@ Regenerates one specific pair. Preserves all other pairs in the session.
 
 **Response 200:** Returns the single regenerated pair object (same schema as above). The regenerated pair's `status` is reset to `"pending"`.
 
-**Response 404** if the session or pair ID does not exist (same error format as PATCH above).
+**Response 404** if the session or pair ID does not exist (same error format as PATCH above): `SESSION_NOT_FOUND` for an unknown session, `PAIR_NOT_FOUND` for an unknown pair in an existing session. Neither calls the model.
 
 **Response 409** (`SESSION_BUSY`) if called while the session's `status` is still `"generating"`.
 
@@ -1478,6 +1503,11 @@ ingest default.
   they list has stored chunks (every file produced no chunks at ingest), so there
   is nothing to rebuild (#328). No job is created. The other `SOURCES_REQUIRED`
   refusals below still come through the job.
+- **409 `SOURCE_INDEX_INVALID`** from `/tune/rechunk`, and from `/tune/reembed`
+  with chunking fields, when the collection's retained source index is invalid
+  (#389). No job is created; repair the index before re-chunking. Re-embedding
+  without chunking fields and re-indexing don't read the retained sources, so
+  they still start.
 - **503 `SERVICE_UNAVAILABLE`** from those same requests when Weaviate can't be
   read for that check (#340). No job is created; try again when Weaviate is
   available. The cause is logged, not returned.
@@ -1859,11 +1889,11 @@ Visible on all pages post-role-selection. Contents vary by role:
 
 **Elements:**
 
-- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection.
+- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Question text input (multi-line, submit via "Ask" button or Ctrl+Enter; plain Enter inserts a newline).
 - Citations toggle (checkbox, off by default, labeled "Show source citations").
 - Answer display area (markdown-rendered).
-- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score, excerpt.
+- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score (higher is better, 3 decimals; `n/a` when the API returns `null`, #376), excerpt.
 - Latency display (small, below answer): `Retrieved in Xms · Generated in Xms`.
 - Retrieval mode selector — visible to Engineer and Developer roles only. Hidden for End User. Read-only: it displays the mode saved for the selected collection, which is changed on the Retrieval Config page. The settings are fetched from `GET /retrieval/config/{collection}` whenever the selected collection changes; if nothing is saved for that collection the API returns the defaults (`hnsw`, `top_k: 5`).
 
@@ -1896,7 +1926,7 @@ settings, regardless of when a prior collection's save completes.
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
 - File list showing queued files with remove buttons.
-- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest.
+- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list.
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
@@ -1988,7 +2018,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Roles:** Engineer, Developer
 
 **Phase 1 — Generate:**
-- Collection selector.
+- Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Sample size input (1–100, default 20).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
 - Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review table as they complete (partial display during generation).
@@ -2016,8 +2046,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/collections`  
 **Roles:** Engineer only
 
-- Table of collections: name, object count, index type, distance metric, created date.
+- Table of collections: name, object count, index type, distance metric, created date. If the list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, and keeps any rows already shown; the next successful load (after a create or delete) clears it (#379).
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
+- A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
@@ -2044,18 +2075,25 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Collection selector (from `GET /collections`).
 - **Fidelity shown before the export runs**, from `GET /tune/{collection}`:
   `with-sources` with the document count, or `chunks-only` with what that costs.
-  The choice is informed rather than discovered afterwards in the manifest.
+  The choice is informed rather than discovered afterwards in the manifest. The
+  line is never hidden: it reads "Fidelity: reading…" while the lookup runs, and
+  "Fidelity: unknown — it could not be read:" with the reason when the lookup
+  fails (409 `SOURCE_INDEX_INVALID`, 503, 404 or a proxy error). It always belongs
+  to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
 - Progress while the job runs, then the filename, size, fidelity, whether models
   were bundled and whether `retrieve.py` was generated. Warnings from the job are
-  shown in full.
+  shown in full. A failed export shows its `error_code` (for example
+  `EMBEDDING_MISMATCH`) before the error, as the import half does.
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
   chunk count, fidelity and size. Unreadable files are listed too, marked as
-  such, so nothing silently disappears.
+  such, so nothing silently disappears. A failed `GET /packages` shows "Could not
+  list the packages in ./exports:" with the reason, instead of the empty-folder
+  hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
   consequence spelled out. There is no default in the API, and the page makes the
   difference explicit because the wrong choice can delete a collection.
@@ -2064,7 +2102,14 @@ A retained session can be loaded/refreshed by its session ID, including when its
   sessions restored).
 
 Both halves poll their job endpoint every 2s and stop polling when the job
-finishes or the page unmounts.
+finishes or the page unmounts; a poll in flight at unmount, or a start answered
+after it, schedules nothing. A failed poll is shown ("Could not check the
+export's progress, retrying:" with the reason) and retried at the same interval,
+with the button still busy; the next good poll clears the message. After 30
+failed polls in a row (about a minute, enough for an API restart) the half stops
+watching the job, says so with the last error and that the job may still be
+running, and enables its button again, so the page never stays stuck until a
+reload (#382).
 
 ### 7.11 Transfer Help Page
 
@@ -2471,6 +2516,12 @@ now lives once, in `api/services/ingest_config.py`.
       *hnsw, flat, hybrid and semantic each returned chunks and an answer.*
 - [x] `include_citations: true` returns citation objects with source_file and score.
       *Each citation carries source_file, chunk_index, score and excerpt.*
+- [x] A citation's score is higher-is-better in every mode, and `null` when missing (#376).
+      *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
+      dot and l2-squared collections give the documented similarities of known vectors, and a
+      collection recreated with another metric is converted by the new one. Controlled tests
+      cover a missing distance or hybrid score (`null`) and an unknown metric; the Q&A page shows
+      `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
@@ -2526,6 +2577,9 @@ now lives once, in `api/services/ingest_config.py`.
       status still read "pending" — an export could ship text nobody approved
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
+- [x] PATCH and regenerate answer 404 `SESSION_NOT_FOUND` for an unknown session and 404 `PAIR_NOT_FOUND` for an unknown pair in an existing session. PATCH refuses an empty or whitespace-only `question`, `answer` or `ground_truth` with 422 `INVALID_PARAMETER` and leaves the pair unchanged.
+      *Evidence: `04_goldstandard.sh` runs `scripts/tests/test_goldstandard_review.py` (all four 404 cases, nothing written and no model call; the empty-field refusal for each field, before the session lookup; accepted-edit controls) and checks the unknown-session codes through the proxy, and in the LLM section the unknown-pair code and an empty question on a generated pair.*
+      *Originally an unknown session answered `PAIR_NOT_FOUND` on both endpoints, and an empty edit was stored and exported as an empty RAGAS field (#381).*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`). Startup settles interrupted generations as failed, preserving completed pairs, counters and validity metadata; ordinary scans leave active generation alone.
       *Evidence: `session_persistence_cases.py` covers fresh-process settlement, mixed completed/interrupted sessions with edits and stale/orphan metadata, worker refusal without cache/file mutation, plain reason persisted without a false storage error, successful regeneration and on-disk retry after write failure. `04_goldstandard.sh` includes a guarded disposable API hard-stop and regeneration check when a retained pair is available.*
 - [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
@@ -2606,6 +2660,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
       for a missing model and an unreachable Ollama or Weaviate.*
+- [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, and shows a failed package list (#382).
+      *Evidence: `scripts/verify/browser/transfer_page.js` (suite 06, through `ui_criteria.js`)
+      stubs every API call in the browser: proxy 502s while polling either half, a poll in
+      flight and an export start answered after the page is left, 409, 503 and 404 from
+      `/tune`, a late fidelity answer for another collection, an `EMBEDDING_MISMATCH` export
+      and a 500 from `/packages`. 13 of its 14 checks fail on the code before #382.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
@@ -2615,6 +2675,18 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       with a synthetic `409 COLLECTION_BUSY` by request interception, so no collection is
       touched, and checks one `DELETE` was sent, the alert inside the dialog, the row and
       the cleared message after Cancel.*
+- [x] A refused collection create is shown inside the New Collection modal on the Collections page and in the Import page's "+ New" modal: the modal stays open with the API's message as an alert, and Cancel or a successful create clears it (#379).
+      *Before, the error went to the page-level line behind the modal's overlay. `ui_criteria.js`
+      answers the `POST /collections` with a synthetic `409 COLLECTION_EXISTS`, then a `201`, by
+      request interception, so no collection is created, and checks one `POST`, the alert inside
+      the open modal, and no alert after Cancel or a success. On the Import page, a create whose
+      list reload fails closes the modal and shows a failed list. The checks fail on the code
+      before #379.*
+- [x] A failed collection list is shown as an alert, "Could not load the collections:" with the reason, on the Collections, Import, Q&A and Gold Standard pages (#379).
+      *Before, the error was swallowed, so an outage looked like "no collections". `ui_criteria.js`
+      answers `GET /collections` with a synthetic `503` on each page, and checks the Collections
+      page clears the message on its next successful load. The checks fail on the code before
+      #379.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
@@ -2644,6 +2716,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *10 collections with identical object counts.*
 - [x] `collection_registry.json` and `ingest_configs/` persist across restarts; `GET /collections` reflects correct `created_at` after restart.
       *`created_at`, index type and distance metric all preserved.*
+- [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
+      *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
@@ -2692,9 +2766,14 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
 
-Both archives MUST exclude `.DS_Store`, `node_modules/`, `__pycache__/`,
-`dist/`, `.env*` and previous archives. Neither carries the Weaviate index or
-uploaded files; those are created empty on first start.
+Both archives MUST hold exactly the files git tracks in the current commit
+(`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
+not `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, `.env*`, `*.tar`,
+`offline/`, previous archives, `.claude/` or `dev-docs/`, nor the contents of
+`ingest-inbox/` and `exports/` (their tracked `.gitkeep` keeps the directories).
+Uncommitted changes are not included. Both scripts MUST refuse to run unless
+their directory is the top level of a git checkout (#384). Neither carries the
+Weaviate index or uploaded files; those are created empty on first start.
 
 ### 11.3 Offline bundle contents
 
@@ -2702,7 +2781,7 @@ uploaded files; those are created empty on first start.
 
 ```
 rag-docker/
-├── <the full source tree>
+├── <the files git tracks in HEAD, as package.sh>
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)

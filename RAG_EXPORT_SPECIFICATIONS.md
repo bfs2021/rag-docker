@@ -83,8 +83,10 @@ filesystem path. If an indexed blob is missing on disk, export warns and omits
 that entry from the shipped index; the package remains importable with its
 available sources and chunks. Existing valid indexes keep their original fidelity.
 An invalid on-disk index makes tuning options return a typed 409
-`SOURCE_INDEX_INVALID`; re-embedding from stored chunks and re-indexing do not
-need to read retained sources. A failed retention write after chunk storage does
+`SOURCE_INDEX_INVALID`, and re-chunking (or re-embedding with chunking
+parameters) is refused with the same 409 before any job is created (#389);
+re-embedding from stored chunks and re-indexing do not need to read retained
+sources. A failed retention write after chunk storage does
 not misreport the ingested file as failed.
 
 Retained-source import restores only blobs named by the validated index. Unindexed
@@ -111,7 +113,9 @@ anywhere in the UI.
 Collections ingested before this change have no source directory. They are not
 reconstructed. Their exports are `chunks-only` (§4.3) and the UI MUST label them
 as such wherever export is offered, so the lower fidelity is visible before the
-user ships the package, not after.
+user ships the package, not after. When the UI cannot read a collection's fidelity
+(`GET /tune/{collection}` fails), it MUST say the fidelity is unknown and why,
+never hide the label.
 
 ### 2.5 Disk
 
@@ -766,7 +770,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
-| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Reindex and re-embed from stored chunks remain available. |
+| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Answered by the tuning options, and by a re-chunk or a re-embed with chunking parameters before any job is created (#389). Reindex and re-embed from stored chunks remain available. |
 | `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
 | `INTERRUPTED` | the API restarted while the export, import or tune job was queued or running; start it again (#23) |
 
@@ -816,7 +820,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight |
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` and its `chunks_written` kept; an import interrupted by the restart answers the same (#309); tune likewise, by `test_jobstore.py` |
 | E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
