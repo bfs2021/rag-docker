@@ -344,6 +344,43 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
         self.assertNotIn('@@', readme)
 
+    def test_failure_text_does_not_promise_an_intact_original(self):
+        # #385: a replace failure after the delete, or a tune failure during the
+        # final replacement, can leave the name missing; the data is in the
+        # recovery collection the error names (recovered_as).
+        help_page = packager.render_help(1024)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        for name, text in (('help page', help_page), ('package README', readme)):
+            with self.subTest(name=name):
+                self.assertNotIn('leaves the original intact', text)
+                self.assertNotIn('leaves it intact', text)
+                self.assertNotIn('a failed tune leaves', text)
+                self.assertIn('recovery collection', text)
+        replace_row = next(line for line in help_page.splitlines() if line.startswith('| `replace`'))
+        self.assertIn('recovered_as', replace_row)
+        self.assertIn('missing or partial', replace_row)
+        tuning = help_page.split('## Tuning after import', 1)[1].split('**Gold-standard', 1)[0]
+        self.assertIn('before cutover', tuning)
+        self.assertIn('recovered_as', tuning)
+
+    def test_transfer_page_replace_description_names_the_recovery_collection(self):
+        root = Path(os.environ.get('RAG_TEST_API_DIR') or '.').resolve().parent  # repo root on the host
+        page = root / 'ui' / 'src' / 'pages' / 'TransferPage.tsx'
+        if not page.is_file():  # the api container has no ui/ tree
+            self.skipTest('ui source not mounted')
+        line = next(l for l in page.read_text(encoding='utf-8').splitlines() if "id: 'replace'" in l)
+        self.assertNotIn('leaves it intact', line)
+        self.assertIn('recovery collection', line)
+
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
             if value is None:  # None denotes no saved file, not an invalid saved config.

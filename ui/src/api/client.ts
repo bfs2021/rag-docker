@@ -41,8 +41,9 @@ function isHealthResult(data: any): data is HealthResult {
 
 // GET /health answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
-// service failed and could not show it red (#375). This call accepts a 503
-// that carries that body; every other error is thrown as request() would.
+// service failed and could not show it red (#375). This call accepts a 200 or
+// a 503 that carries that body; every other error is thrown as request() would,
+// and a 200 without it is unreadable (#415).
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
@@ -58,8 +59,9 @@ async function getHealthResult(): Promise<HealthResult> {
   if (!res.ok) {
     throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
   }
-  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
-  return data as HealthResult
+  // Another JSON shape, text or an empty body: the page would throw while
+  // rendering the cards, or show nothing at all (#415).
+  throw new Error('The server sent a response the UI could not read.')
 }
 
 export const api = {
