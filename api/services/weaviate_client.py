@@ -454,11 +454,39 @@ async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
     await asyncio.to_thread(_insert_chunks_sync, collection_name, chunks)
 
 
+# A citation's score is higher-is-better in every retrieval mode (#376), so the
+# distance-based modes turn Weaviate's distance into a similarity by the
+# collection's distance metric.
+_SIMILARITY = {
+    VectorDistances.COSINE: lambda d: 1 - d,            # cosine similarity, -1 to 1
+    VectorDistances.DOT: lambda d: -d,                  # the dot product itself
+    VectorDistances.L2_SQUARED: lambda d: 1 / (1 + d),  # 0 to 1
+}
+
+
+def _distance_to_score(coll):
+    """The distance-to-score conversion for this collection's metric.
+
+    The metric is read on every query, not cached, so a collection deleted and
+    recreated with another metric is converted by its new one. A missing
+    distance, or a metric that can't be read or has no conversion, gives None.
+    """
+    vector_config = coll.config.get().vector_index_config
+    convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
+
+    def to_score(distance: float | None) -> float | None:
+        if convert is None or distance is None:
+            return None
+        return convert(distance)
+    return to_score
+
+
 def _near_vector_query_sync(
     collection_name: str, vector: list[float], top_k: int
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_vector(
         near_vector=vector,
         limit=top_k,
@@ -467,12 +495,11 @@ def _near_vector_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -488,6 +515,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_text(
         query=query,
         limit=top_k,
@@ -496,12 +524,11 @@ def _near_text_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -530,7 +557,8 @@ def _hybrid_query_sync(
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": obj.metadata.score or 0.0,
+            # Weaviate's fusion score, higher is better; missing reads as None (#376).
+            "score": obj.metadata.score,
         })
     return rows
 
