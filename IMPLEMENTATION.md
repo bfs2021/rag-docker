@@ -11240,8 +11240,9 @@ function isHealthResult(data: any): data is HealthResult {
 
 // GET /health answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
-// service failed and could not show it red (#375). This call accepts a 503
-// that carries that body; every other error is thrown as request() would.
+// service failed and could not show it red (#375). This call accepts a 200 or
+// a 503 that carries that body; every other error is thrown as request() would,
+// and a 200 without it is unreadable (#415).
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
@@ -11257,8 +11258,9 @@ async function getHealthResult(): Promise<HealthResult> {
   if (!res.ok) {
     throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
   }
-  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
-  return data as HealthResult
+  // Another JSON shape, text or an empty body: the page would throw while
+  // rendering the cards, or show nothing at all (#415).
+  throw new Error('The server sent a response the UI could not read.')
 }
 
 export const api = {
@@ -13304,6 +13306,11 @@ export default function HealthPage() {
 
   const [diagnosticPending, setDiagnosticPending] = useState(true)
   const diagnosticTicket = useRef(0)
+  // Each load is numbered; a result is shown only if no later load's result
+  // already is, so a slow older response can't replace a newer one (#415).
+  const loadCount = useRef(0)
+  const healthShown = useRef(0)
+  const metricsShown = useRef(0)
 
   function load() {
     const ticket = ++diagnosticTicket.current
@@ -13319,12 +13326,18 @@ export default function HealthPage() {
     })
     // Health and metrics load separately: a degraded or unreachable API must not
     // stop the latency charts, and no stale green cards stay up (#375).
+    const n = ++loadCount.current
     api.getHealth().then(h => {
-      setHealth(h); setHealthError(null)
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(h); setHealthError(null)
     }).catch(e => {
-      setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
     })
-    api.getMetrics().then(setMetrics).catch(() => { /* keep the last metrics shown */ })
+    api.getMetrics().then(m => {
+      if (n < metricsShown.current) return
+      metricsShown.current = n; setMetrics(m)
+    }).catch(() => { /* keep the last metrics shown */ })
   }
 
   useEffect(() => {
@@ -13575,7 +13588,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing.
 
@@ -13977,8 +13990,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
+| `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
@@ -14029,7 +14045,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -14142,6 +14158,20 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Health page refresh checks
+
+`browser/health_page.js` (#415), registered in `06_ui.sh` through `ui_criteria.js`,
+stubs every API call the Health page makes and holds each health and metrics answer
+until the check releases it, driving each refresh through the captured 30 s timer. Ten
+cases cover a failed metrics call (an API error, and no answer) keeping the charts last
+shown; a 200 without a health body (JSON of another shape, an empty body, text) and a 503
+carrying the API's error envelope, each shown as "Service health could not be read:" with
+no cards; and late responses from an older refresh, which never replace a newer health
+result (success or failure) or newer charts, while a late metrics result after a newer
+failed one is still shown. Every case also fails on a React page error. These fixtures
+make no backend calls; like the other modules, the file runs standalone with
+`RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
@@ -14239,8 +14269,10 @@ Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends 
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
-`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
-names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+`error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
+together (all three `error`), each with its latency, model names and `resources`; and 200
+`ok` when everything is up, also with memory below the recommendation or unreadable
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
 stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
@@ -14258,6 +14290,39 @@ JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logge
 200 with `created_at` `null`, with updates resuming once the file is readable again. It also
 checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
 the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
+
+Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
+runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
+temporary folder: an upload with no supported file answers 400 `NO_SUPPORTED_FILES` with the
+exact message listing a direct file and a ZIP member it skipped, and leaves no job, staging
+folder or registration; an unknown ingest job answers 404 `JOB_NOT_FOUND`; a `/query` body
+with only `question` and `collection` reaches the pipeline with the defaults (`hnsw`, `top_k`
+5, `alpha` 0.75, no citations, `end_user`), and through the real pipeline runs a top-5 vector
+search with the end-user prompt; the reformulation, end-user and engineer prompts and their
+`[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
+successful query records one metric; a saved retrieval config missing newer keys is filled
+from the defaults, and one that isn't JSON or can't be read gives the defaults with
+`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
+instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+checked for its statistics against hand-worked percentiles, its exact-match `collection` and
+`retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
+Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
+`/proc/meminfo` reports memory `unknown` with a note while `/health` stays 200. On the host,
+`scripts/tests/test_ollama_entrypoint.py` runs `ollama/entrypoint.sh` with stub `ollama`,
+`timeout` and `sleep` commands: models already listed are not pulled, a missing one is pulled
+as `timeout 7200 ollama pull`, a failed or timed-out pull is retried after 15 s, and the fifth
+failure exits 1 with its error. Then, on the verify stack: the upload and job errors through
+the proxy; a new collection's schema has BM25 off for `source_file`, `source_type` and
+`chunk_strategy` and refuses an insert with an undeclared property; the running proxy's
+loaded configuration (`nginx -T`) reads `/api/` for 300 s and connects for 10 s; the metrics
+route's shape, `history_limit=0` and the 422. Unless `RAG_SKIP_SLOW=1`, a query with the
+defaults on a text of more than five chunks retrieves 5 chunks without citations and records
+one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
+and that metric read back unchanged after the API restarts, and then a first start: `down -v`
+(the model copy is external and kept) and `up -d --wait` must bring every service healthy
+within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
+SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
+internet. It removes the verify project's data, so it runs last in suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -16206,8 +16271,228 @@ finally:
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
 
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
+
 drop_collection "$C"
 cleanup_prefixed
+summary
+```
+
+### scripts/verify/16_api_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Ingest, query, metrics and health API paths no other check covers (#399).
+#
+# Run by 01_infrastructure.sh, after its own checks: the opt-in first-start check
+# at the end removes the verify project's volumes. The query checks need an LLM
+# (skipped with RAG_SKIP_SLOW=1); the restart and first-start checks are opt-in
+# (RAG_ALLOW_RESTART=1) and never reach the live rag-docker project.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+C="${PREFIX}ApiPaths"
+
+RAG_PATHS_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-paths.XXXXXX") || exit 2
+export RAG_PATHS_TMP
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_PATHS_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
+
+section "API paths: controlled (#399)"
+# Through the app with Weaviate and Ollama mocked, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_api_paths.py)
+check "ingest, query, retrieval-config, metrics and health paths through the app" $?
+python3 "$REPO_ROOT/scripts/tests/test_ollama_entrypoint.py"
+check "the Ollama entrypoint skips present models, pulls under a timeout and retries" $?
+
+section "API paths: ingest errors and schema rules"
+drop_collection "$C"; make_collection "$C"
+printf 'not a supported type\n' > "$RAG_PATHS_TMP/notes.xyz"
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/unsupported.json" -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "files=@$RAG_PATHS_TMP/notes.xyz")
+check_eq "an upload with no supported file answers 400" "$code" "400"
+check_eq "it carries NO_SUPPORTED_FILES" "$(jfield "['error']['code']" < "$RAG_PATHS_TMP/unsupported.json")" "NO_SUPPORTED_FILES"
+check_eq "its message lists what was skipped" "$(jfield "['error']['message']" < "$RAG_PATHS_TMP/unsupported.json")" \
+  "No supported files found in upload. Skipped: notes.xyz (unsupported type '.xyz')"
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/nojob.json" -w '%{http_code}' "$API/ingest/job/vfy-no-such-job")
+check_eq "an unknown ingest job answers 404" "$code" "404"
+check_eq "it carries JOB_NOT_FOUND and names the job" \
+  "$(jfield "['error']['code'] + ' ' + d['error']['message']" < "$RAG_PATHS_TMP/nojob.json")" \
+  "JOB_NOT_FOUND Job 'vfy-no-such-job' not found."
+
+# The schema as Weaviate holds it, and an insert carrying a property it doesn't declare.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+client = wc.get_client()
+try:
+    collection = client.collections.get(name)
+    properties = {p.name: p for p in collection.config.get().properties}
+    out = {"searchable": {n: properties[n].index_searchable
+                          for n in ("content", "source_file", "source_type", "chunk_strategy")}}
+    try:
+        collection.data.insert(properties={"content": "undeclared property check",
+                                           "undeclared_prop": "x"},
+                               vector=[0.01] * 768)
+        out["insert"] = "accepted"
+    except Exception as exc:                          # noqa: BLE001
+        out["insert"] = "refused"
+    out["declared"] = "undeclared_prop" in {p.name for p in collection.config.get().properties}
+    out["objects"] = collection.aggregate.over_all(total_count=True).total_count
+    print(json.dumps(out))
+finally:
+    wc.close_client()
+ENDPY
+) > "$RAG_PATHS_TMP/schema.json"
+check_eq "BM25 is off for source_file, source_type and chunk_strategy, on for content" \
+  "$(jfield "['searchable']" < "$RAG_PATHS_TMP/schema.json")" \
+  "{'content': True, 'source_file': False, 'source_type': False, 'chunk_strategy': False}"
+check_eq "an insert with an undeclared property is refused, adding no property or object" \
+  "$(jfield "['insert'] + ' ' + str(d['declared']) + ' ' + str(d['objects'])" < "$RAG_PATHS_TMP/schema.json")" \
+  "refused False 0"
+
+section "API paths: proxy timeout and metrics route"
+# The configuration the running proxy loaded, not only the file.
+(cd "$REPO_ROOT" && docker compose exec -T proxy nginx -T 2>/dev/null) > "$RAG_PATHS_TMP/nginx.txt"
+python3 - "$RAG_PATHS_TMP/nginx.txt" <<'ENDPY'
+import re, sys
+text = open(sys.argv[1]).read()
+start = text.index("location /api/ {")
+block = text[start:text.index("}", start)]
+ok = (re.search(r"^\s*proxy_read_timeout\s+300s;", block, re.M)
+      and re.search(r"^\s*proxy_connect_timeout\s+10s;", block, re.M))
+sys.exit(0 if ok else 1)
+ENDPY
+check "the proxy's /api/ location reads for 300 s and connects for 10 s" $?
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency.json" -w '%{http_code}' "$API/metrics/latency?history_limit=0")
+check_eq "GET /metrics/latency answers 200" "$code" "200"
+python3 - "$RAG_PATHS_TMP/latency.json" <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+stats = ("p50", "p95", "p99", "mean", "count")
+ok = (set(d) == {"total_records", "retrieval_latency", "llm_latency", "total_latency", "history"}
+      and all(set(d[k]) == set(stats) for k in ("retrieval_latency", "llm_latency", "total_latency"))
+      and d["history"] == [])
+sys.exit(0 if ok else 1)
+ENDPY
+check "it reports the three latency summaries, and history_limit=0 an empty history" $?
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency501.json" -w '%{http_code}' "$API/metrics/latency?history_limit=501")
+check_eq "history_limit above 500 answers 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < "$RAG_PATHS_TMP/latency501.json")" "422 INVALID_PARAMETER"
+
+section "API paths: a query with the defaults (LLM)"
+queried=0
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "a default query and its metric" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  python3 - "$RAG_PATHS_TMP/overtime.txt" <<'ENDPY'
+import sys
+topics = ["overtime approval", "holiday requests", "expense claims", "travel booking",
+          "remote work", "sick leave", "training budgets", "equipment loans",
+          "parking permits", "visitor badges", "parental leave", "jury duty"]
+with open(sys.argv[1], "w") as f:
+    for t in topics:
+        f.write(f"The policy on {t} says a manager must approve every request about {t} "
+                f"before the end of the month, and the HR team records the decision.\n\n")
+ENDPY
+  _rag_require_lock_owner
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$RAG_PATHS_TMP/overtime.txt" > "$RAG_PATHS_TMP/ingest.json"
+  job=$(jfield "['job_id']" < "$RAG_PATHS_TMP/ingest.json")
+  check_eq "a text of more than five chunks is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+  api_post "/query" "{\"question\":\"who approves overtime?\",\"collection\":\"$C\"}" > "$RAG_PATHS_TMP/answer.json"
+  check_eq "a query with only question and collection retrieves the default 5 chunks, without citations" \
+    "$(jfield "['chunks_retrieved'], d['citations'], bool(d['answer'].strip())" < "$RAG_PATHS_TMP/answer.json")" \
+    "5 None True"
+  api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/latency_c.json"
+  python3 - "$RAG_PATHS_TMP/latency_c.json" "$RAG_PATHS_TMP/answer.json" <<'ENDPY'
+import json, sys
+d, a = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+h = d["history"]
+ok = (d["total_records"] == 1 and len(h) == 1 and h[0]["retrieval_mode"] == "hnsw"
+      and h[0]["retrieval_ms"] == a["retrieval_latency_ms"] and h[0]["llm_ms"] == a["llm_latency_ms"]
+      and h[0]["total_ms"] == a["retrieval_latency_ms"] + a["llm_latency_ms"])
+sys.exit(0 if ok else 1)
+ENDPY
+  check "the query recorded one hnsw metric with its latencies" $? "$(cat "$RAG_PATHS_TMP/latency_c.json")"
+  queried=1
+fi
+
+section "API paths: restart and first start (opt-in)"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "retrieval settings and metrics across a restart, and the first start" "set RAG_ALLOW_RESTART=1 to include them"
+elif [ -n "$restart_refusal" ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_refusal"
+elif [ "$restart_limit_ok" != 0 ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_limit"
+else
+  project="$COMPOSE_PROJECT_NAME"
+  saved="{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.3,\"ef\":null,\"response_format\":\"engineer\"}"
+  api_post "/retrieval/config" "$saved" > /dev/null
+  api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_before.json"
+  [ "$queried" = 1 ] && api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_before.json"
+  started=$(python3 -c "import time;print(time.time())")
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  if [ -z "$elapsed" ]; then
+    check "the API is healthy again after the restart" 1 "not healthy after $((restart_limit * 2))s"
+  else
+    api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_after.json"
+    python3 - "$RAG_PATHS_TMP/retrieval_before.json" "$RAG_PATHS_TMP/retrieval_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+want = {"retrieval_mode": "hybrid", "top_k": 7, "alpha": 0.3, "ef": None,
+        "response_format": "engineer", "is_default": False}
+ok = all(before.get(k) == v for k, v in want.items()) and after == before
+sys.exit(0 if ok else 1)
+ENDPY
+    check "saved retrieval settings survive an API restart" $? "$(cat "$RAG_PATHS_TMP/retrieval_after.json")"
+    if [ "$queried" = 1 ]; then
+      api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_after.json"
+      python3 - "$RAG_PATHS_TMP/metrics_before.json" "$RAG_PATHS_TMP/metrics_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+sys.exit(0 if before["total_records"] == 1 and after["history"] == before["history"] else 1)
+ENDPY
+      check "the query's metric survives an API restart" $? "$(cat "$RAG_PATHS_TMP/metrics_after.json")"
+    else
+      skip "the query's metric across a restart" "set RAG_SKIP_SLOW=0 to include model calls"
+    fi
+
+    # First start: no volumes but the model copy, which is external and kept by
+    # `down -v`. The model pull isn't timed: the verify project copies the models.
+    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+    up_ok=$?
+    took=$(python3 -c "import time;print(int(time.time()-$started))")
+    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+    # It started from nothing: the collection made above is gone with its volume.
+    check_eq "that first start began with no collections" \
+      "$(api_get "/collections" | jfield "['collections']")" "[]"
+  fi
+fi
+
+drop_collection "$C"
 summary
 ```
 
@@ -20090,6 +20375,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
+  await require('./health_page').runHealthPageTests(browser, BASE, r);
   await require('./transfer_page').runTransferPageTests(browser, BASE, r);
 
   await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
@@ -25591,6 +25877,199 @@ if (require.main === module) (async () => {
   const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   const reporter = makeReporter();
   try { await runChunkingConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/health_page.js
+
+```javascript
+// Health page refreshes with every API call stubbed and held in the page (#415);
+// no backend state. Each load is driven by hand through the captured 30s refresh.
+const assert = require('node:assert/strict');
+const { makeReporter } = require('./lib');
+
+const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
+const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
+const healthBody = (embed = 'ok') => ({
+  status: embed === 'ok' ? 'ok' : 'degraded',
+  services: {
+    weaviate: service('ok', 11),
+    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+  },
+  resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
+});
+const metricsBody = n => ({
+  total_records: n,
+  retrieval_latency: { p50: 10, p95: 20, p99: 30 },
+  llm_latency: { p50: 100, p95: 200, p99: 300 },
+  total_latency: { p50: 110, p95: 220, p99: 330 },
+  history: Array.from({ length: n }, (_, i) => ({ timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString(), collection: 'OwnedFixture', retrieval_mode: 'hybrid', retrieval_ms: 10, llm_ms: 100, total_ms: 110 })),
+});
+const OK = { status: 200, body: healthBody() };
+const DEGRADED = { status: 503, body: healthBody('error') };
+const ERROR = message => ({ status: 500, body: { error: { code: 'INTERNAL_ERROR', message } } });
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.evaluateOnNewDocument((health, metrics) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const original = window.setInterval;
+    window.setInterval = (fn, delay, ...args) => {
+      if (delay === 30000) { window.__healthRefresh = fn; return 45003; }
+      return original(fn, delay, ...args);
+    };
+    const realFetch = window.fetch.bind(window);
+    window.healthFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      if (path === '/api/goldstandard/diagnostics') return Promise.resolve(new Response(JSON.stringify({ issues: [] }), { status: 200 }));
+      if (path === health || path === metrics) {
+        const entry = { path, done: false };
+        window.healthFixture.requests.push(entry);
+        return new Promise((resolve, reject) => {
+          entry.release = ({ status = 200, body, text, fail }) => {
+            entry.done = true;
+            if (fail) return reject(new TypeError('Failed to fetch'));
+            resolve(new Response(text !== undefined ? text : JSON.stringify(body), { status }));
+          };
+        });
+      }
+      return Promise.reject(new Error('Unexpected fixture request ' + path));
+    };
+  }, HEALTH, METRICS);
+  await page.goto(base + '/health', { waitUntil: 'domcontentloaded' });
+  await requested(page, 1);
+  return { ctx, page, errors };
+}
+// Wait until `n` loads have asked for both health and metrics.
+async function requested(page, n) {
+  await page.waitForFunction((h, m, count) => ['h', 'm'].every((_, i) =>
+    window.healthFixture.requests.filter(r => r.path === [h, m][i]).length >= count), { timeout: 5000 }, HEALTH, METRICS, n);
+}
+// Answer load `load` (1 = the first) for `path`, then let React render.
+async function release(page, path, load, answer) {
+  await page.evaluate(async (p, i, a) => {
+    const entry = window.healthFixture.requests.filter(r => r.path === p)[i - 1];
+    if (!entry || entry.done) throw new Error(`no pending ${p} for load ${i}`);
+    entry.release(a);
+    await new Promise(r => setTimeout(r, 50));
+    for (let k = 0; k < 2; k++) await new Promise(r => requestAnimationFrame(() => r()));
+  }, path, load, answer);
+}
+async function refresh(page, n) {
+  await page.evaluate(() => window.__healthRefresh());
+  await requested(page, n);
+}
+async function load(page, n, health, metrics) {
+  await release(page, HEALTH, n, health);
+  await release(page, METRICS, n, metrics);
+}
+const text = page => page.evaluate(() => (document.querySelector('#root')?.innerText || '').replace(/\s+/g, ' ').trim());
+// Each service card's label and dot colour; the latency tiles have no dot.
+const cards = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')].map(dot => ({
+  label: (dot.parentElement.textContent || '').trim(),
+  colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
+})).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
+const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
+const charts = n => `Latency Trends (${n} queries in ring buffer)`;
+const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
+
+async function assertCharts(page, n) {
+  const t = await text(page);
+  assert.ok(t.includes(charts(n)), `expected "${charts(n)}" in: ${t.slice(0, 300)}`);
+}
+async function assertUnreadable(page, message) {
+  const t = await text(page);
+  assert.ok(t.includes(message), `expected "${message}" in: ${t.slice(0, 300)}`);
+  assert.equal(await cards(page), '');
+}
+
+async function runHealthPageTests(browser, base, reporter) {
+  reporter.section('Health page refreshes (#415, stubbed API)');
+  const cases = [
+    ['a failed metrics call (API error) keeps the last charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(2) });
+      await refresh(page, 2);
+      await load(page, 2, DEGRADED, ERROR('Synthetic metrics failure'));
+      await assertCharts(page, 2);
+      assert.equal(await cards(page), EMBED_RED, 'the same refresh\'s health is shown');
+    }],
+    ['a failed metrics call (no answer) keeps the last charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(2) });
+      await refresh(page, 2);
+      await load(page, 2, DEGRADED, { fail: true });
+      await assertCharts(page, 2);
+      assert.equal(await cards(page), EMBED_RED, 'the same refresh\'s health is shown');
+    }],
+    ['a JSON 200 without the health shape is unreadable, not a page error', async page => {
+      await load(page, 1, { status: 200, body: { status: 'ok' } }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+      await assertCharts(page, 1);
+    }],
+    ['an empty 200 is unreadable', async page => {
+      await load(page, 1, { status: 200, text: '' }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
+    ['a non-JSON 200 is unreadable', async page => {
+      await load(page, 1, { status: 200, text: '<html><body>Not the API</body></html>' }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
+    ['a 503 with the JSON error envelope shows its message, not cards', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2);
+      await load(page, 2, { status: 503, body: { error: { code: 'SERVICE_UNAVAILABLE', message: 'Synthetic health envelope' } } }, { body: metricsBody(1) });
+      await assertUnreadable(page, 'Service health could not be read: Synthetic health envelope');
+    }],
+    ['a late older health failure cannot replace a newer success', async page => {
+      await load(page, 1, DEGRADED, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, HEALTH, 3, OK);
+      await release(page, HEALTH, 2, { fail: true });
+      const t = await text(page);
+      assert.equal(healthAlert(t), '');
+      assert.equal(await cards(page), ALL_GREEN);
+    }],
+    ['a late older health success cannot replace a newer failure', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, HEALTH, 3, { status: 502, text: '<html>502 Bad Gateway</html>' });
+      await release(page, HEALTH, 2, DEGRADED);
+      await assertUnreadable(page, 'Service health could not be read: The API is not responding');
+    }],
+    ['a late older metrics success cannot replace newer charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, METRICS, 3, { body: metricsBody(5) });
+      await release(page, METRICS, 2, { body: metricsBody(3) });
+      await assertCharts(page, 5);
+    }],
+    ['a late older metrics success after a newer failure is shown', async page => {
+      await refresh(page, 2);
+      await release(page, METRICS, 2, ERROR('Synthetic metrics failure'));
+      await release(page, METRICS, 1, { body: metricsBody(4) });
+      await assertCharts(page, 4);
+    }],
+  ];
+  for (const [name, test] of cases) {
+    let s;
+    try { s = await fixture(browser, base); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.stack || e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+module.exports = { runHealthPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runHealthPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
   finally { await browser.close(); }
   process.exitCode = reporter.summary() ? 0 : 1;
 })().catch(e => { console.error(e); process.exitCode = 2; });
