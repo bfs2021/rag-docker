@@ -2037,14 +2037,14 @@ A retained session can be loaded/refreshed by its session ID, including when its
 
 **Phase 1 — Generate:**
 - Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
-- Sample size input (1–100, default 20).
+- Sample size input (1–100, default 20). While the value is empty, not a whole number, below 1 or above 100, "Generate Pairs" is disabled and the page says "Sample size must be a whole number from 1 to 100."; no request is sent (#393).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
-- Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review table as they complete (partial display during generation).
+- Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review list as they complete (partial display during generation).
 - If a session already exists in the UI (from a previous generation), clicking "Generate Pairs" displays a confirmation dialog: "This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?" Previous sessions remain on the server (accessible via direct session ID) but are no longer referenced by the UI after confirmation.
 
 **Phase 2 — Review:**
-- Table of generated pairs. Columns: Question, Answer, Source File, Status, Actions.
-- Each row expandable to show full context chunk.
+- List of generated pairs, one expandable row per pair (#393). The collapsed row shows the question, the source file, the status and the actions below.
+- Expanding a row shows the answer, the ground truth and a preview of the first context chunk: its first 300 characters, followed by `…`.
 - Actions per row:
   - Approve (green check) → calls `PATCH /goldstandard/session/{session_id}/pair/{pair_id}` with `{ "status": "approved" }`
   - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included)
@@ -2055,8 +2055,8 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Phase 3 — Export:**
 - "Export Approved" button (disabled until at least 1 approved or edited pair exists).
 - Historical sessions use "Export Historical Approved" and additionally require an explicit checkbox acknowledging that the file omits validity warnings and is not a current baseline. The backend independently enforces the choice.
-- Filename field: pre-filled with `{collection}_{timestamp}`, editable.
-- Calls `POST /goldstandard/save` → on success, triggers download of the resulting JSON file.
+- Filename field: pre-filled with the API's default name, `{collection}_{YYYYMMDD_HHMMSS}.json` (UTC, with the collection part made safe and shortened as the `POST /goldstandard/save` default does), when a generation starts and when a retained session is loaded; editable (#393).
+- Calls `POST /goldstandard/save` → on success, opens `GET /goldstandard/download/{filename}` in a new tab, with the returned filename percent-encoded as one path segment, to download the resulting JSON file (#393). Browsers allow that tab only shortly after the click: with Chromium's popup blocker on, it opens when the save answers within about 5 seconds and is blocked after that.
 - Export summary shown: `17 pairs exported, 3 excluded (rejected/pending)`.
 
 ### 7.8 Collections Page
@@ -2727,6 +2727,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       answers `GET /collections` with a synthetic `503` on each page, and checks the Collections
       page clears the message on its next successful load. The checks fail on the code before
       #379.*
+- [x] The Gold Standard page pre-fills the export filename as `{collection}_{YYYYMMDD_HHMMSS}.json`, made safe and at most 128 characters, after a generation and after a lookup; opens the download with the filename encoded; refuses a sample size outside 1-100 before calling the API; and shows each pair as an expandable row with a 300-character context preview (#393).
+      *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
+      API call by request interception. Its filename, encoded-URL and sample-size checks fail on the
+      code before #393 (`..json`, an empty field after a lookup, a raw `#` in the URL, and a generate
+      request sent for 0, 101, 2.5 and an empty field). It also clicks Export in Chromium with the
+      popup blocker on: a save answered in 1 s opens the download tab, and a control answered after
+      6 s opens none.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message

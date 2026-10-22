@@ -20,6 +20,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./health_page').runHealthPageTests(browser, BASE, r);
   await require('./transfer_page').runTransferPageTests(browser, BASE, r);
 
+  await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
+
   await require('./ui_controls').runUiControlTests(browser, BASE, r);
 
   await require('./ui_pages').runUiPageTests(browser, BASE, r);
