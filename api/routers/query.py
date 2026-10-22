@@ -14,6 +14,22 @@ router = APIRouter(prefix="/query")
 _log = logging.getLogger(__name__)
 
 
+def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
+    """The 503 for a dependency failure, naming the embedder too when there is one (#411)."""
+    service, embedder = exc.service, exc.embedder
+    if embedder is None:
+        _log.exception("Query on %r failed: %s did not answer", collection, service)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error. Try again when {service} is available.")
+    else:
+        _log.exception("Query on %r failed: %s (or %s, embedding the question for it) "
+                       "did not answer", collection, service, embedder)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error, or {embedder} could not embed the "
+                   f"question for it. Try again when {service} and {embedder} are available.")
+    return api_error(503, "SERVICE_UNAVAILABLE", message, detail={"collection": collection})
+
+
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
     try:
@@ -37,12 +53,7 @@ async def run_query(body: QueryRequest):
         )
     except rag_pipeline.ServiceUnavailable as exc:
         # The cause is logged, not sent (#373).
-        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
-        return api_error(503, "SERVICE_UNAVAILABLE",
-                         f"The question was not answered: {exc.service} could not be reached, "
-                         f"timed out or returned an error. Try again when {exc.service} "
-                         f"is available.",
-                         detail={"collection": body.collection})
+        return _unavailable(body.collection, exc)
 
     await metrics.record(
         collection=body.collection,

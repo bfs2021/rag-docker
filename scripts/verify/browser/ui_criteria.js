@@ -634,6 +634,92 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
+    }
+  }
+
   // ── re-ingest progress (#22) ───────────────────────────────────────────────
   // The progress panel reports replaced chunks, and the skipped heading no
   // longer claims every skip is an unsupported type: a later file with the
