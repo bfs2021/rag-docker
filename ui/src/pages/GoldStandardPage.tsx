@@ -14,6 +14,8 @@ export default function GoldStandardPage() {
   const exportPendingRef = useRef(false)
   const activeSessionRef = useRef('')
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
   const [editingPair, setEditingPair] = useState<GoldPair | null>(null)
@@ -25,8 +27,9 @@ export default function GoldStandardPage() {
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }, [])
 
   useEffect(() => {
@@ -163,6 +166,7 @@ export default function GoldStandardPage() {
             Generate Pairs
           </button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
         {session && session.status === 'generating' && (
           <div className="mt-3">
