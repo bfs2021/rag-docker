@@ -362,7 +362,7 @@ delete a collection:
 |---|---|
 | `abort` | fail if a collection of that name already exists |
 | `rename` | import alongside it as `<name>_imported_<id8>` |
-| `replace` | overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact |
+| `replace` | overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`) |
 
 The package is validated before anything touches the database: the archive must
 be readable, the format understood, every digest must match, and the embedding

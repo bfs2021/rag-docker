@@ -10217,7 +10217,9 @@ curl -X POST http://localhost:8080/api/import \
 
 `on_conflict` is required and has no default. It is one of `abort` (fail if the
 name is taken), `rename` (import under a free name) or `replace` (overwrite,
-but only after this package has been proven to import cleanly).
+but only after this package has been proven to import cleanly; a failure while the
+final copy is being built can leave the name unavailable, with the data kept in a
+recovery collection named in the error).
 
 ## The filename is a label, not an input
 
@@ -10500,7 +10502,7 @@ choice can delete a collection.
 |---|---|
 | `abort` | Fail if a collection of that name already exists. |
 | `rename` | Import alongside it as `<name>_imported_<id8>`. |
-| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact. |
+| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`). |
 
 Replacing a collection keeps its gold-standard sessions and marks them orphaned,
 and the import result reports how many. They are never deleted silently.
@@ -10517,8 +10519,10 @@ and the import result reports how many. They are never deleted silently.
 
 `GET /api/tune/<collection>` reports which of these a given collection can do.
 
-Every rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failed tune leaves the collection as it was.
+Every rebuild is staged into a temporary collection and verified before the
+original is touched, so a failure before cutover leaves the collection as it was.
+A failure during the final replacement can leave its name missing or partial, with
+the data kept in a recovery collection named in the error (`recovered_as`).
 
 **Gold-standard sessions are flagged, never deleted or remapped.** Re-chunking or
 re-embedding changes which chunks exist, so evaluation pairs built against the
@@ -12824,7 +12828,7 @@ function sizeLabel(bytes: number | null): string {
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
   { id: 'rename', label: 'Rename', description: 'Import alongside the existing one, under a new name the API reports back.' },
-  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
+  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly. A failure while the final copy is built can leave the name missing; the data is then kept in a recovery collection the error names.' },
 ]
 
 // Both halves poll their job every 2 s. A failed poll is shown and retried;
@@ -24973,6 +24977,43 @@ class RetrievalImportTests(unittest.TestCase):
         partial = (packager._TEMPLATE_DIR / 'partials' / 'contents.md').read_text().rstrip('\n')
         self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
         self.assertNotIn('@@', readme)
+
+    def test_failure_text_does_not_promise_an_intact_original(self):
+        # #385: a replace failure after the delete, or a tune failure during the
+        # final replacement, can leave the name missing; the data is in the
+        # recovery collection the error names (recovered_as).
+        help_page = packager.render_help(1024)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        for name, text in (('help page', help_page), ('package README', readme)):
+            with self.subTest(name=name):
+                self.assertNotIn('leaves the original intact', text)
+                self.assertNotIn('leaves it intact', text)
+                self.assertNotIn('a failed tune leaves', text)
+                self.assertIn('recovery collection', text)
+        replace_row = next(line for line in help_page.splitlines() if line.startswith('| `replace`'))
+        self.assertIn('recovered_as', replace_row)
+        self.assertIn('missing or partial', replace_row)
+        tuning = help_page.split('## Tuning after import', 1)[1].split('**Gold-standard', 1)[0]
+        self.assertIn('before cutover', tuning)
+        self.assertIn('recovered_as', tuning)
+
+    def test_transfer_page_replace_description_names_the_recovery_collection(self):
+        root = Path(os.environ.get('RAG_TEST_API_DIR') or '.').resolve().parent  # repo root on the host
+        page = root / 'ui' / 'src' / 'pages' / 'TransferPage.tsx'
+        if not page.is_file():  # the api container has no ui/ tree
+            self.skipTest('ui source not mounted')
+        line = next(l for l in page.read_text(encoding='utf-8').splitlines() if "id: 'replace'" in l)
+        self.assertNotIn('leaves it intact', line)
+        self.assertIn('recovery collection', line)
 
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
