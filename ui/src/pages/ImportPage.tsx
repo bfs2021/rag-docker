@@ -18,6 +18,9 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The status the upload was accepted with, shown with the job ID until the
+  // first poll answers, so the page responds at once rather than 3 s later (#394).
+  const [queuedStatus, setQueuedStatus] = useState('')
   const [error, setError] = useState('')
   // A failed status poll, shown instead of ignored (#290). Polling carries on,
   // and the next successful poll clears it.
@@ -109,9 +112,15 @@ export default function ImportPage() {
   }
 
   async function startIngest() {
-    if (!files.length || !collection) return
+    if (!files.length) return
     setError('')
     setPollError('')
+    // With no collection selected (none exist, or the list failed to load),
+    // say so instead of doing nothing (#394).
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -132,6 +141,7 @@ export default function ImportPage() {
     try {
       const res = await api.uploadFiles(form)
       setJobId(res.job_id)
+      setQueuedStatus(res.status)
       setJob(null)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -211,6 +221,13 @@ export default function ImportPage() {
         Start Ingest
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {jobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{jobId}</span></p>}
+      {jobId && !job && (
+        <div className="mt-4 p-4 border rounded bg-gray-50 flex justify-between text-sm">
+          <span>Waiting for the first progress update</span>
+          <span className="text-blue-600">{queuedStatus}</span>
+        </div>
+      )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 

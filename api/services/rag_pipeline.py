@@ -30,11 +30,17 @@ SYNTHESIS_ENGINEER_SYSTEM = (
 
 
 class ServiceUnavailable(Exception):
-    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+    """Ollama or Weaviate failed during a query; `service` names which (#373).
 
-    def __init__(self, service: str):
+    `embedder` names the service that embeds the question for `service`, when it
+    does so itself: in hybrid and semantic modes Weaviate embeds through Ollama,
+    so an Ollama failure there comes back as a Weaviate error (#411).
+    """
+
+    def __init__(self, service: str, embedder: str | None = None):
         super().__init__(f"{service} failed during the query")
         self.service = service
+        self.embedder = embedder
 
 
 async def _from_ollama(call):
@@ -45,12 +51,12 @@ async def _from_ollama(call):
         raise ServiceUnavailable("Ollama") from exc
 
 
-async def _from_weaviate(call):
+async def _from_weaviate(call, embedder: str | None = None):
     """Await a Weaviate query; any error from it is ServiceUnavailable."""
     try:
         return await call
     except Exception as exc:                          # noqa: BLE001
-        raise ServiceUnavailable("Weaviate") from exc
+        raise ServiceUnavailable("Weaviate", embedder) from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -90,9 +96,11 @@ async def run_query(
         vector = await _from_ollama(ollama.embed(reformulated))
         chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
     elif retrieval_mode == "hybrid":
-        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
+        chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k),
+                                      embedder="Ollama")
     elif retrieval_mode == "semantic":
-        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
+        chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k),
+                                      embedder="Ollama")
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()

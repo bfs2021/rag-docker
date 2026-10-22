@@ -118,7 +118,7 @@ A collection is a named vector index that holds chunks from one or more document
 
 Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically.
 
-Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents.
+Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
 Supported chunking strategies:
 
@@ -518,9 +518,12 @@ the target machine.
 bash package.sh              # writes rag-docker.zip (~150 KB)
 ```
 
-The script excludes `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, any
-`.env`, and previous archives. Run it with `bash package.sh`, not `./package.sh`,
-so it does not depend on its own executable bit.
+The zip holds exactly the files git tracks in the current commit (`HEAD`), built
+with `git archive`. Untracked and ignored files never go in (`.env` files,
+`node_modules/`, offline tars, previous archives, `.claude/`, `dev-docs/`, the
+contents of `ingest-inbox/` and `exports/`), and neither do uncommitted changes,
+so commit first. Run it in a git checkout of the project, with `bash package.sh`,
+not `./package.sh`, so it does not depend on its own executable bit.
 
 #### 2. What the target Mac needs
 
@@ -568,7 +571,9 @@ been downloaded:
 bash package-offline.sh              # writes rag-docker-offline.tar (~4.6 GB)
 ```
 
-It runs `docker save` on all five images (~2.5 GB compressed) and exports the
+Its source tree is the same as `package.sh`'s: the files git tracks in the
+current commit, so run it in a git checkout too. It runs `docker save` on all
+five images (~2.5 GB compressed) and exports the
 Ollama model weights from the `ollama_models` volume (~2.2 GB). Expect a few
 minutes; saving the image layers is the slow part.
 

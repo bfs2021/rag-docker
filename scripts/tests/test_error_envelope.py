@@ -85,6 +85,15 @@ class RoutingErrorTests(EnvelopeTestCase):
             response = self.client.post("/query", json=QUESTION)
         self.assert_error(response, 404, "COLLECTION_NOT_FOUND")
 
+    def test_other_http_errors_keep_fastapi_answer(self):
+        # A body FastAPI can't parse is its own 400, outside the routing envelope.
+        response = self.client.post("/ingest/upload", content=b"not multipart",
+                                    headers={"content-type": "multipart/form-data"})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertTrue(response.headers["content-type"].startswith("application/json"))
+        self.assertIn("detail", response.json())
+        self.assertNotIn("error", response.json())
+
     def test_request_validation_is_still_422_invalid_parameter(self):
         response = self.client.post("/query", json={**QUESTION, "top_k": 0})
         self.assertEqual(response.status_code, 422, response.text)
@@ -143,6 +152,11 @@ class QueryPipelineTests(EnvelopeTestCase):
         return (f"The question was not answered: {service} could not be reached, timed out "
                 f"or returned an error. Try again when {service} is available.")
 
+    WEAVIATE_OR_EMBEDDING = (
+        "The question was not answered: Weaviate could not be reached, timed out or returned "
+        "an error, or Ollama could not embed the question for it. Try again when Weaviate and "
+        "Ollama are available.")
+
     def ask(self, mode="hnsw", chat=None, embed=None, near_vector=None, hybrid=None,
             near_text=None):
         chunk = {"content": "Managers approve overtime.", "source_file": "a.txt",
@@ -163,8 +177,8 @@ class QueryPipelineTests(EnvelopeTestCase):
             for p in patches:
                 p.stop()
 
-    def assert_unavailable(self, response, service, logs):
-        self.assert_error(response, 503, "SERVICE_UNAVAILABLE", self.message(service),
+    def assert_unavailable(self, response, service, logs, message=None):
+        self.assert_error(response, 503, "SERVICE_UNAVAILABLE", message or self.message(service),
                           {"collection": "Coll"})
         self.assertIn(CAUSE, logged(logs))
         self.record.assert_not_awaited()
@@ -193,13 +207,33 @@ class QueryPipelineTests(EnvelopeTestCase):
                 response = self.ask(**mocks)
                 self.assert_unavailable(response, "Ollama", logs)
 
+    def test_the_engineer_answer_synthesis_is_covered(self):
+        down = httpx.ConnectError(CAUSE, request=ollama_request())
+        chat = AsyncMock(side_effect=["a search query", down])
+        with patch.object(ollama_client, "chat", chat), \
+                patch.object(ollama_client, "embed", AsyncMock(return_value=[0.0, 1.0])), \
+                patch.object(wc, "near_vector_query", AsyncMock(return_value=[])), \
+                self.assertLogs("routers.query", "ERROR") as logs:
+            response = self.client.post("/query", json={**QUESTION,
+                                                         "response_format": "engineer"})
+        self.assertEqual(chat.await_count, 2)
+        self.assert_unavailable(response, "Ollama", logs)
+
     def test_a_weaviate_query_failing_is_503_in_every_retrieval_mode(self):
-        cases = {"hnsw": "near_vector", "flat": "near_vector", "hybrid": "hybrid",
-                 "semantic": "near_text"}
-        for mode, call in cases.items():
+        # In hybrid and semantic modes Weaviate embeds the question through Ollama, so
+        # an Ollama failure there comes back as a Weaviate error: both are named (#411).
+        cases = {"hnsw": ("near_vector", None), "flat": ("near_vector", None),
+                 "hybrid": ("hybrid", self.WEAVIATE_OR_EMBEDDING),
+                 "semantic": ("near_text", self.WEAVIATE_OR_EMBEDDING)}
+        for mode, (call, message) in cases.items():
             with self.subTest(mode=mode), self.assertLogs("routers.query", "ERROR") as logs:
                 response = self.ask(mode, **{call: AsyncMock(side_effect=ConnectionError(CAUSE))})
-                self.assert_unavailable(response, "Weaviate", logs)
+                self.assert_unavailable(response, "Weaviate", logs, message)
+                named = "Weaviate (or Ollama, embedding the question for it) did not answer"
+                if message:
+                    self.assertIn(named, logged(logs))
+                else:
+                    self.assertIn("Weaviate did not answer", logged(logs))
 
     def test_a_healthy_query_is_unchanged(self):
         response = self.ask()
@@ -221,6 +255,14 @@ class HelpTests(EnvelopeTestCase):
                           "not be read.")
         self.assertNotIn(empty.name, response.text)
         self.assertIn(empty.name, logged(logs))
+
+    def test_a_template_runtime_error_keeps_its_own_message(self):
+        with patch.object(packager, "render_help",
+                          side_effect=RuntimeError("Template has an unknown placeholder.")), \
+                patch.object(ollama_client, "embed", AsyncMock(return_value=[0.0] * 3)):
+            response = self.client.get("/help/transfer")
+        self.assert_error(response, 500, "HELP_RENDER_FAILED",
+                          "Template has an unknown placeholder.")
 
 
 class CreateDeleteTests(EnvelopeTestCase):

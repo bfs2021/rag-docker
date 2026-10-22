@@ -213,6 +213,40 @@ class ExportFileTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertFalse((self.root / "missing").exists())
 
+    def test_download_refuses_a_dangling_exports_link_and_temporary_names(self):
+        # Reviewer addition: download meets the same folder check as save for a
+        # dangling link, and a save's temporary file name is never served (#402).
+        self.exports.symlink_to(self.root / "missing")
+        self.assert_folder_invalid(self.client.get("/goldstandard/download/a.json"))
+        self.assertFalse((self.root / "missing").exists())
+        self.exports.unlink()
+        self.assertEqual(self.save("same.json").status_code, 200)
+        self.assertEqual(sorted(os.listdir(self.exports)), ["same.json"])
+        (self.exports / ".same-abcd1234.tmp").write_text("[]")
+        self.assert_invalid(self.client.get("/goldstandard/download/.same-abcd1234.tmp"))
+
+    def test_link_appearing_at_the_exports_folder_during_mkdir_is_refused(self):
+        # The link turns up between the first folder check and mkdir (#406):
+        # mkdir succeeds through it, and the re-check refuses it.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        real_mkdir = Path.mkdir
+        planted = []
+
+        def planting_mkdir(path, *args, **kwargs):
+            if path.resolve() == self.exports.resolve():
+                planted.append(path.name)
+                self.exports.symlink_to(elsewhere, target_is_directory=True)
+            return real_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", planting_mkdir):
+            self.assert_folder_invalid(self.save("a.json"))
+        self.assertEqual(planted, [gs.EXPORT_DIRNAME])
+        self.assertTrue(self.exports.is_symlink())
+        self.assertEqual(os.listdir(elsewhere), [])
+        self.assertEqual((self.root / "collection_registry.json").read_bytes(), REGISTRY)
+        self.assertEqual((self.root / "metrics.jsonl").read_bytes(), METRICS)
+
     def test_invalid_name_is_refused_before_the_folder_check(self):
         self.exports.write_text("[]")
         self.assert_invalid(self.save("report.txt"))

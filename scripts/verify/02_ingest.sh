@@ -453,6 +453,40 @@ sys.exit(0 if ok else 1)
 ENDPY
 check "ZIP members with one basename in two folders stay two documents, named by path" $?
 
+# A Finder "Compress" ZIP (#378): __MACOSX/finder/._report.txt is the file's
+# AppleDouble resource fork with the same suffix, and was queued as a document.
+python3 - "$RIFIX/finder.zip" <<'ENDPY'
+import sys, zipfile
+double = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for name, data in [("finder/", b""), ("finder/report.txt",
+                        b"Finder report. The pool closes at eight on Sundays."),
+                       ("__MACOSX/", b""), ("__MACOSX/finder/", b""),
+                       ("__MACOSX/finder/._report.txt", double)]:
+        z.writestr(zipfile.ZipInfo(name), data)
+ENDPY
+ingest "$RI" fixed 200 40 "$RIFIX/finder.zip"
+cp /tmp/vfy_job.json /tmp/vfy_ri_finder.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_finder.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+checks = {
+    "completed": job["status"] == "completed",
+    "no errors": job["errors"] == [],
+    "one file": job["files_total"] == 1,
+    "skipped names the AppleDouble member": job["skipped"] == [
+        "finder.zip:__MACOSX/finder/._report.txt (macOS metadata (AppleDouble), not a document)"],
+    "real file stored": "Finder report" in names.get("finder/report.txt", ""),
+    "no metadata stored": not any("__MACOSX" in n or "/._" in n for n in names),
+}
+print({k: v for k, v in checks.items() if not v} or "ok", sorted(names))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a Finder ZIP stores its file, not the __MACOSX AppleDouble member, which is listed in skipped" $? \
+  "$(head -c 300 /tmp/vfy_ri_finder.json)"
+
 # Two parts with one filename: the second's bytes are stored, the first reported.
 ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
 cp /tmp/vfy_job.json /tmp/vfy_ri_dupe.json
