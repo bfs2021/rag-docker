@@ -150,29 +150,26 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk. Both remove their
-# own directory in a `finally`, which a hard kill skips -- twelve of these were
-# found holding 152 MB after the kill tests, and a with-models package would
-# leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
+# Extraction workspaces created by an import or a re-chunk, and an ingest's
+# upload staging (#377). Each removes its own directory in a `finally`, which a
+# hard kill skips -- twelve of these were found holding 152 MB after the kill
+# tests, a with-models package would leave 2.3 GB behind each time, and an
+# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-")
 
 
 def sweep_stale_workdirs() -> list[str]:
-    """Remove extraction directories abandoned by a killed job."""
+    """Remove work directories abandoned by a killed job; never follows a link."""
     root = Path(settings.upload_dir)
     removed: list[str] = []
     if not root.is_dir():
         return removed
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(_WORKDIR_PREFIXES):
+        if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        try:
-            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
-            shutil.rmtree(entry, ignore_errors=True)
-        except OSError:
-            _log.exception("Could not remove stale work directory %s", entry)
-            continue
-        removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+        size = packager.remove_leftover(entry, directory=True)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
 
 

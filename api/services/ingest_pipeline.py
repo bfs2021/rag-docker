@@ -1124,7 +1124,8 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
-    tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
+    # The prefix is how the startup sweep finds a killed job's staging (#377).
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
     # a later one with the same name. Dropping them without a word makes a ZIP
     # of 8 files silently report 6, with nothing saying which two or why.

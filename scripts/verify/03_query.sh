@@ -14,6 +14,13 @@ section "§10.2 Query"
 # controlled, in the API image with no network.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
 check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
+# Citation scores are higher-is-better in every mode, and null when missing (#376):
+# controlled in the API image with no network, then on the real Weaviate with each
+# distance metric (models controlled, no LLM work).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_citation_score.py)
+check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
+check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -48,7 +55,7 @@ import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
 c = d.get('citations') or []
 ok = bool(c) and all(
     isinstance(x.get('source_file'), str) and x['source_file']
-    and isinstance(x.get('score'), (int, float))
+    and (x.get('score') is None or isinstance(x.get('score'), (int, float)))
     and isinstance(x.get('chunk_index'), int)
     and isinstance(x.get('excerpt'), str) for x in c)
 sys.exit(0 if ok else 1)"
@@ -69,6 +76,14 @@ try: d=json.load(open('/tmp/vfy_ans.json'))
 except Exception: sys.exit(1)
 sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
   check "retrieval mode '$mode' returns results" $?
+  python3 -c "
+import json,sys
+try: c=json.load(open('/tmp/vfy_ans.json')).get('citations') or []
+except Exception: sys.exit(1)
+s=[x.get('score') for x in c]
+sys.exit(0 if s and all(isinstance(v,(int,float)) for v in s) and s==sorted(s,reverse=True) else 1)"
+  check "retrieval mode '$mode' citation scores are numbers, best (highest) first (#376)" $? \
+    "$(python3 -c "import json;print([x.get('score') for x in json.load(open('/tmp/vfy_ans.json')).get('citations') or []])" 2>/dev/null)"
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────

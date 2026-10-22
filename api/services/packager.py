@@ -8,11 +8,14 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -45,6 +48,65 @@ def exports_dir() -> Path:
     p = Path(settings.exports_dir)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ── Leftovers of a killed job (#377) ─────────────────────────────────────────
+# A build removes its staging directory and temporary archive in a `finally`,
+# which a hard kill skips: each killed export left them in ./exports for good,
+# hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
+# and by kind, never by age; anything else in the folder is left alone.
+_BUILD_DIR = ".build-*"
+_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+
+
+def remove_leftover(entry: Path, *, directory: bool = False,
+                    regular_file: bool = False) -> int | None:
+    """Remove one thing a killed job left behind and return the bytes it held.
+
+    `directory` and `regular_file` say what its name promises. Anything else,
+    a symlink included, is kept, and no link is followed: not to check it, size
+    it or remove it. None when it was kept or could not be removed (logged).
+    """
+    try:
+        info = entry.lstat()
+        if directory and stat.S_ISDIR(info.st_mode):
+            size = 0
+            for parent, _dirs, files in os.walk(entry):     # does not follow links
+                for name in files:
+                    found = os.lstat(os.path.join(parent, name))
+                    if stat.S_ISREG(found.st_mode):
+                        size += found.st_size
+            # Removes links inside without following them, and refuses a link.
+            shutil.rmtree(entry)
+            return size
+        if regular_file and stat.S_ISREG(info.st_mode):
+            entry.unlink()
+            return info.st_size
+        return None
+    except OSError:
+        _log.exception("Could not remove %s", entry)
+        return None
+
+
+def sweep_build_leftovers() -> list[str]:
+    """Remove the staging directories and temporary archives of killed exports.
+
+    Startup only, before this process can have an export of its own running.
+    A missing exports folder is not created.
+    """
+    root = Path(settings.exports_dir)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for entry in sorted(root.iterdir()):
+        as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
+        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        if not (as_dir or as_file):
+            continue
+        size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+    return removed
 
 
 # ── Naming (spec §4.1) ────────────────────────────────────────────────────────
