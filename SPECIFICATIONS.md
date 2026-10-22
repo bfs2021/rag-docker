@@ -246,7 +246,11 @@ ingest and retrieval settings, gold-standard sessions, query metrics and job gua
 keyed by the stored name, and responses and messages that name the collection give it.
 Nothing else is case-folded: `mydocs` is a different name from `MyDocs`. Import takes its
 name from the package, which must already be in this form (`RAG_EXPORT_SPECIFICATIONS.md`).
-State written under a lowercase-first spelling before #372 is not moved or renamed.
+State written under a lowercase-first spelling before #372 (a registry entry, a `sources/` folder, a
+settings file, a session's `collection`, a metric record) is not migrated, and it isn't read under the
+stored name either: such a collection lists `created_at` as `null`, exports and tunes without those
+originals, settings and sessions, and its old metric records match only that old spelling. Recreating
+the state (re-ingesting, saving the settings again) puts it under the stored name.
 
 #### 3.1.1 Health
 

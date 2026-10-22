@@ -353,7 +353,9 @@ completion, the written filename.
   `{"collection": "<name>"}`. The cause is logged, not returned (#366).
 - The requested name is first replaced by the name as stored, its first character
   upper-cased (`SPECIFICATIONS.md` §3.1, #372), so `policies` exports `Policies`
-  with its retained originals and gold-standard sessions.
+  with its retained originals and gold-standard sessions. Originals and sessions
+  saved under the lowercase spelling before #372 are not migrated and are not
+  included.
 - Only one export per collection may run at a time, whichever first-letter spelling
   each request uses (#372); a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
