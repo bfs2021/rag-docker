@@ -1080,7 +1080,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     source_file: str
     chunk_index: int
-    score: float
+    score: Optional[float]  # higher is better in every mode; null when missing (#376)
     excerpt: str
 
 
@@ -1187,6 +1187,15 @@ class PatchPairRequest(BaseModel):
                 f"changing {', '.join(content)} requires status='edited'; "
                 f"got status={self.status!r}")
         return self
+
+    @field_validator("question", "answer", "ground_truth")
+    @classmethod
+    def _content_not_empty(cls, v: Optional[str], info) -> Optional[str]:
+        """An empty field would be saved into the RAGAS export as an empty row
+        field. Generation refuses empty model fields the same way (#381)."""
+        if v is not None and not v.strip():
+            raise ValueError(f"{info.field_name} must not be empty or only whitespace")
+        return v
 
     @field_validator("status")
     @classmethod
@@ -2738,11 +2747,39 @@ async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
     await asyncio.to_thread(_insert_chunks_sync, collection_name, chunks)
 
 
+# A citation's score is higher-is-better in every retrieval mode (#376), so the
+# distance-based modes turn Weaviate's distance into a similarity by the
+# collection's distance metric.
+_SIMILARITY = {
+    VectorDistances.COSINE: lambda d: 1 - d,            # cosine similarity, -1 to 1
+    VectorDistances.DOT: lambda d: -d,                  # the dot product itself
+    VectorDistances.L2_SQUARED: lambda d: 1 / (1 + d),  # 0 to 1
+}
+
+
+def _distance_to_score(coll):
+    """The distance-to-score conversion for this collection's metric.
+
+    The metric is read on every query, not cached, so a collection deleted and
+    recreated with another metric is converted by its new one. A missing
+    distance, or a metric that can't be read or has no conversion, gives None.
+    """
+    vector_config = coll.config.get().vector_index_config
+    convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
+
+    def to_score(distance: float | None) -> float | None:
+        if convert is None or distance is None:
+            return None
+        return convert(distance)
+    return to_score
+
+
 def _near_vector_query_sync(
     collection_name: str, vector: list[float], top_k: int
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_vector(
         near_vector=vector,
         limit=top_k,
@@ -2751,12 +2788,11 @@ def _near_vector_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2772,6 +2808,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_text(
         query=query,
         limit=top_k,
@@ -2780,12 +2817,11 @@ def _near_text_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2814,7 +2850,8 @@ def _hybrid_query_sync(
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": obj.metadata.score or 0.0,
+            # Weaviate's fusion score, higher is better; missing reads as None (#376).
+            "score": obj.metadata.score,
         })
     return rows
 
@@ -4315,7 +4352,8 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
-    tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
+    # The prefix is how the startup sweep finds a killed job's staging (#377).
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
     # a later one with the same name. Dropping them without a word makes a ZIP
     # of 8 files silently report 6, with nothing saying which two or why.
@@ -4550,7 +4588,7 @@ async def run_query(
             {
                 "source_file": c["source_file"],
                 "chunk_index": c["chunk_index"],
-                "score": round(c["score"], 4),
+                "score": None if c["score"] is None else round(c["score"], 4),
                 "excerpt": c["content"][:200],
             }
             for c in chunks
@@ -5545,20 +5583,32 @@ async def start_generation(
     }
 
 
+def _session_not_found(session_id: str) -> GoldStandardError:
+    return GoldStandardError("SESSION_NOT_FOUND", f"Session '{session_id}' not found.", 404)
+
+
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
+    """The updated pair, or None for an unknown pair. An unknown session raises
+    SESSION_NOT_FOUND, so the two 404s stay apart (#381)."""
     def change(current):
         for pair in current["pairs"]:
             if pair["pair_id"] == pair_id:
                 pair.update({key: value for key, value in updates.items() if value is not None})
                 return pair
         return None
-    return await asyncio.to_thread(_update_session_sync, session_id, change)
+
+    def apply():
+        with _state_lock:
+            if session_id not in _sessions:
+                raise _session_not_found(session_id)
+            return _update_session_sync(session_id, change)
+    return await asyncio.to_thread(apply)
 
 
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
-        return None
+        raise _session_not_found(session_id)
     if session.get("status") == "generating":
         # The generation loop is appending to session["pairs"] and saving it;
         # regenerating underneath that races with it and can lose a pair.
@@ -5729,11 +5779,14 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -5766,6 +5819,65 @@ def exports_dir() -> Path:
     p = Path(settings.exports_dir)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ── Leftovers of a killed job (#377) ─────────────────────────────────────────
+# A build removes its staging directory and temporary archive in a `finally`,
+# which a hard kill skips: each killed export left them in ./exports for good,
+# hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
+# and by kind, never by age; anything else in the folder is left alone.
+_BUILD_DIR = ".build-*"
+_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+
+
+def remove_leftover(entry: Path, *, directory: bool = False,
+                    regular_file: bool = False) -> int | None:
+    """Remove one thing a killed job left behind and return the bytes it held.
+
+    `directory` and `regular_file` say what its name promises. Anything else,
+    a symlink included, is kept, and no link is followed: not to check it, size
+    it or remove it. None when it was kept or could not be removed (logged).
+    """
+    try:
+        info = entry.lstat()
+        if directory and stat.S_ISDIR(info.st_mode):
+            size = 0
+            for parent, _dirs, files in os.walk(entry):     # does not follow links
+                for name in files:
+                    found = os.lstat(os.path.join(parent, name))
+                    if stat.S_ISREG(found.st_mode):
+                        size += found.st_size
+            # Removes links inside without following them, and refuses a link.
+            shutil.rmtree(entry)
+            return size
+        if regular_file and stat.S_ISREG(info.st_mode):
+            entry.unlink()
+            return info.st_size
+        return None
+    except OSError:
+        _log.exception("Could not remove %s", entry)
+        return None
+
+
+def sweep_build_leftovers() -> list[str]:
+    """Remove the staging directories and temporary archives of killed exports.
+
+    Startup only, before this process can have an export of its own running.
+    A missing exports folder is not created.
+    """
+    root = Path(settings.exports_dir)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for entry in sorted(root.iterdir()):
+        as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
+        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        if not (as_dir or as_file):
+            continue
+        size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+    return removed
 
 
 # ── Naming (spec §4.1) ────────────────────────────────────────────────────────
@@ -7115,29 +7227,26 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk. Both remove their
-# own directory in a `finally`, which a hard kill skips -- twelve of these were
-# found holding 152 MB after the kill tests, and a with-models package would
-# leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
+# Extraction workspaces created by an import or a re-chunk, and an ingest's
+# upload staging (#377). Each removes its own directory in a `finally`, which a
+# hard kill skips -- twelve of these were found holding 152 MB after the kill
+# tests, a with-models package would leave 2.3 GB behind each time, and an
+# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-")
 
 
 def sweep_stale_workdirs() -> list[str]:
-    """Remove extraction directories abandoned by a killed job."""
+    """Remove work directories abandoned by a killed job; never follows a link."""
     root = Path(settings.upload_dir)
     removed: list[str] = []
     if not root.is_dir():
         return removed
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(_WORKDIR_PREFIXES):
+        if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        try:
-            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
-            shutil.rmtree(entry, ignore_errors=True)
-        except OSError:
-            _log.exception("Could not remove stale work directory %s", entry)
-            continue
-        removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+        size = packager.remove_leftover(entry, directory=True)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
 
 
@@ -8271,6 +8380,18 @@ def _nothing_to_rebuild(collection: str) -> PackageError:
         {"collection": collection})
 
 
+# An invalid retained source index (sources.load_index raises ValueError) is
+# refused before a job is created too, as the tuning options already report it
+# (#389). Re-embedding from stored chunks and re-indexing never read it.
+def _source_index_invalid(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCE_INDEX_INVALID",
+        f"Cannot re-chunk '{collection}': its retained source index is invalid. "
+        "Repair it before re-chunking; re-embedding from stored chunks and "
+        "re-indexing remain available.",
+        {"collection": collection})
+
+
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
@@ -8281,16 +8402,17 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
 
 
 def _refuse_nothing_to_rebuild(collection: str) -> None:
-    """The one re-chunk refusal made before a job is created (#328).
+    """The re-chunk refusals made before a job is created: an invalid
+    retained source index (#389) and nothing to rebuild (#328).
 
-    The other refusals, and an invalid index, are still reported by the job.
-    A Weaviate failure during the walk raises ServiceUnavailableError, which
-    the router answers with 503 rather than a bare 500 (#340).
+    The other refusals are still reported by the job. A Weaviate failure
+    during the walk raises ServiceUnavailableError, which the router answers
+    with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
-    except ValueError:
-        return
+    except ValueError as exc:
+        raise _source_index_invalid(collection) from exc
     if not documents:
         return
     try:
@@ -8648,8 +8770,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guards; the store removes the record.
     try:
-        # A re-chunk with nothing to rebuild is refused here, before any job
-        # exists (#328); the walk runs off the event loop too.
+        # A re-chunk with an invalid source index (#389) or nothing to rebuild
+        # (#328) is refused here, before any job exists; the walk runs off the
+        # event loop too.
         if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
             await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
         await _jobs.create(job_id, {
@@ -8863,6 +8986,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8893,20 +9018,51 @@ def _registry_path() -> Path:
     return _REGISTRY_FILE
 
 
+class _RegistryUnreadable(Exception):
+    """The registry file exists but can't be read as a JSON object (#388)."""
+
+
 def _load_registry() -> dict:
+    """The registry, or {} when the file doesn't exist yet. A file that exists but
+    can't be read, isn't JSON or isn't an object raises _RegistryUnreadable, so it
+    is never taken for an empty registry and overwritten by the next save (#388)."""
     p = _registry_path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return {}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RegistryUnreadable(f"{p} can't be read: {exc}") from exc
+    try:
+        reg = json.loads(text)
+    except ValueError as exc:
+        raise _RegistryUnreadable(f"{p} isn't valid JSON: {exc}") from exc
+    if not isinstance(reg, dict):
+        raise _RegistryUnreadable(f"{p} isn't a JSON object")
+    return reg
 
 
 def _save_registry(reg: dict) -> None:
+    """Publish the whole registry atomically (#388): a uniquely named temporary file
+    in the same folder, fsynced, then os.replace. A failure at any step leaves the
+    old file whole and no temporary file, and raises. Callers hold _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(reg, indent=2))
+    payload = json.dumps(reg, indent=2)
+    # mkstemp creates the file 0600, like the job and session files.
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 @router.get("", response_model=CollectionsResponse)
@@ -8919,7 +9075,13 @@ async def list_collections():
         return api_error(503, "SERVICE_UNAVAILABLE",
                          "Cannot list the collections: Weaviate could not be read. "
                          "Try again when Weaviate is available.")
-    registry = await asyncio.to_thread(_load_registry)
+    try:
+        registry = await asyncio.to_thread(_load_registry)
+    except _RegistryUnreadable as exc:
+        # Listed without created_at; the file is left for someone to fix (#388).
+        _log.warning("The collection registry can't be read, so created_at is null "
+                     "for every collection: %s", exc)
+        registry = {}
     items = [
         CollectionInfo(
             name=c["name"],
@@ -8958,9 +9120,16 @@ async def create_collection(body: CreateCollectionRequest):
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        registry[body.name] = datetime.now(timezone.utc).isoformat()
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten with this one entry (#388).
+            _log.exception("Collection %r was created, but its created_at was not recorded: "
+                           "the collection registry can't be read and is left unchanged",
+                           body.name)
+        else:
+            registry[body.name] = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(_save_registry, registry)
 
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
@@ -9014,10 +9183,17 @@ async def delete_collection(name: str, confirm: str | None = None):
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        for spelling in aliases(name):
-            registry.pop(spelling, None)
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten without its other entries (#388).
+            _log.exception("Collection %r was deleted, but its created_at was not removed: "
+                           "the collection registry can't be read and is left unchanged",
+                           name)
+        else:
+            for spelling in aliases(name):
+                registry.pop(spelling, None)
+            await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
 ```
@@ -10411,6 +10587,14 @@ async def lifespan(app: FastAPI):
                             len(stale_dirs), ", ".join(stale_dirs))
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted imports failed")
+        try:
+            from services import packager
+            leftovers = await asyncio.to_thread(packager.sweep_build_leftovers)
+            if leftovers:
+                log.warning("Removed %d leftover(s) of an interrupted export from the "
+                            "exports folder: %s", len(leftovers), ", ".join(leftovers))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted exports failed")
         # Job records survive a restart (#23). After the sweeps, so a job interrupted
         # mid-import is reported failed and its half-built collection already swept.
         # No worker from the previous process is alive, so any job still queued or
@@ -11111,7 +11295,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -11155,7 +11339,7 @@ export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface ImportBody { filename: string; on_conflict: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
@@ -11274,7 +11458,7 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
           <div key={i} className="text-xs bg-gray-50 border rounded p-2">
             <div className="flex justify-between mb-1">
               <span className="font-medium">{c.source_file}</span>
-              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score.toFixed(3)}</span>
+              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score === null ? 'n/a' : c.score.toFixed(3)}</span>
             </div>
             <p className="text-gray-700 italic">{c.excerpt}</p>
           </div>
@@ -11491,12 +11675,15 @@ export default function QAPage() {
   const [showCitations, setShowCitations] = useState(false)
   const [latency, setLatency] = useState<{ ret: number; llm: number } | null>(null)
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
 
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
     // Runs once; a collection already chosen on the Retrieval page is kept.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -11548,6 +11735,7 @@ export default function QAPage() {
           </select>
         )}
       </div>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-3">{listError}</p>}
       <textarea
         value={question}
         onChange={e => setQuestion(e.target.value)}
@@ -11618,15 +11806,33 @@ export default function ImportPage() {
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
+  // A refused create is shown inside the "+ New" modal, where the page-level
+  // line was hidden behind its overlay, and a failed list is shown, not
+  // swallowed (#379).
+  const [newColError, setNewColError] = useState('')
+  const [listError, setListError] = useState('')
 
   const showOverlap = strategy !== 'semantic' && strategy !== 'context_aware'
   const showSimilarity = strategy === 'semantic' && role === 'engineer'
 
-  useEffect(() => {
-    api.getCollections().then(r => {
+  // Resolves to the list, or null when it could not be read; a failure keeps
+  // the options already shown.
+  async function loadCollections(): Promise<CollectionInfo[] | null> {
+    try {
+      const r = await api.getCollections()
       setCollections(r.collections)
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      setListError('')
+      return r.collections
+    } catch (e: unknown) {
+      setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadCollections().then(list => {
+      if (list && list.length > 0) setCollection(list[0].name)
+    })
   }, [])
 
   useEffect(() => {
@@ -11658,14 +11864,27 @@ export default function ImportPage() {
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
       })
-      const r = await api.getCollections()
-      setCollections(r.collections)
-      setCollection(newColName)
-      setShowNewColModal(false)
-      setNewColName('')
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setNewColError(e instanceof Error ? e.message : String(e))
+      return
     }
+    // The create succeeded, so a failed reload is a list error, not a refusal.
+    const created = newColName
+    setShowNewColModal(false)
+    setNewColName('')
+    setNewColError('')
+    await loadCollections()
+    setCollection(created)
+  }
+
+  function openNewCol() {
+    setNewColError('')
+    setShowNewColModal(true)
+  }
+
+  function closeNewCol() {
+    setShowNewColModal(false)
+    setNewColError('')
   }
 
   async function startIngest() {
@@ -11731,8 +11950,9 @@ export default function ImportPage() {
           <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
             {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
           </select>
-          <button onClick={() => setShowNewColModal(true)} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
+          <button onClick={openNewCol} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-2">{listError}</p>}
       </div>
 
       <div className="mb-2">
@@ -11782,8 +12002,9 @@ export default function ImportPage() {
               <option value="hnsw">HNSW (Approximate)</option>
               <option value="flat">Flat (Exact KNN)</option>
             </select>
+            {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowNewColModal(false)} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+              <button onClick={closeNewCol} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
               <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -12150,6 +12371,8 @@ export default function GoldStandardPage() {
   const exportPendingRef = useRef(false)
   const activeSessionRef = useRef('')
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
   const [editingPair, setEditingPair] = useState<GoldPair | null>(null)
@@ -12161,8 +12384,9 @@ export default function GoldStandardPage() {
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }, [])
 
   useEffect(() => {
@@ -12299,6 +12523,7 @@ export default function GoldStandardPage() {
             Generate Pairs
           </button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
         {session && session.status === 'generating' && (
           <div className="mt-3">
@@ -12412,7 +12637,10 @@ import { api, CollectionInfo } from '../api/client'
 
 export default function CollectionsPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [error, setError] = useState('')
+  // A refused create is shown inside the New Collection modal, and a failed
+  // list on the page; both were hidden or swallowed before (#379).
+  const [createError, setCreateError] = useState('')
+  const [listError, setListError] = useState('')
   const [showModal, setShowModal] = useState(false)
   const [name, setName] = useState('')
   const [indexType, setIndexType] = useState('hnsw')
@@ -12427,7 +12655,10 @@ export default function CollectionsPage() {
   const [deleteError, setDeleteError] = useState('')
 
   async function load() {
-    api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
+    api.getCollections().then(r => {
+      setCollections(r.collections)
+      setListError('')
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }
 
   useEffect(() => { load() }, [])
@@ -12437,10 +12668,21 @@ export default function CollectionsPage() {
       await api.createCollection({ name, index_type: indexType, distance_metric: distanceMetric, hnsw_config: { efConstruction, maxConnections, ef } })
       setShowModal(false)
       setName('')
+      setCreateError('')
       load()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setCreateError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function openCreate() {
+    setCreateError('')
+    setShowModal(true)
+  }
+
+  function closeCreate() {
+    setShowModal(false)
+    setCreateError('')
   }
 
   async function deleteCollection() {
@@ -12466,9 +12708,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={() => setShowModal(true)} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
       </div>
-      {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
         <thead>
           <tr className="border-b text-left text-gray-500">
@@ -12534,8 +12776,9 @@ export default function CollectionsPage() {
                 </div>
               </div>
             )}
+            {createError && <p role="alert" className="text-red-600 text-sm mb-4">{createError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowModal(false)} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={closeCreate} className="text-sm text-gray-500">Cancel</button>
               <button onClick={create} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -12584,92 +12827,166 @@ const CONFLICT = [
   { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
 ]
 
+// Both halves poll their job every 2 s. A failed poll is shown and retried;
+// after POLL_ATTEMPTS failures in a row (about a minute, long enough for an API
+// restart) the page stops watching that job and enables its button again, so
+// one transient 502 can no longer leave it stuck until a reload (#382).
+const POLL_MS = 2000
+const POLL_ATTEMPTS = 30
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 export default function TransferPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
+  const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
+  const [exportWatching, setExportWatching] = useState(false)
+  const [exportPollError, setExportPollError] = useState('')
 
   const [packages, setPackages] = useState<PackageSummary[]>([])
+  const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
+  const [importWatching, setImportWatching] = useState(false)
+  const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching.
+  // does not leave a timer running against a job nobody is watching. The job
+  // id being polled is kept too: a poll that answers after the page unmounted,
+  // or after it stopped watching that job, schedules nothing and changes nothing.
+  const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
+  const exportPoll = useRef<string | null>(null)
+  const importPoll = useRef<string | null>(null)
 
   const loadPackages = useCallback(() => {
-    api.getPackages().then(r => setPackages(r.packages)).catch(() => {})
+    api.getPackages().then(r => {
+      setPackages(r.packages)
+      setPackagesError('')
+    }, (e: unknown) => setPackagesError(`Could not list the packages in ./exports: ${message(e)}`))
   }, [])
 
   useEffect(() => {
+    alive.current = true
     api.getCollections().then(r => {
       setCollections(r.collections)
       if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch(() => {})
     loadPackages()
     return () => {
+      alive.current = false
+      exportPoll.current = null
+      importPoll.current = null
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
   }, [loadPackages])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
-  // than discovered afterwards in the manifest.
+  // than discovered afterwards in the manifest. A lookup that fails says so
+  // instead of hiding the line, and an answer for a collection that is no
+  // longer selected is ignored.
   useEffect(() => {
-    if (!collection) { setTune(null); return }
-    api.getTuneOptions(collection).then(setTune).catch(() => setTune(null))
+    setTune(null); setTuneError('')
+    if (!collection) return
+    let current = true
+    api.getTuneOptions(collection).then(t => {
+      if (current) setTune(t)
+    }, (e: unknown) => {
+      if (current) setTuneError(message(e))
+    })
+    return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string) {
+  function pollExport(jobId: string, failures = 0) {
     api.getExportJob(jobId).then(job => {
+      if (exportPoll.current !== jobId) return
       setExportJob(job)
+      setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
+        exportPoll.current = null
+        setExportWatching(false)
         loadPackages()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), 2000)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
-    }).catch((e: unknown) => setExportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (exportPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        exportPoll.current = null
+        setExportWatching(false)
+        setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
+      } else {
+        setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
-  function pollImport(jobId: string) {
+  function pollImport(jobId: string, failures = 0) {
     api.getImportJob(jobId).then(job => {
+      if (importPoll.current !== jobId) return
       setImportJob(job)
+      setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), 2000)
-      } else if (job.status === 'completed') {
+        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        return
+      }
+      importPoll.current = null
+      setImportWatching(false)
+      if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
-    }).catch((e: unknown) => setImportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (importPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        importPoll.current = null
+        setImportWatching(false)
+        setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
+      } else {
+        setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
   async function startExport() {
-    setExportError(''); setExportJob(null)
+    setExportError(''); setExportPollError(''); setExportJob(null)
     try {
       const r = await api.startExport({ collection, include_models: includeModels })
+      if (!alive.current) return
+      exportPoll.current = r.job_id
+      setExportWatching(true)
       pollExport(r.job_id)
     } catch (e: unknown) {
-      setExportError(e instanceof Error ? e.message : String(e))
+      setExportError(message(e))
     }
   }
 
   async function startImport() {
-    setImportError(''); setImportJob(null)
+    setImportError(''); setImportPollError(''); setImportJob(null)
     try {
       const r = await api.startImport({ filename, on_conflict: onConflict })
+      if (!alive.current) return
+      importPoll.current = r.job_id
+      setImportWatching(true)
       pollImport(r.job_id)
     } catch (e: unknown) {
-      setImportError(e instanceof Error ? e.message : String(e))
+      setImportError(message(e))
     }
   }
 
-  const exportBusy = exportJob !== null && exportJob.status !== 'completed' && exportJob.status !== 'failed'
-  const importBusy = importJob !== null && importJob.status !== 'completed' && importJob.status !== 'failed'
+  const exportBusy = exportWatching
+  const importBusy = importWatching
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -12699,7 +13016,7 @@ export default function TransferPage() {
           ))}
         </select>
 
-        {tune && (
+        {tune ? (
           <p className="text-xs mb-3">
             <span className={tune.fidelity === 'with-sources' ? 'text-green-700' : 'text-amber-700'}>
               Fidelity: <strong>{tune.fidelity}</strong>
@@ -12709,7 +13026,13 @@ export default function TransferPage() {
               ? `${tune.source_document_count} original document(s) will travel with the package.`
               : 'No original documents were retained, so the package cannot be re-chunked after import.'}
           </p>
-        )}
+        ) : tuneError ? (
+          <p className="text-xs mb-3 text-red-600">
+            Fidelity: <strong>unknown</strong> — it could not be read: {tuneError}
+          </p>
+        ) : collection ? (
+          <p className="text-xs mb-3 text-gray-500">Fidelity: reading…</p>
+        ) : null}
 
         <label className="flex items-start gap-2 text-sm mb-3">
           <input type="checkbox" checked={includeModels} onChange={e => setIncludeModels(e.target.checked)} className="mt-1" />
@@ -12731,6 +13054,7 @@ export default function TransferPage() {
         </button>
 
         {exportError && <p className="text-red-600 text-sm mt-3">{exportError}</p>}
+        {exportPollError && <p className="text-red-600 text-sm mt-3">{exportPollError}</p>}
         {exportJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -12748,7 +13072,12 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
-            {exportJob.status === 'failed' && <p className="text-red-600">{exportJob.error}</p>}
+            {exportJob.status === 'failed' && (
+              <p className="text-red-600">
+                {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
+                {exportJob.error}
+              </p>
+            )}
             {exportJob.warnings.map((w, i) => (
               <p key={i} className="text-amber-700 text-xs mt-1">{w}</p>
             ))}
@@ -12779,7 +13108,8 @@ export default function TransferPage() {
             </option>
           ))}
         </select>
-        {packages.length === 0 && (
+        {packagesError && <p className="text-red-600 text-xs mb-3">{packagesError}</p>}
+        {packages.length === 0 && !packagesError && (
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
@@ -12808,6 +13138,7 @@ export default function TransferPage() {
         </button>
 
         {importError && <p className="text-red-600 text-sm mt-3">{importError}</p>}
+        {importPollError && <p className="text-red-600 text-sm mt-3">{importPollError}</p>}
         {importJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -13400,6 +13731,20 @@ collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of tha
 interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
 operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
+`scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
+leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
+`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+names, and only a real directory or regular file as the name says: completed packages,
+`ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
+anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
+removed directory, and sizes don't count what links point at. A failed removal is logged and
+not reported as removed, and a missing exports folder is not created. A real lifespan run in a
+child process removes both kinds and logs them by name and size. `02_ingest.sh` runs it in the
+API container. With `RAG_ALLOW_RESTART=1`, `05_transfer.sh` checks after its export restart
+that the interrupted export's build directory and temporary archive are gone, without removing
+anything itself, and that the completed package from the top of the suite is still there.
+
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
 repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
@@ -13543,13 +13888,17 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
@@ -13702,6 +14051,24 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
+
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
@@ -13728,6 +14095,18 @@ health body each show "Service health could not be read:" with the reason and re
 earlier cards, that the next good load clears it, and that the latency metrics load on every
 refresh whatever health answers.
 
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
+
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
 It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
@@ -13740,6 +14119,22 @@ tried again; that 1,100 concurrent records all land; and that a restart restores
 records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
 files a crash left, and starts when the file can't be read or compacted. It also checks the
 `IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+
+Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
+`scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
+the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
+`1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
+first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
+`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+rounds numbers and passes `null` through, and `/query` returns it. It also checks the
+`IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
+project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
+vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled, and checks the
+scores against the expected similarities; then it deletes the cosine collection, recreates it
+with l2-squared, and checks the next query uses the new metric. With models, the suite checks
+that in each of the four modes the citation scores are numbers, highest first.
+`browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
+`n/a` for a `null` score.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
@@ -15342,6 +15737,9 @@ check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -16304,6 +16702,10 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
+# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
+check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
@@ -16608,6 +17010,13 @@ section "§10.2 Query"
 # controlled, in the API image with no network.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
 check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
+# Citation scores are higher-is-better in every mode, and null when missing (#376):
+# controlled in the API image with no network, then on the real Weaviate with each
+# distance metric (models controlled, no LLM work).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_citation_score.py)
+check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
+check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -16642,7 +17051,7 @@ import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
 c = d.get('citations') or []
 ok = bool(c) and all(
     isinstance(x.get('source_file'), str) and x['source_file']
-    and isinstance(x.get('score'), (int, float))
+    and (x.get('score') is None or isinstance(x.get('score'), (int, float)))
     and isinstance(x.get('chunk_index'), int)
     and isinstance(x.get('excerpt'), str) for x in c)
 sys.exit(0 if ok else 1)"
@@ -16663,6 +17072,14 @@ try: d=json.load(open('/tmp/vfy_ans.json'))
 except Exception: sys.exit(1)
 sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
   check "retrieval mode '$mode' returns results" $?
+  python3 -c "
+import json,sys
+try: c=json.load(open('/tmp/vfy_ans.json')).get('citations') or []
+except Exception: sys.exit(1)
+s=[x.get('score') for x in c]
+sys.exit(0 if s and all(isinstance(v,(int,float)) for v in s) and s==sorted(s,reverse=True) else 1)"
+  check "retrieval mode '$mode' citation scores are numbers, best (highest) first (#376)" $? \
+    "$(python3 -c "import json;print([x.get('score') for x in json.load(open('/tmp/vfy_ans.json')).get('citations') or []])" 2>/dev/null)"
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
@@ -16684,6 +17101,119 @@ check "end_user answers are shorter than engineer on average" $? \
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/citation_score.py
+
+```python
+"""Citation scores on a real Weaviate: higher is better, by the collection's metric (#376).
+
+Inside the disposable API container (`03_query.sh`):
+
+    docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py
+
+Creates owned collections with each distance metric through `POST /collections`,
+inserts known vectors, and asks `/query` in the `hnsw` and `flat` modes with
+Ollama's reformulation, embedding and answer controlled. Weaviate's distances
+are real. Then deletes one collection, recreates it under the same name with
+another metric, and checks the next query converts by the new metric. Its
+collections are deleted at the end, pass or fail.
+"""
+import math
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from services import weaviate_client as wc
+
+prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
+QUERY = [1.0, 0.0, 0.0, 0.0]
+
+
+def unit(cos):
+    return [cos, math.sqrt(1 - cos * cos), 0.0, 0.0]
+
+
+# metric -> (vectors, expected score of each against QUERY), best match first.
+CASES = {
+    "cosine": ([unit(c) for c in (0.95, 0.6, 0.1, -0.5)], [0.95, 0.6, 0.1, -0.5]),
+    "dot": ([[a, 0.0, 0.0, 0.0] for a in (3.0, 1.5, -0.5, -2.0)], [3.0, 1.5, -0.5, -2.0]),
+    "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
+}
+
+client = TestClient(app)
+created = []
+failures = []
+
+
+def create(name, metric, index_type):
+    response = client.post("/collections", json={"name": name, "index_type": index_type,
+                                                  "distance_metric": metric})
+    assert response.status_code == 201, response.text
+    if name not in created:
+        created.append(name)
+    coll = wc.get_client().collections.get(name)
+    for i, vector in enumerate(CASES[metric][0]):
+        coll.data.insert(properties={"content": f"Score chunk {i}", "source_file": "score.txt",
+                                     "chunk_index": i}, vector=vector)
+
+
+def check(name, metric):
+    expected = CASES[metric][1]
+    for mode in ("hnsw", "flat"):
+        with patch("services.rag_pipeline.ollama.chat", new=AsyncMock(return_value="Controlled")), \
+                patch("services.rag_pipeline.ollama.embed", new=AsyncMock(return_value=QUERY)):
+            response = client.post("/query", json={"collection": name, "question": "score",
+                                                   "retrieval_mode": mode, "top_k": 4,
+                                                   "include_citations": True})
+        label = f"{metric} collection, {mode} mode"
+        if response.status_code != 200:
+            failures.append(f"{label}: {response.status_code} {response.text}")
+            continue
+        got = [c["score"] for c in response.json()["citations"]]
+        ok = (len(got) == len(expected)
+              and all(isinstance(g, (int, float)) and abs(g - e) < 1e-3 for g, e in zip(got, expected))
+              and got == sorted(got, reverse=True))
+        print(("PASS " if ok else "FAIL ") + f"{label}: scores {got}, expected {expected}", flush=True)
+        if not ok:
+            failures.append(f"{label}: scores {got}, expected {expected}")
+
+
+with tempfile.TemporaryDirectory(prefix="citation-score-") as directory, \
+        patch.object(settings, "upload_dir", directory):
+    try:
+        for metric, index_type in (("cosine", "hnsw"), ("dot", "flat"), ("l2-squared", "flat")):
+            name = prefix + metric.replace("-", "").capitalize()
+            create(name, metric, index_type)
+            check(name, metric)
+        # Same name, another metric: the next query must use the new metric.
+        name = prefix + "Cosine"
+        response = client.delete("/collections/" + name + "?confirm=true")
+        assert response.status_code == 200, response.text
+        create(name, "l2-squared", "hnsw")
+        print("recreated " + name + " with l2-squared", flush=True)
+        check(name, "l2-squared")
+    finally:
+        for name in created:
+            try:
+                if wc._collection_exists_sync(name):
+                    response = client.delete("/collections/" + name + "?confirm=true")
+                    if response.status_code != 200:
+                        failures.append(f"cleanup {name}: {response.status_code} {response.text}")
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"cleanup {name}: {error!r}")
+        wc.close_client()
+
+if failures:
+    print("FAIL " + "; ".join(failures), flush=True)
+    sys.exit(1)
+print("PASS citation scores convert by each collection's metric, best first", flush=True)
 ```
 
 ### scripts/verify/12_persistence.sh
@@ -16911,6 +17441,21 @@ section "§10.3 Gold Standard"
 bash ./09_sampling.sh
 check "UUID sampling acceptance" $?
 
+# Review errors need no model: an unknown session is SESSION_NOT_FOUND, an
+# unknown pair PAIR_NOT_FOUND, and an empty edit is refused with 422 (#381).
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_review.py)
+check "review 404 codes and empty-edit refusal" $?
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/gs_00000000/pair/p_1" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X POST \
+  "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+  -d '{"session_id":"gs_00000000","pair_id":"p_1"}')
+check_eq "regenerate on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
@@ -16993,6 +17538,15 @@ code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
 check_eq "a status-only change is accepted" "$code" "200"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"status":"edited","question":""}')
+check_eq "an empty question is refused" "$code" "422"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/p_unknown" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown pair returns 404 PAIR_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 PAIR_NOT_FOUND"
 
 # ── regenerate replaces exactly one pair ─────────────────────────────────────
 if [ "$actual" -ge 2 ]; then
@@ -17744,9 +18298,23 @@ for mode in abs link; do
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
-  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
-  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
-    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  RECHUNK="{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation refuses the source-dependent starts with
+    # the typed 409, before any job is created (#389).
+    for route in rechunk reembed; do
+      check_eq "E29: $route with chunking on an on-disk abs entry is HTTP 409" \
+        "$(api_post_code "/tune/$route" "$RECHUNK")" "409"
+      api_post "/tune/$route" "$RECHUNK" > /tmp/vfy_tj.json
+      check_eq "E29: ... with error code SOURCE_INDEX_INVALID and no job ($route)" \
+        "$(jfield "['error']['code']" < /tmp/vfy_tj.json) $(jfield ".get('job_id')" < /tmp/vfy_tj.json)" \
+        "SOURCE_INDEX_INVALID None"
+    done
+  else
+    api_post "/tune/rechunk" "$RECHUNK" > /tmp/vfy_tj.json
+    check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
   if [ "$mode" = abs ]; then
     # An index that fails validation is a typed 409, not a 500, and doesn't
@@ -18238,6 +18806,9 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
+    # The build directory this export is writing; the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -18259,12 +18830,20 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
-    # The killed build's leftovers are the container's (root, mode 0700): remove
-    # only the build directories that appeared during this export.
-    builds_after=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
+    # The killed build's leftovers (root, mode 0700) are the startup sweep's to
+    # remove (#377): its build directory and any temporary archive must be gone,
+    # and the completed package from the top of this suite still there.
+    check "the interrupted export had a build directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
-    (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
+        if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
+      done; echo checked' sh $killed)
+    check "the restart removes the interrupted export's build directory and temporary archive" \
+      "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
+    check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
+      "$EXPORTS/$PKG is gone"
   fi
 
   # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
@@ -19017,7 +19596,7 @@ async function fixture(browser, base) {
       }
       if (path === '/api/query') {
         entry.done = true;
-        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+        return Promise.resolve(response(window.queryConfigFixture.queryResult || { answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
       }
       if (path.startsWith('/api/retrieval/config')) {
         return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
@@ -19233,6 +19812,31 @@ async function runQueryConfigTests(browser, base, reporter) {
     await assertSettings(page, { ...A, top_k: 19 });
     assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
   }]);
+  // #376: a citation's score is a number (higher is better) or null when Weaviate gave none.
+  cases.push(['citations show a numeric score and n/a for a null score', async page => {
+    await page.evaluate(() => {
+      window.queryConfigFixture.queryResult = {
+        answer: 'Fixture answer', retrieval_latency_ms: 1, llm_latency_ms: 1, chunks_retrieved: 2,
+        citations: [
+          { source_file: 'scored.txt', chunk_index: 3, score: 0.9123, excerpt: 'Scored excerpt' },
+          { source_file: 'unscored.txt', chunk_index: 4, score: null, excerpt: 'Unscored excerpt' },
+        ],
+      };
+    });
+    assert.equal(await clickByText(page, 'Q&A'), true);
+    await page.waitForSelector('textarea');
+    await page.evaluate(() => {
+      const box = [...document.querySelectorAll('label')].find(l => l.innerText.includes('Show source citations')).querySelector('input');
+      if (!box.checked) box.click();
+    });
+    await setValue(page, '() => document.querySelector("textarea")', 'Which sources?');
+    assert.equal(await clickByText(page, 'Ask'), true);
+    await page.waitForFunction(() => document.body.innerText.includes('Unscored excerpt') || document.body.innerText.includes('Fixture answer'));
+    await sleep(200);
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /chunk 3 \S score 0\.912\b/, 'the numeric score is not shown with 3 decimals');
+    assert.match(text, /chunk 4 \S score n\/a/, 'the null score is not shown as n/a');
+  }]);
   for (const [name, test] of cases) {
     let s;
     try {
@@ -19274,7 +19878,7 @@ if (require.main === module) {
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -19285,6 +19889,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
+
+  await require('./transfer_page').runTransferPageTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -19613,6 +20219,123 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
               await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
+  }
+
+  // ── refused creates and failed collection lists (#379) ───────────────────
+  // A refused create went to the page-level error line behind the modal's
+  // overlay, so it looked like nothing happened, and a failed GET /collections
+  // was swallowed, so an outage looked like "no collections". The POSTs and the
+  // failing lists are answered here, so no collection is created.
+  r.section('refused creates and failed collection lists (#379)');
+  {
+    const LIST_FAIL = 'Synthetic list failure (#379).';
+    const LIST_MESSAGE = 'Could not load the collections: ' + LIST_FAIL;
+    const EXISTS = "Collection 'VfyRefused379' already exists.";
+    const listFailure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: LIST_FAIL, detail: null } }) };
+    const refusal = { status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_EXISTS', message: EXISTS, detail: null } }) };
+    const accepted = { status: 201, contentType: 'application/json', body: JSON.stringify({ name: 'VfyRefused379', status: 'created' }) };
+    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => a.textContent.trim()));
+    // The New Collection modal, and the alert inside it, if any.
+    const modal = page => page.evaluate(() => {
+      const h = [...document.querySelectorAll('h2')].find(x => x.textContent.trim() === 'New Collection');
+      const box = h && h.parentElement;
+      const alert = box && box.querySelector('[role=alert]');
+      return { open: !!h, alert: alert ? alert.textContent.trim() : null };
+    });
+    // Answers GET and POST /api/collections as the test's current modes say.
+    async function stub(s) {
+      const mode = { list: 'pass', post: 'refuse' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'GET' && mode.list === 'fail') return request.respond(listFailure);
+        if (request.method() === 'POST') return request.respond(mode.post === 'refuse' ? refusal : accepted);
+        return request.continue();
+      });
+      return mode;
+    }
+    const posts = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/collections').length;
+
+    // A failed list on each page that loads one.
+    for (const path of ['/collections', '/import', '/qa', '/goldstandard']) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const shown = await alerts(s.page);
+        r.check(`${path}: a failed collection list is shown as an alert`, shown.includes(LIST_MESSAGE), JSON.stringify(shown));
+        r.check(`${path}: a failed collection list causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Collections page: a refused create, then a successful one, which also
+    // reloads the list and clears the failed-list message.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=Name]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Collections: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Collections: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Collections: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'pass';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        r.check('Collections: a successful create closes the modal', !done.open, JSON.stringify(done));
+        const after = await alerts(s.page);
+        r.check('Collections: the next successful list clears the failed-list message', !after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Collections: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Collections create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Import page "+ New": a refused create, then a successful one whose list
+    // reload fails, which is a list error, not a refused create.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Import: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Import: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Import: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'fail';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        const after = await alerts(s.page);
+        r.check('Import: a successful create closes the modal even when the list reload fails', !done.open, JSON.stringify(done));
+        r.check('Import: a failed reload after a create is shown as a failed list', after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
   }
 
   // ── upload size limit ──────────────────────────────────────────────────────
@@ -20703,9 +21426,9 @@ from unittest.mock import patch, AsyncMock
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
-from services import goldstandard as gs, weaviate_client as wc, importer
+from services import goldstandard as gs, weaviate_client as wc, importer, packager
 async def run():
-    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]):
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
         async with lifespan(app):
             print(json.dumps(gs.get_session('gs_450abcde')))
 asyncio.run(run())
@@ -22480,7 +23203,7 @@ async def proof():
 asyncio.run(proof())
 print('PASS independent API lifespan restores recovery, exact records and historical session')
 """
-    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources'),'EXPORTS_DIR':str(Path(temp)/'exports')}
     restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
     if restarted.returncode:print(restarted.stderr,flush=True)
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
@@ -24484,6 +25207,238 @@ if (require.main === module) (async () => {
 })().catch(e => { console.error(e); process.exitCode = 2; });
 ```
 
+### scripts/verify/browser/transfer_page.js
+
+```javascript
+// Transfer page polling and failure display (#382), against the rendered page
+// with every API call stubbed in the browser; no backend reads or writes.
+//
+// Each case gets fresh fetch stubs. Fixed answers cover the collections, the
+// package list and the fidelity lookup unless a case holds them; every other
+// /api/ request is held until the case releases it with a status and body. The
+// page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
+// second.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue } = require('./lib');
+
+const A = 'VfyTransferA', B = 'VfyTransferB';
+const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
+const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
+const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
+const json = (status, body) => ({ status, body: JSON.stringify(body) });
+const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
+// nginx's own page when the API is down; request() turns it into this message.
+const BAD_GATEWAY = { status: 502, body: '<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>' };
+const DOWN = 'The API is not responding. It may still be starting; try again in a minute.';
+const exportJob = (status, extra = {}) => json(200, { job_id: 'vfyexp', status, collection: A, chunks_written: 1, filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null, retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null, ...extra });
+const importJob = (status, extra = {}) => json(200, { job_id: 'vfyimp', status, filename: PACKAGE, on_conflict: 'abort', collection: null, original_collection: null, chunks_written: 1, fidelity: null, renamed: false, notes: [], error: null, error_code: null, error_detail: null, ...extra });
+
+const HALVES = {
+  export: { start: '/api/export', started: json(202, { job_id: 'vfyexp', status: 'queued', collection: A }), poll: '/api/export/job/vfyexp', job: exportJob, idle: 'Export', busy: 'Exporting…', progress: "the export's progress",
+            done: exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true }) },
+  import: { start: '/api/import', started: json(202, { job_id: 'vfyimp', status: 'queued', filename: PACKAGE }), poll: '/api/import/job/vfyimp', job: importJob, idle: 'Import', busy: 'Importing…', progress: "the import's progress",
+            done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
+};
+
+async function fixture(browser, base, { hold = [] } = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  const fixed = {
+    'GET /api/collections': json(200, collectionsBody),
+    'GET /api/packages': json(200, packagesBody),
+    ['GET /api/tune/' + A]: json(200, tuneBody(A)),
+    ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+  };
+  for (const key of hold) delete fixed[key];
+  await page.evaluateOnNewDocument(answers => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
+    const realFetch = window.fetch.bind(window);
+    window.transferFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const entry = { path, method, done: false };
+      window.transferFixture.requests.push(entry);
+      const answer = answers[method + ' ' + path];
+      if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
+      return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
+    };
+  }, fixed);
+  await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
+  return { ctx, page, errors };
+}
+
+const count = (page, path, method = 'GET') => page.evaluate((p, m) => window.transferFixture.requests.filter(r => r.path === p && r.method === m).length, path, method);
+async function pending(page, path, method = 'GET') {
+  await page.waitForFunction((p, m) => window.transferFixture.requests.some(r => r.path === p && r.method === m && !r.done), { timeout: 5000 }, path, method)
+    .catch(() => { throw new Error(`no ${method} ${path} request arrived`); });
+}
+async function release(page, path, answer, method = 'GET') {
+  await pending(page, path, method);
+  await page.evaluate((p, m, status, body) => {
+    window.transferFixture.requests.find(r => r.path === p && r.method === m && !r.done).resolve(status, body);
+  }, path, method, answer.status, answer.body);
+}
+const text = page => page.evaluate(() => document.body.innerText.replace(/\s+/g, ' '));
+async function waitText(page, want, gone = false) {
+  await page.waitForFunction((w, g) => document.body.innerText.replace(/\s+/g, ' ').includes(w) !== g, { timeout: 5000 }, want, gone)
+    .catch(async () => { throw new Error(`${gone ? 'still shows' : 'never showed'} "${want}"; page: ${(await text(page)).slice(0, 600)}`); });
+}
+// The half's start button, found by either of its labels.
+const button = (page, half) => page.evaluate((idle, busy) => {
+  const b = [...document.querySelectorAll('button')].find(x => [idle, busy].includes(x.textContent.trim()));
+  return b ? { label: b.textContent.trim(), disabled: b.disabled } : null;
+}, HALVES[half].idle, HALVES[half].busy);
+async function expectButton(page, half, busy) {
+  const want = busy ? HALVES[half].busy : HALVES[half].idle;
+  await page.waitForFunction((label, disabled) => [...document.querySelectorAll('button')].some(x => x.textContent.trim() === label && x.disabled === disabled), { timeout: 5000 }, want, busy)
+    .catch(async () => { throw new Error(`expected "${want}" ${busy ? 'disabled' : 'enabled'}, got ${JSON.stringify(await button(page, half))}`); });
+}
+// Buttons only by default: the nav has an "Import" link as well as the Import button.
+const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
+  const b = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
+  if (!b) return false; b.click(); return true;
+}, label, selector);
+
+// Selects the package (import) and starts the half; leaves its start request held.
+async function start(page, half) {
+  if (half === 'import') {
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(PACKAGE)}))`, PACKAGE);
+  }
+  await expectButton(page, half, false);
+  assert.equal(await click(page, HALVES[half].idle), true, `no ${HALVES[half].idle} button`);
+  await pending(page, HALVES[half].start, 'POST');
+}
+async function startAndPoll(page, half) {
+  await start(page, half);
+  await release(page, HALVES[half].start, HALVES[half].started, 'POST');
+  await pending(page, HALVES[half].poll);
+}
+const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
+const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
+
+async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+async function runTransferPageTests(browser, base, reporter) {
+  reporter.section('Transfer page polling and failures (#382)');
+  const cases = [];
+  for (const half of ['export', 'import']) {
+    const h = HALVES[half];
+    cases.push([`${half}: a failed poll is shown and retried with the button still busy, and the next good poll clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.job('running'));
+      await waitText(page, retrying(half), true);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.done);
+      await waitText(page, 'Done.');
+      await waitText(page, retrying(half), true);
+      await expectButton(page, half, false);
+    }]);
+    cases.push([`${half}: after 30 failed polls in a row polling stops, the reason is shown and the button is usable; a new start clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      for (let i = 0; i < 30; i++) await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, stopped(half));
+      await expectButton(page, half, false);
+      const polls = await count(page, h.poll);
+      await sleep(400);
+      assert.equal(await count(page, h.poll), polls, 'polling went on after the limit');
+      assert.equal(polls, 31, 'one good poll and 30 failed ones');
+      await start(page, half);
+      await waitText(page, stopped(half), true);
+    }]);
+    cases.push([`${half}: a poll in flight when the page is left schedules no further poll`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      await pending(page, h.poll);
+      assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+      await page.waitForFunction(() => location.pathname === '/collections');
+      await release(page, h.poll, h.job('running'));
+      await sleep(400);
+      assert.equal(await count(page, h.poll), 2, 'a poll was sent after the page was left');
+    }]);
+  }
+  cases.push(['export: a start answered after the page was left starts no polling', async page => {
+    await start(page, 'export');
+    assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+    await page.waitForFunction(() => location.pathname === '/collections');
+    await release(page, HALVES.export.start, HALVES.export.started, 'POST');
+    await sleep(400);
+    assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
+                                     [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],
+                                     [404, 'COLLECTION_NOT_FOUND', `Collection '${A}' not found.`]]) {
+    cases.push([`fidelity: a ${status} ${code} from /tune is labelled, not hidden`, async page => {
+      await pending(page, '/api/tune/' + A);
+      await waitText(page, 'Fidelity: reading…');
+      await release(page, '/api/tune/' + A, apiError(status, code, msg));
+      await waitText(page, `Fidelity: unknown — it could not be read: ${msg}`);
+    }, { hold: ['GET /api/tune/' + A] }]);
+  }
+  cases.push(['fidelity: a good lookup shows the fidelity line', async page => {
+    await waitText(page, 'Fidelity: with-sources — 2 original document(s) will travel with the package.');
+  }]);
+  cases.push(['fidelity: a late answer for a collection no longer selected is ignored', async page => {
+    await pending(page, '/api/tune/' + A);
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(B)}))`, B);
+    await release(page, '/api/tune/' + B, json(200, { ...tuneBody(B), fidelity: 'chunks-only', source_document_count: 0 }));
+    await waitText(page, 'Fidelity: chunks-only');
+    await release(page, '/api/tune/' + A, apiError(503, 'SERVICE_UNAVAILABLE', 'Synthetic late failure.'));
+    await sleep(300);
+    const shown = await text(page);
+    assert.ok(shown.includes('Fidelity: chunks-only') && !shown.includes('Synthetic late failure.'), shown.slice(0, 600));
+  }, { hold: ['GET /api/tune/' + A, 'GET /api/tune/' + B] }]);
+  cases.push(['export: a refused export shows its error_code', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('failed', { error: 'PackageError: Synthetic embedding model mismatch.', error_code: 'EMBEDDING_MISMATCH', error_detail: { expected: 'a', found: 'b' } }));
+    await waitText(page, 'Failed.');
+    const codes = await page.evaluate(() => [...document.querySelectorAll('code')].map(c => c.textContent.trim()));
+    assert.ok(codes.includes('EMBEDDING_MISMATCH'), `codes shown: ${JSON.stringify(codes)}`);
+    await waitText(page, 'Synthetic embedding model mismatch.');
+    await expectButton(page, 'export', false);
+  }]);
+  cases.push(['packages: a failed list is shown without the empty-folder hint, and a good Refresh clears it', async page => {
+    await release(page, '/api/packages', apiError(500, 'INTERNAL_ERROR', 'Synthetic package list failure.'));
+    await waitText(page, 'Could not list the packages in ./exports: Synthetic package list failure.');
+    assert.ok(!(await text(page)).includes('Nothing in ./exports yet'), 'the empty-folder hint is shown for a failed list');
+    assert.equal(await click(page, 'Refresh'), true, 'no Refresh button');
+    await release(page, '/api/packages', json(200, packagesBody));
+    await waitText(page, 'Could not list the packages', true);
+    const listed = await page.evaluate(p => [...document.querySelectorAll('option')].some(o => o.value === p), PACKAGE);
+    assert.equal(listed, true, 'the package is not listed after a good Refresh');
+  }, { hold: ['GET /api/packages'] }]);
+
+  for (const [name, test, opts] of cases) {
+    let s;
+    try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+
+module.exports = { runTransferPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runTransferPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
 ### scripts/verify/legacy_retrieval.py
 
 ```python
@@ -25953,6 +26908,7 @@ class TelemetryTests(unittest.TestCase):
             importer.sweep_interrupted_imports=lambda:[]
             importer.sweep_stale_workdirs=lambda:[]
             service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
+                                    packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}

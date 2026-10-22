@@ -24,6 +24,9 @@ check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP

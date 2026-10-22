@@ -35,7 +35,7 @@ async function fixture(browser, base) {
       }
       if (path === '/api/query') {
         entry.done = true;
-        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+        return Promise.resolve(response(window.queryConfigFixture.queryResult || { answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
       }
       if (path.startsWith('/api/retrieval/config')) {
         return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
@@ -250,6 +250,31 @@ async function runQueryConfigTests(browser, base, reporter) {
     await release(page, '/api/retrieval/config', A, { method: 'POST' });
     await assertSettings(page, { ...A, top_k: 19 });
     assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+  }]);
+  // #376: a citation's score is a number (higher is better) or null when Weaviate gave none.
+  cases.push(['citations show a numeric score and n/a for a null score', async page => {
+    await page.evaluate(() => {
+      window.queryConfigFixture.queryResult = {
+        answer: 'Fixture answer', retrieval_latency_ms: 1, llm_latency_ms: 1, chunks_retrieved: 2,
+        citations: [
+          { source_file: 'scored.txt', chunk_index: 3, score: 0.9123, excerpt: 'Scored excerpt' },
+          { source_file: 'unscored.txt', chunk_index: 4, score: null, excerpt: 'Unscored excerpt' },
+        ],
+      };
+    });
+    assert.equal(await clickByText(page, 'Q&A'), true);
+    await page.waitForSelector('textarea');
+    await page.evaluate(() => {
+      const box = [...document.querySelectorAll('label')].find(l => l.innerText.includes('Show source citations')).querySelector('input');
+      if (!box.checked) box.click();
+    });
+    await setValue(page, '() => document.querySelector("textarea")', 'Which sources?');
+    assert.equal(await clickByText(page, 'Ask'), true);
+    await page.waitForFunction(() => document.body.innerText.includes('Unscored excerpt') || document.body.innerText.includes('Fixture answer'));
+    await sleep(200);
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /chunk 3 \S score 0\.912\b/, 'the numeric score is not shown with 3 decimals');
+    assert.match(text, /chunk 4 \S score n\/a/, 'the null score is not shown as n/a');
   }]);
   for (const [name, test] of cases) {
     let s;
