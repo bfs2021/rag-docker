@@ -911,6 +911,12 @@ special-case a new collection.
 system defaults (`hnsw`, `top_k: 5`, `alpha: 0.75`, `ef: null`,
 `response_format: "end_user"`).
 
+A saved file that can't be read, isn't JSON, holds JSON that isn't an object, or has a
+field of the wrong type (for example `"top_k": "x"`) is logged as a warning, and the
+response is the defaults with `is_default: true`, never an error (#439). Fields of the
+right type are returned as saved, missing fields are filled from the defaults, and an
+export still refuses such a file (RAG_EXPORT_SPECIFICATIONS.md §5).
+
 Saved `ef` is a legacy inactive field, not a query override. `GET /collections` reports actual HNSW settings as `hnsw_config` (ef, efConstruction, maxConnections), or null for a Flat, Dynamic or unrecognized index configuration. An unavailable distance metric is reported as `unknown`. Both hnsw/flat query-mode names use the existing physical index.
 
 ---
