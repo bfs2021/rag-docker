@@ -292,20 +292,23 @@ def _check_embedding(manifest: dict) -> None:
 
     if pkg_model != our_model:
         fidelity = manifest.get("fidelity")
-        remedy = ("This package is `with-sources`, so it can be re-embedded after "
-                  "import once that is supported."
+        # Nothing re-embeds a refused package, whatever its fidelity (#390).
+        remedy = (f"Use an instance running '{pkg_model}', or re-export from one."
                   if fidelity == "with-sources" else
                   "This package is `chunks-only`, so it cannot be re-embedded from "
                   "the original documents. Use an instance running "
                   f"'{pkg_model}', or re-export from one.")
+        actual = _probe_dimensions()
+        ours = (f"{actual} dimensions" if actual is not None else
+                "whose dimension count couldn't be read from Ollama")
         raise PackageError(
             "EMBEDDING_MISMATCH",
             f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
-            f"but this instance uses '{our_model}'. Vectors from a different model "
-            f"are meaningless here, not merely different, so the import is refused. "
-            + remedy,
+            f"but this instance uses '{our_model}' ({ours}). Vectors from a different "
+            f"model are meaningless here, not merely different, so the import is "
+            f"refused. " + remedy,
             {"package_model": pkg_model, "package_dimensions": pkg_dims,
-             "instance_model": our_model})
+             "instance_model": our_model, "instance_dimensions": actual})
 
     # Same model name but a different width means one side is not what it claims.
     if pkg_dims is not None:
@@ -443,7 +446,16 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Could not install bundled model '{name}': {exc}",
                 {"model": name}) from exc
-        if not model_bundle.is_installed(model):
+        # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
+        reported = _ollama_reports(model)
+        if reported is None:
+            raise PackageError(
+                "IMPORT_FAILED",
+                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"confirm it is there. Check that the ollama service is running, "
+                f"then import again.",
+                {"model": name})
+        if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",

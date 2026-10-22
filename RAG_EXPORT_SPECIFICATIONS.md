@@ -436,8 +436,13 @@ exports. They MUST NOT abort flagging after a collection has been deleted.
 Check 4 is a refusal, not a warning. Vectors from a different model are
 meaningless rather than merely different, and a collection built from them
 answers every query confidently and wrongly. The error MUST name both models and
-both dimension counts, and state that re-embedding is available when the package
-is `with-sources`.
+both dimension counts, in the message and in `detail` (`package_model`,
+`package_dimensions`, `instance_model`, `instance_dimensions`). This instance's
+count comes from an embedding call; when Ollama can't answer it, the import is
+still refused, `instance_dimensions` is `null` and the message says the count
+couldn't be read. A refused package is not re-embedded, whatever its fidelity, so
+the error offers no re-embedding: the remedy is an instance running the package's
+model, or a re-export from one (#390).
 
 ### 6.3 Bundled models
 
@@ -483,7 +488,7 @@ On import:
 |---|---|
 | Model present and its files match their checksums | skip; do not overwrite. A target's existing model is assumed deliberate |
 | Model present but a file is missing or doesn't match its checksum | embedding model: fail with `MODEL_INTEGRITY_FAILED`, naming the model and saying to restore or re-pull it. LLM: note it on the import and continue. Never overwrite it: blobs are shared, and replacing one could affect other models |
-| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding |
+| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding. If Ollama doesn't report it: the embedding model fails `EMBEDDING_MODEL_MISSING`, the LLM `IMPORT_FAILED`. If Ollama can't be reached, either fails `IMPORT_FAILED`, saying so rather than calling the model missing |
 | Model absent, package does not bundle it | fail with `EMBEDDING_MODEL_MISSING`, naming the model and stating that it must be pulled or a `with-models` package used |
 | Namespaced model name (`user/model`) | it has no path in the model store, so it can't be checked or installed from a package. If Ollama reports it, note that its files weren't checked and continue. If not: the embedding model fails `EMBEDDING_MODEL_MISSING`, saying to pull it; the LLM gets a note. If Ollama can't be reached, the embedding model fails `IMPORT_FAILED`, saying so rather than calling the model missing; the LLM gets a note |
 
