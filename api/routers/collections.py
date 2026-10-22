@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from models.schemas import (
     CollectionInfo,
+    CollectionName,
     CollectionsResponse,
     CreateCollectionRequest,
 )
@@ -126,7 +127,7 @@ def _busy_error(name: str, jobs: list[tuple[str, str]]):
 
 
 @router.delete("/{name}", status_code=200)
-async def delete_collection(name: str, confirm: str | None = None):
+async def delete_collection(name: CollectionName, confirm: str | None = None):
     # Checked first, before the collection is even looked up, and as text, so a
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":

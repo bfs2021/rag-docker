@@ -351,7 +351,11 @@ completion, the written filename.
 - When Weaviate can't be read to check whether the collection exists, the export
   fails with HTTP 503 `SERVICE_UNAVAILABLE` before any job is created; `detail` is
   `{"collection": "<name>"}`. The cause is logged, not returned (#366).
-- Only one export per collection may run at a time; a second request while one is
+- The requested name is first replaced by the name as stored, its first character
+  upper-cased (`SPECIFICATIONS.md` §3.1, #372), so `policies` exports `Policies`
+  with its retained originals and gold-standard sessions.
+- Only one export per collection may run at a time, whichever first-letter spelling
+  each request uses (#372); a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
   concurrent exports would race on the temporary file described below. A request
   that arrives while that export is still storing its first record waits for it,

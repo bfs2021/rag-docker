@@ -237,6 +237,17 @@ healthcheck:
 
 ### 3.1 Endpoints
 
+**Collection names (#372).** Weaviate stores a collection under its name with the first
+character upper-cased and the rest unchanged (`myDocs` is stored as `MyDocs`). Every
+endpoint that takes a collection name from the caller, in the body, the path, the query
+string or a form field, replaces it with that stored name before using it. So whichever
+spelling of the first character a request uses, the registry entry, retained originals,
+ingest and retrieval settings, gold-standard sessions, query metrics and job guards are
+keyed by the stored name, and responses and messages that name the collection give it.
+Nothing else is case-folded: `mydocs` is a different name from `MyDocs`. Import takes its
+name from the package, which must already be in this form (`RAG_EXPORT_SPECIFICATIONS.md`).
+State written under a lowercase-first spelling before #372 is not moved or renamed.
+
 #### 3.1.1 Health
 
 ```
@@ -367,6 +378,9 @@ ignore valid HNSW settings.
 ```json
 { "name": "Documents", "status": "created" }
 ```
+
+`name` is the name as stored (§3.1, #372): a request for `myDocs` answers `MyDocs`, and
+`collection_registry.json` records its `created_at` under `MyDocs`.
 
 **Response 409** if collection already exists.
 
@@ -1174,7 +1188,9 @@ answer, the record still counts in the ring, and the API still starts. A line le
 by a failed write doesn't cost the next record, which starts a line of its own.
 
 **Query parameters:** `collection`, `retrieval_mode` (both optional filters), and
-`history_limit` (integer, 0-500, default 100).
+`history_limit` (integer, 0-500, default 100). Queries are recorded, and `collection` is
+matched, under the stored collection name (§3.1, #372), so `myDocs` and `MyDocs` select the
+same records.
 
 **Response 200:**
 ```json
@@ -1910,7 +1926,7 @@ settings, regardless of when a prior collection's save completes.
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
 - File list showing queued files with remove buttons.
-- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list.
+- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list. After a create, the selector selects the new collection under the name the API answered with, which is the name the list shows (`myDocs` selects `MyDocs`, #372).
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
@@ -2290,6 +2306,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] A collection created, ingested into, configured, queried, exported, tuned or used for gold-standard generation under a lowercase-first spelling keeps all its state under the stored name: the 201 answers `MyDocs` for `myDocs`, the list shows its `created_at`, its originals are retained under the stored name so export is with-sources and re-chunk finds them, one settings file serves both spellings, and the metrics filter and the one-export guard treat both spellings as one collection (#372).
+      *`test_collection_spelling.py` (run by `02_ingest.sh`) drives each route through the app with a lowercase-first name and checks the name every worker, file and record receives; it fails on the code before #372. `05_transfer.sh` creates, ingests, exports and re-chunks a lowercase-first name on the verify stack and, with LLM work, checks a query's metrics under both spellings. `ui_criteria.js` checks the Import page selects the created collection as stored.*
 - [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources, configurations and registry entries, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies. Import-replace notes count sessions under both spellings.
       *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration. The live backend rejects case-only neighbouring collections; Linux-volume checks still verify case-distinct sidecar/session preservation, while controlled tests cover both backend collections.*
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.

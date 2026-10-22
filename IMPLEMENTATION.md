@@ -726,7 +726,9 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+
+from services.collection_writes import canonical
 
 
 def _numeric(value):
@@ -755,6 +757,10 @@ TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
+# A collection name as a caller sends it, replaced by the name Weaviate stores
+# (first character upper-cased), so every file, registry entry, session, metric
+# and guard is keyed by one spelling (#372).
+CollectionName = Annotated[str, AfterValidator(canonical)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -766,7 +772,7 @@ class HnswConfig(BaseModel):
 
 
 class CreateCollectionRequest(BaseModel):
-    name: str
+    name: CollectionName
     index_type: IndexType = "hnsw"
     distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
@@ -866,7 +872,7 @@ class IngestConfigResponse(BaseModel):
 # SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
 # export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -892,7 +898,7 @@ class HelpResponse(BaseModel):
 # ── Export / Import ───────────────────────────────────────────────────────────
 
 class ExportRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     include_models: bool = False
 
 
@@ -1021,16 +1027,16 @@ class _ChunkingFields(BaseModel):
 
 
 class RechunkRequest(_ChunkingFields):
-    collection: str
+    collection: CollectionName
 
 
 class ReembedRequest(_ChunkingFields):
     """Chunking fields are optional here, and only legal with `with-sources`."""
-    collection: str
+    collection: CollectionName
 
 
 class ReindexRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     index_type: Optional[IndexType] = None
     distance_metric: Optional[DistanceMetric] = None
 
@@ -1069,7 +1075,7 @@ class TuneOptionsResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -1095,7 +1101,7 @@ class QueryResponse(BaseModel):
 # ── Gold Standard ─────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     sample_size: int = 20
     seed: Optional[int] = None
 
@@ -8981,6 +8987,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from models.schemas import (
     CollectionInfo,
+    CollectionName,
     CollectionsResponse,
     CreateCollectionRequest,
 )
@@ -9096,7 +9103,7 @@ def _busy_error(name: str, jobs: list[tuple[str, str]]):
 
 
 @router.delete("/{name}", status_code=200)
-async def delete_collection(name: str, confirm: str | None = None):
+async def delete_collection(name: CollectionName, confirm: str | None = None):
     # Checked first, before the collection is even looked up, and as text, so a
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":
@@ -9144,18 +9151,19 @@ from fastapi import APIRouter, Form, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
+                            IngestUploadResponse, JobStatusResponse)
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
-from services.collection_writes import CollectionDeletingError
+from services.collection_writes import CollectionDeletingError, canonical
 from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
-    collection: str
+    collection: CollectionName
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -9170,6 +9178,9 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    # A form field's default is not validated through CollectionName, so the
+    # stored-name rule is applied here (#372).
+    collection = canonical(collection)
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files)
@@ -9236,7 +9247,7 @@ async def job_status(job_id: str):
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: str):
+async def get_ingest_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 
@@ -9322,14 +9333,14 @@ import asyncio
 
 from fastapi import APIRouter
 
-from models.schemas import RetrievalConfigResponse, SaveRetrievalConfigBody
+from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
 from services import retrieval_config
 
 router = APIRouter(prefix="/retrieval")
 
 
 @router.get("/config/{collection}", response_model=RetrievalConfigResponse)
-async def get_retrieval_config(collection: str):
+async def get_retrieval_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(retrieval_config.resolve, collection)
     return RetrievalConfigResponse(is_default=is_default, **cfg)
 
@@ -9484,6 +9495,7 @@ import logging
 from fastapi import APIRouter
 
 from models.schemas import (
+    CollectionName,
     ReembedRequest,
     ReindexRequest,
     RechunkRequest,
@@ -9577,7 +9589,7 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: str):
+async def tune_options(collection: CollectionName):
     """What this collection can be tuned with, given its fidelity."""
     try:
         exists = await wc.collection_exists(collection)
@@ -9768,7 +9780,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from models.schemas import MetricsResponse
+from models.schemas import CollectionName, MetricsResponse
 from services import metrics
 
 router = APIRouter(prefix="/metrics")
@@ -9776,7 +9788,7 @@ router = APIRouter(prefix="/metrics")
 
 @router.get("/latency", response_model=MetricsResponse)
 async def latency_summary(
-    collection: str | None = Query(default=None),
+    collection: CollectionName | None = Query(default=None),
     retrieval_mode: str | None = Query(default=None),
     history_limit: int = Query(default=100, ge=0, le=500),
 ):
@@ -11156,7 +11168,8 @@ async function getHealthResult(): Promise<HealthResult> {
 
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
-  createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
+  // Answers with the name as stored, first letter capitalised (#372).
+  createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
@@ -11790,19 +11803,21 @@ export default function ImportPage() {
 
   async function createCollection() {
     if (!newColName.trim()) return
+    // The name as the API stored it, which is the one the list shows: a typed
+    // lowercase first letter matched no option (#372).
+    let created: string
     try {
-      await api.createCollection({
+      created = (await api.createCollection({
         name: newColName,
         index_type: newColIndexType,
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
-      })
+      })).name
     } catch (e: unknown) {
       setNewColError(e instanceof Error ? e.message : String(e))
       return
     }
     // The create succeeded, so a failed reload is a list error, not a refusal.
-    const created = newColName
     setShowNewColModal(false)
     setNewColName('')
     setNewColError('')
@@ -13831,7 +13846,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -13839,6 +13854,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
@@ -14013,6 +14029,15 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+
+Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
+and the job workers mocked, it sends each route that takes a collection name a lowercase-first
+spelling (`myDocs`) and checks that the registry, the 201 and 202 answers, the ingest and
+retrieval settings files, the query metric and the metrics filter, retained originals found by
+`GET /tune`, and the export, tune, ingest and generation workers all get the stored name
+(`MyDocs`). It fails on the code before #372. Suite 05 then creates, ingests, exports and
+re-chunks a lowercase-first name on the verify stack and, unless `RAG_SKIP_SLOW=1`, checks a
+query's metrics under both spellings.
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
@@ -16543,6 +16568,10 @@ check "delete-while-busy: job kinds, request orderings and the job's report" $?
 check "ingest jobs count submitted, accepted and stored chunks apart" $?
 python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
 check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+# One spelling for per-collection state (#372): every route takes a collection
+# name as Weaviate stores it, so a lowercase first letter keys nothing apart.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_spelling.py)
+check "routes key per-collection state by the stored collection name (#372)" $?
 
 # DELETE needs ?confirm=true, checked before the collection is looked up (#302).
 CC="${PREFIX}Confirm"
@@ -18791,6 +18820,55 @@ ENDPY
   drop_collection "$XR"
 fi
 
+# ── one spelling for per-collection state (#372) ─────────────────────────────
+# Weaviate stores a collection with its first letter capitalised. Everything
+# below is sent under the lowercase-first spelling; the registry, the retained
+# originals, the package and the metrics must all land under the stored name.
+SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
+SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+drop_collection "$SC"
+api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
+check_eq "#372: creating '$SL' answers the stored name" \
+  "$(jfield "['name']" < /tmp/vfy_sp_create.json)" "$SC"
+check "#372: the list gives '$SC' its created_at" "$(api_get "/collections" | python3 -c "
+import json,sys
+c=[c for c in json.load(sys.stdin)['collections'] if c['name']=='$SC']
+print(0 if c and c[0]['created_at'] else 1)")"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SL" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_sp_up.json
+check_eq "#372: an upload to '$SL' answers the stored name" \
+  "$(jfield "['collection']" < /tmp/vfy_sp_up.json)" "$SC"
+check_eq "#372: the upload completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_sp_up.json)" 900)" "completed"
+api_get "/tune/$SL" > /tmp/vfy_sp_tune.json
+check_eq "#372: the originals are found under the stored name (re-chunk offered)" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
+api_post "/export" "{\"collection\":\"$SL\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
+check_eq "#372: the export of '$SL' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
+api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
+check_eq "#372: the export carries its retained originals" \
+  "$(jfield "['fidelity']" < /tmp/vfy_sp_expjob.json)" "with-sources"
+sppkg=$(jfield "['filename']" < /tmp/vfy_sp_expjob.json)
+api_post "/tune/rechunk" "{\"collection\":\"$SL\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_sp_tj.json
+check_eq "#372: a re-chunk of '$SL' completes" \
+  "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_sp_tj.json)" 1800)" "completed"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#372: a query's metrics under both spellings" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  # The body goes through a variable: inside "$(...)" its braces would be
+  # brace-expanded into three requests.
+  spq="{\"question\":\"who approves overtime?\",\"collection\":\"$SL\",\"top_k\":3}"
+  spcode=$(api_post_code "/query" "$spq")
+  check_eq "#372: a query on '$SL' answers" "$spcode" "200"
+  spl=$(api_get "/metrics/latency?collection=$SL&history_limit=0" | jfield "['total_records']")
+  spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
+  check "#372: the metrics filter finds the query under both spellings" \
+    "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+fi
+[ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
+drop_collection "$SC"
+
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
@@ -20235,6 +20313,44 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
         r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
       } finally { await s.ctx.close(); }
     }
+  }
+
+  // ── the created name as stored (#372) ──────────────────────────────────────
+  // Weaviate capitalises a collection's first letter, and the list shows that
+  // name. The Import page selected the typed name, which matched no option, so
+  // React showed the first option instead while uploads went to the typed name.
+  // /api/collections is answered here, the list with a decoy first, so that
+  // fallback can't pass the check; nothing is created on the stack.
+  r.section('the created name as stored (#372)');
+  {
+    const TYPED = 'vfySpelling372', STORED = 'VfySpelling372', DECOY = 'VfyDecoy372';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const s = await session(browser, BASE, 'engineer');
+    try {
+      await s.page.setRequestInterception(true);
+      let created = false;
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'POST') {
+          created = true;
+          return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ name: STORED, status: 'created' }) });
+        }
+        const list = created ? [info(DECOY), info(STORED)] : [info(DECOY)];
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+      });
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      await clickByText(s.page, '+ New'); await sleep(300);
+      await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", TYPED);
+      await clickByText(s.page, 'Create'); await sleep(1500);
+      const selected = await s.page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        const select = label && label.parentElement.querySelector('select');
+        return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+      });
+      r.check('Import: after "+ New", the selector holds the created collection as stored',
+              !!selected && selected.value === STORED, JSON.stringify(selected));
+      r.check('Import stored-name fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
   }
 
   // ── upload size limit ──────────────────────────────────────────────────────
@@ -23083,7 +23199,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
                     alias=name[:1].lower()+name[1:]
                     creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
-                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
+                    check(creation.status_code==201 and creation.json()['name']==name,'collection HTTP creation from a supported lowercase alias answers the stored name (#372)')
                     col=client.collections.get(name)
                     source=[]
                     for i in range(2):

@@ -252,7 +252,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
                     alias=name[:1].lower()+name[1:]
                     creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
-                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
+                    check(creation.status_code==201 and creation.json()['name']==name,'collection HTTP creation from a supported lowercase alias answers the stored name (#372)')
                     col=client.collections.get(name)
                     source=[]
                     for i in range(2):

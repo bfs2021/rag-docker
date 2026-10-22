@@ -64,7 +64,8 @@ async function getHealthResult(): Promise<HealthResult> {
 
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
-  createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
+  // Answers with the name as stored, first letter capitalised (#372).
+  createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
