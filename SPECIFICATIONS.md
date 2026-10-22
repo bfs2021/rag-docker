@@ -2634,6 +2634,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
 - [x] Citations toggle correctly hides/shows citation panel.
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
+      interception and checks that the box starts unchecked and the query sends
+      `include_citations` false with no Sources panel, even when the reply carries citations; that
+      checked, it sends true and the panel lists file, chunk, score (`n/a` for null) and excerpt; and
+      that unchecking and checking it again hides and shows the panel of the answer on screen
+      without a new query.*
 - [x] Chunking strategy selection updates the explanation panel without page reload.
       *All five strategies render distinct text; zero navigations.*
 - [x] Health dashboard shows per-service latency; auto-refreshes every 30 seconds.
@@ -2675,6 +2681,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
+      *Evidence for the proxy pages: `ui_controls.js` (suite 06) answers the Import upload with
+      nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON error, and checks the
+      message shown for each (the 512 MB limit text for a 413, "HTTP 500" for a plain 500, and
+      never a JSON syntax error).*
 
 - [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
   *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
