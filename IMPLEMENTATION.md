@@ -13575,6 +13575,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -14283,9 +14288,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -15172,6 +15181,30 @@ restart_refusal_reason() {
   elif [ "$project" = "rag-docker" ]; then
     printf 'restarts never run against the live rag-docker project (#152)'
   fi
+}
+
+# Prints why removing the project's volumes (`docker compose down -v`) must not
+# run here, or nothing (#465). Only the verify project as stack.sh sets it up:
+# COMPOSE_PROJECT_NAME rag-verify and a COMPOSE_FILE that includes the overlay
+# docker-compose.verify.yml, whose model volume is external and so kept. Any
+# other project would lose all its volumes, models included.
+volume_removal_refusal_reason() {
+  local reason sep="${COMPOSE_PATH_SEPARATOR:-:}" rest entry
+  reason=$(restart_refusal_reason)
+  if [ -n "$reason" ]; then printf '%s' "$reason"; return 0; fi
+  if [ "$COMPOSE_PROJECT_NAME" != rag-verify ]; then
+    printf "volumes are removed only on the verify project rag-verify, not '%s'; run it through scripts/verify/stack.sh" "$COMPOSE_PROJECT_NAME"
+    return 0
+  fi
+  # Split as compose splits COMPOSE_FILE; only that exact file name counts.
+  rest="${COMPOSE_FILE:-}"
+  while [ -n "$rest" ]; do
+    entry="${rest%%"$sep"*}"
+    [ "${entry##*/}" = docker-compose.verify.yml ] && return 0
+    [ "$entry" = "$rest" ] && break
+    rest="${rest#*"$sep"}"
+  done
+  printf 'COMPOSE_FILE does not include docker-compose.verify.yml, whose model volume is kept; run it through scripts/verify/stack.sh'
 }
 
 # Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
@@ -16439,19 +16472,26 @@ ENDPY
     fi
 
     # First start: no volumes but the model copy, which is external and kept by
-    # `down -v`. The model pull isn't timed: the verify project copies the models.
-    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
-    started=$(python3 -c "import time;print(time.time())")
-    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
-    up_ok=$?
-    took=$(python3 -c "import time;print(int(time.time()-$started))")
-    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
-    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
-      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
-    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
-    # It started from nothing: the collection made above is gone with its volume.
-    check_eq "that first start began with no collections" \
-      "$(api_get "/collections" | jfield "['collections']")" "[]"
+    # `down -v`, so the models are already present, as SPECIFICATIONS.md's
+    # criterion says; the pull from empty is a recorded manual measurement (#465).
+    # Only on the verify project: elsewhere `down -v` would remove every volume.
+    removal_refusal=$(volume_removal_refusal_reason)
+    if [ -n "$removal_refusal" ]; then
+      check "a first start from empty volumes brings every service healthy within 300s" 1 "$removal_refusal"
+    else
+      (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+      started=$(python3 -c "import time;print(time.time())")
+      (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+      up_ok=$?
+      took=$(python3 -c "import time;print(int(time.time()-$started))")
+      [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+      check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+        "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+      wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # It started from nothing: the collection made above is gone with its volume.
+      check_eq "that first start began with no collections" \
+        "$(api_get "/collections" | jfield "['collections']")" "[]"
+    fi
   fi
 fi
 

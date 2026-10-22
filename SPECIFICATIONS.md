@@ -2751,9 +2751,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
   *Evidence: compose start_period and `RestartTimingTests` verify capped waiting, elapsed time from the supplied start, and positive six-digit limit validation.*
 
-- [x] `docker compose up` brings all five services healthy within 5 minutes on first run (including model pull).
-      *Model volume deleted and re-pulled from scratch: **233s (3.9 min)**. Both
-      models returned with their original IDs.*
+- [x] `docker compose up` brings all five services healthy within 5 minutes on a first start from empty data volumes, with the models already in the model volume.
+      *With `RAG_ALLOW_RESTART=1`, `16_api_paths.sh` (run by `01_infrastructure.sh`)
+      removes the verify project's volumes but its model copy (`down -v`) and times
+      `up -d --wait`. The model pull isn't part of the automated check (#465). A
+      first run with the pull, measured by hand: model volume deleted and re-pulled
+      from scratch, **233s (3.9 min)**. Both models returned with their original IDs.*
 - [x] `docker compose up` brings all five services healthy within 120 seconds on subsequent runs (models cached in volume, no re-download).
       *22s.*
 - [x] Weaviate data persists across `docker compose down && docker compose up`.

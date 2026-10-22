@@ -113,6 +113,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -821,9 +826,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
