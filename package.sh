@@ -7,9 +7,13 @@
 # Invoke with `bash package.sh` rather than `./package.sh` so the script does
 # not depend on its own executable bit surviving a file transfer.
 #
-# What the archive contains: source, Dockerfiles, compose file, both lock files
+# What the archive contains: the files git tracks in the current commit (HEAD),
+# built with `git archive`: source, Dockerfiles, compose file, both lock files
 # (ui/package-lock.json and api/requirements.txt) and the docs. That is
-# everything needed to rebuild the stack from scratch.
+# everything needed to rebuild the stack from scratch. Untracked and ignored
+# files never go in -- offline tars, .env files, node_modules/, previous
+# archives, the contents of ingest-inbox/ and exports/ -- and neither do
+# uncommitted changes, so commit first. Run it in a git checkout (#384).
 #
 # What it deliberately does NOT contain: Docker images, the Weaviate index, and
 # the Ollama model weights. Those are rebuilt or re-downloaded on the target
@@ -24,39 +28,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. In an extracted archive there is no repository, and in a
+# subdirectory of another one git archive would take only that subtree.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
+
 OUT="${1:-rag-docker.zip}"
 rm -f "$OUT"
 
-zip -r -q "$OUT" . \
-  -x '*.DS_Store' \
-  -x '__MACOSX/*' \
-  -x '*/node_modules/*' \
-  -x '*/__pycache__/*' \
-  -x '*.pyc' \
-  -x '*.pyo' \
-  -x '*/dist/*' \
-  -x '*/.venv/*' \
-  -x '*/venv/*' \
-  -x '*/.pytest_cache/*' \
-  -x '*/.mypy_cache/*' \
-  -x '*/.ruff_cache/*' \
-  -x '*/uploads/*' \
-  -x 'ingest-inbox/*' \
-  -x 'exports/*' \
-  -x '.env' \
-  -x '*/.env' \
-  -x '*/.env.*' \
-  -x '.git/*' \
-  -x '*.zip'
-
-# The blanket ingest-inbox exclusion also drops the directory itself. Add the
-# placeholder back so the bind-mount target exists on the target machine; without
-# it Docker creates the directory as root and the user cannot drop files in.
-zip -q "$OUT" ingest-inbox/.gitkeep
-# Same for ./exports: it is the bind mount export packages are written to.
-# Its contents are somebody's corpus and never belong in a source archive,
-# but the directory itself must exist or Docker creates it as root.
-zip -q "$OUT" exports/.gitkeep
+# Tracked files only. ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so
+# both bind-mount targets exist on the target machine; without them Docker
+# creates the directories as root and the user cannot drop files in.
+git archive --format=zip -o "$OUT" HEAD
 
 echo "Created $OUT ($(du -h "$OUT" | cut -f1))"
 echo
