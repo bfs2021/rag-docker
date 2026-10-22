@@ -407,9 +407,11 @@ note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields ans
 `SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
-refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
-(on the verify project, with the exports from `stack.sh up`, as above):
+refused before backend, model or staging work, with every backend mocked.
+`07_settings.sh` runs it in the API image with the repository mounted read-only
+and no network (#386). Its embedded-source check reads `IMPLEMENTATION.md`, so
+to run it by hand mount the whole repository (on the verify project, with the
+exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -518,11 +520,16 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
+| `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
+| `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
+| `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
-| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
 | `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
@@ -577,8 +584,11 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On the verify project (`bash scripts/verify/stack.sh up`, then paste the
-`export` lines it prints), whose model copy holds the embedding model, run:
+`05_transfer.sh` runs `model_integrity.py` in the verify project's API
+container, and `test_model_bundle.py` in the API image with the repository
+mounted (#386). To run them by hand, on the verify project
+(`bash scripts/verify/stack.sh up`, then paste the `export` lines it prints),
+whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
