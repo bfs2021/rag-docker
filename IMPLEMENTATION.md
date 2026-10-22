@@ -7357,20 +7357,23 @@ def _check_embedding(manifest: dict) -> None:
 
     if pkg_model != our_model:
         fidelity = manifest.get("fidelity")
-        remedy = ("This package is `with-sources`, so it can be re-embedded after "
-                  "import once that is supported."
+        # Nothing re-embeds a refused package, whatever its fidelity (#390).
+        remedy = (f"Use an instance running '{pkg_model}', or re-export from one."
                   if fidelity == "with-sources" else
                   "This package is `chunks-only`, so it cannot be re-embedded from "
                   "the original documents. Use an instance running "
                   f"'{pkg_model}', or re-export from one.")
+        actual = _probe_dimensions()
+        ours = (f"{actual} dimensions" if actual is not None else
+                "whose dimension count couldn't be read from Ollama")
         raise PackageError(
             "EMBEDDING_MISMATCH",
             f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
-            f"but this instance uses '{our_model}'. Vectors from a different model "
-            f"are meaningless here, not merely different, so the import is refused. "
-            + remedy,
+            f"but this instance uses '{our_model}' ({ours}). Vectors from a different "
+            f"model are meaningless here, not merely different, so the import is "
+            f"refused. " + remedy,
             {"package_model": pkg_model, "package_dimensions": pkg_dims,
-             "instance_model": our_model})
+             "instance_model": our_model, "instance_dimensions": actual})
 
     # Same model name but a different width means one side is not what it claims.
     if pkg_dims is not None:
@@ -7508,7 +7511,16 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Could not install bundled model '{name}': {exc}",
                 {"model": name}) from exc
-        if not model_bundle.is_installed(model):
+        # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
+        reported = _ollama_reports(model)
+        if reported is None:
+            raise PackageError(
+                "IMPORT_FAILED",
+                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"confirm it is there. Check that the ollama service is running, "
+                f"then import again.",
+                {"model": name})
+        if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
@@ -13522,7 +13534,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the four controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13565,6 +13577,15 @@ fail the export early with an actionable error and publish nothing. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
+
+`scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
+an import job of a digest-valid package embedded with another model is refused
+`EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
+and both dimension counts (or saying this instance's count couldn't be read), with
+no promise of re-embedding; a same-name package of another width is refused too.
+It also checks that a model installed from a package is confirmed through Ollama's
+model list: reported, not reported, and Ollama unreachable. Only Ollama is
+replaced. `05_transfer.sh` runs it in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -17755,6 +17776,8 @@ check "evaluation import and generated-session regressions" $?
 check "retained-source index boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
+check "E12 embedding mismatch and post-install Ollama check regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
