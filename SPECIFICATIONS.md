@@ -569,6 +569,17 @@ most 512 MB decompressed, nothing decompressed written to disk). Each line becom
 as described in §5.1; chunks have `source_type` `jsonl`, and the retained original is the file
 as uploaded.
 
+**macOS metadata in ZIPs (#378).** A ZIP made with the macOS Finder holds, beside each file, an
+AppleDouble file with its resource fork and extended attributes, `__MACOSX/<folder>/._<name>`,
+which keeps the file's suffix; other macOS tools write `._<name>` beside the file. These are not
+documents. A ZIP member whose logical name (below) has `__MACOSX` as its first folder, or whose
+file name starts with `._`, is not queued, whatever its suffix, and is listed in the job's
+`skipped` as `<zip filename>:<member path> (macOS metadata (AppleDouble), not a document)`, not
+left out silently. The match is exact and case-sensitive, so names that only contain these
+strings (`_report.txt`, `notes._v2.txt`, `.hidden.txt`, `__MACOSX_notes.txt`,
+`docs/__MACOSX/readme.txt`) are queued as usual. Such members are still validated like any
+member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPPORTED_FILES`.
+
 **Logical names and re-ingesting (#22).** Every file is stored under a logical name: the
 `source_file` of its chunks and the filename in its retained-source index entry.
 
@@ -649,7 +660,8 @@ three counts change in one update (#324). Job records written before
 these two fields existed read back with both `null`, not `0`, which would be untrue (#302).
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
-ingested, each with its reason: an unsupported type, or a later input with the same name.
+ingested, each with its reason: an unsupported type, macOS metadata in a ZIP (#378), or a
+later input with the same name.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -841,9 +853,10 @@ retrieval order, best match first, so their scores don't increase down the list.
 
 The metric is read from Weaviate on every query, so a collection deleted and recreated with
 another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
-(or no hybrid score), or when the collection's metric can't be read or isn't one of the three
-above; it is never replaced by 0.0. Non-null scores are rounded to 4 decimals. Scores rank the
-chunks of one answer; they aren't comparable across modes or metrics.
+(or no hybrid score), or when the collection's config has no metric or a metric that isn't one
+of the three above; it is never replaced by 0.0. A failed read of the metric is a Weaviate
+failure: the query answers the 503 below (#373). Non-null scores are rounded to 4 decimals.
+Scores rank the chunks of one answer; they aren't comparable across modes or metrics.
 
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
@@ -856,6 +869,11 @@ the pipeline (#373): an Ollama call (the reformulation, the query embedding or t
 that can't connect, times out or answers an error status, or a Weaviate retrieval call that
 raises. The message names the service: "The question was not answered: Ollama could not be
 reached, timed out or returned an error. Try again when Ollama is available." (or Weaviate).
+In `hybrid` and `semantic` modes Weaviate embeds the question itself through Ollama, so an
+Ollama failure there comes back as a Weaviate error; a Weaviate failure in those modes names
+both (#411): "The question was not answered: Weaviate could not be reached, timed out or
+returned an error, or Ollama could not embed the question for it. Try again when Weaviate and
+Ollama are available."
 `detail` is `{"collection": "<name>"}`, no metrics record is written, and the cause is logged,
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
@@ -1685,7 +1703,7 @@ Flat (KNN) index has no tunable parameters.
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -1939,7 +1957,7 @@ settings, regardless of when a prior collection's save completes.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
-- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
+- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
 - Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
@@ -2507,6 +2525,14 @@ now lives once, in `api/services/ingest_config.py`.
       against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
       archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
       `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
+- [x] A ZIP's macOS metadata (`__MACOSX/` members and `._*` AppleDouble files) is not ingested and is listed in `skipped` with its reason; names that only look like it are ingested (#378).
+      *A Finder ZIP's `__MACOSX/._report.pdf` kept `.pdf` and was queued as a document of
+      its own. `test_reingest.py` covers a Finder-style ZIP (only the file queued, the
+      AppleDouble member in `skipped`), a `._*` file beside its file, other `__MACOSX/`
+      members whatever their suffix, look-alike names that are still queued, and a ZIP of
+      only metadata refused with `NO_SUPPORTED_FILES`. `02_ingest.sh` ingests a Finder-style
+      ZIP through the proxy: the job completes with no errors, stores only the file's
+      chunks and lists the AppleDouble member in `skipped`.*
 - [x] Two ingest jobs that replace one logical name in one collection run one at a time: afterwards exactly one job's version is stored, whole (its full chunk set, its `chunks_replaced` equal to the other job's `chunks_stored`, one retained digest naming the name, the winner's); which job runs last is not promised (#22).
       *`02_ingest.sh` sends two uploads of one name, with different content, at once
       through the proxy and checks that both jobs complete, exactly one version's text is
@@ -2528,8 +2554,8 @@ now lives once, in `api/services/ingest_config.py`.
       *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
       dot and l2-squared collections give the documented similarities of known vectors, and a
       collection recreated with another metric is converted by the new one. Controlled tests
-      cover a missing distance or hybrid score (`null`) and an unknown metric; the Q&A page shows
-      `n/a` for a `null` score.*
+      cover a missing distance or hybrid score (`null`), an unknown metric, and a failed metric
+      read answering 503; the Q&A page shows `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
@@ -2537,9 +2563,9 @@ now lives once, in `api/services/ingest_config.py`.
       end_user prompt now asks for a short answer without technical detail, so
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
-- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373).
+- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373). In `hybrid` and `semantic` modes, where Weaviate embeds the question through Ollama, a Weaviate failure names both Weaviate and Ollama (#411).
 - [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged; the file never holds more than 1,000 lines, is compacted atomically to its last 500 records, and those reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
-      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call and each retrieval mode's Weaviate call; it fails on the code before #373.*
+      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call (the synthesis in both response formats) and each retrieval mode's Weaviate call; it fails on the code before #373, and its hybrid and semantic wording on the code before #411.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
@@ -2736,8 +2762,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
-- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned.
-  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373.*
+- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
+  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373. Suite 01 also checks through the proxy on the running stack that an unknown route answers 404 `NOT_FOUND` and a wrong method `METHOD_NOT_ALLOWED` (#411).*
 
 ---
 
