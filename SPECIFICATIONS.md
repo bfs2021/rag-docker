@@ -1620,6 +1620,14 @@ A file that cannot be read as a package is still listed, with `readable: false`
 and null metadata, so it does not silently disappear from the UI. Import reports
 precisely why it cannot be used.
 
+The listing reads each archive only up to its top-level `manifest.json`
+(`<directory>/manifest.json`) and nothing after it, so a large package is not
+decompressed to list it (#383). New packages put the manifest first
+(`RAG_EXPORT_SPECIFICATIONS.md` §4.2); in older ones the files before it are read
+past, which is slower but works. The manifest read is bounded at 16 MiB: a larger
+manifest is not read and its package is listed `readable: false`, as is one whose
+manifest is missing, damaged, not UTF-8, not valid JSON or not a JSON object.
+
 The package format itself — filename convention, layout, manifest and
 `chunks.jsonl` — is specified in `RAG_EXPORT_SPECIFICATIONS.md` §4.
 
@@ -2718,6 +2726,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *`created_at`, index type and distance metric all preserved.*
 - [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
       *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
+- [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
+      *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
