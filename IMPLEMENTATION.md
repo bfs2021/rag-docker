@@ -1080,7 +1080,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     source_file: str
     chunk_index: int
-    score: float
+    score: Optional[float]  # higher is better in every mode; null when missing (#376)
     excerpt: str
 
 
@@ -2747,11 +2747,39 @@ async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
     await asyncio.to_thread(_insert_chunks_sync, collection_name, chunks)
 
 
+# A citation's score is higher-is-better in every retrieval mode (#376), so the
+# distance-based modes turn Weaviate's distance into a similarity by the
+# collection's distance metric.
+_SIMILARITY = {
+    VectorDistances.COSINE: lambda d: 1 - d,            # cosine similarity, -1 to 1
+    VectorDistances.DOT: lambda d: -d,                  # the dot product itself
+    VectorDistances.L2_SQUARED: lambda d: 1 / (1 + d),  # 0 to 1
+}
+
+
+def _distance_to_score(coll):
+    """The distance-to-score conversion for this collection's metric.
+
+    The metric is read on every query, not cached, so a collection deleted and
+    recreated with another metric is converted by its new one. A missing
+    distance, or a metric that can't be read or has no conversion, gives None.
+    """
+    vector_config = coll.config.get().vector_index_config
+    convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
+
+    def to_score(distance: float | None) -> float | None:
+        if convert is None or distance is None:
+            return None
+        return convert(distance)
+    return to_score
+
+
 def _near_vector_query_sync(
     collection_name: str, vector: list[float], top_k: int
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_vector(
         near_vector=vector,
         limit=top_k,
@@ -2760,12 +2788,11 @@ def _near_vector_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2781,6 +2808,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = coll.query.near_text(
         query=query,
         limit=top_k,
@@ -2789,12 +2817,11 @@ def _near_text_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2823,7 +2850,8 @@ def _hybrid_query_sync(
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": obj.metadata.score or 0.0,
+            # Weaviate's fusion score, higher is better; missing reads as None (#376).
+            "score": obj.metadata.score,
         })
     return rows
 
@@ -4560,7 +4588,7 @@ async def run_query(
             {
                 "source_file": c["source_file"],
                 "chunk_index": c["chunk_index"],
-                "score": round(c["score"], 4),
+                "score": None if c["score"] is None else round(c["score"], 4),
                 "excerpt": c["content"][:200],
             }
             for c in chunks
@@ -11200,7 +11228,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -11363,7 +11391,7 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
           <div key={i} className="text-xs bg-gray-50 border rounded p-2">
             <div className="flex justify-between mb-1">
               <span className="font-medium">{c.source_file}</span>
-              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score.toFixed(3)}</span>
+              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score === null ? 'n/a' : c.score.toFixed(3)}</span>
             </div>
             <p className="text-gray-700 italic">{c.excerpt}</p>
           </div>
@@ -13795,6 +13823,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, the metric read on every query; registered by suite 03 |
+| `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
@@ -14008,6 +14038,22 @@ tried again; that 1,100 concurrent records all land; and that a restart restores
 records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
 files a crash left, and starts when the file can't be read or compacted. It also checks the
 `IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+
+Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
+`scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
+the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
+`1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
+first; a missing distance, a missing hybrid score and an unknown or unreadable metric give
+`null` (a distance of 0 is a real value); the metric is read again on every query; the pipeline
+rounds numbers and passes `null` through, and `/query` returns it. It also checks the
+`IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
+project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
+vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled, and checks the
+scores against the expected similarities; then it deletes the cosine collection, recreates it
+with l2-squared, and checks the next query uses the new metric. With models, the suite checks
+that in each of the four modes the citation scores are numbers, highest first.
+`browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
+`n/a` for a `null` score.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
@@ -16877,6 +16923,13 @@ section "§10.2 Query"
 # controlled, in the API image with no network.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
 check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
+# Citation scores are higher-is-better in every mode, and null when missing (#376):
+# controlled in the API image with no network, then on the real Weaviate with each
+# distance metric (models controlled, no LLM work).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_citation_score.py)
+check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
+check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -16911,7 +16964,7 @@ import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
 c = d.get('citations') or []
 ok = bool(c) and all(
     isinstance(x.get('source_file'), str) and x['source_file']
-    and isinstance(x.get('score'), (int, float))
+    and (x.get('score') is None or isinstance(x.get('score'), (int, float)))
     and isinstance(x.get('chunk_index'), int)
     and isinstance(x.get('excerpt'), str) for x in c)
 sys.exit(0 if ok else 1)"
@@ -16932,6 +16985,14 @@ try: d=json.load(open('/tmp/vfy_ans.json'))
 except Exception: sys.exit(1)
 sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
   check "retrieval mode '$mode' returns results" $?
+  python3 -c "
+import json,sys
+try: c=json.load(open('/tmp/vfy_ans.json')).get('citations') or []
+except Exception: sys.exit(1)
+s=[x.get('score') for x in c]
+sys.exit(0 if s and all(isinstance(v,(int,float)) for v in s) and s==sorted(s,reverse=True) else 1)"
+  check "retrieval mode '$mode' citation scores are numbers, best (highest) first (#376)" $? \
+    "$(python3 -c "import json;print([x.get('score') for x in json.load(open('/tmp/vfy_ans.json')).get('citations') or []])" 2>/dev/null)"
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
@@ -16953,6 +17014,119 @@ check "end_user answers are shorter than engineer on average" $? \
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/citation_score.py
+
+```python
+"""Citation scores on a real Weaviate: higher is better, by the collection's metric (#376).
+
+Inside the disposable API container (`03_query.sh`):
+
+    docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py
+
+Creates owned collections with each distance metric through `POST /collections`,
+inserts known vectors, and asks `/query` in the `hnsw` and `flat` modes with
+Ollama's reformulation, embedding and answer controlled. Weaviate's distances
+are real. Then deletes one collection, recreates it under the same name with
+another metric, and checks the next query converts by the new metric. Its
+collections are deleted at the end, pass or fail.
+"""
+import math
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from services import weaviate_client as wc
+
+prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
+QUERY = [1.0, 0.0, 0.0, 0.0]
+
+
+def unit(cos):
+    return [cos, math.sqrt(1 - cos * cos), 0.0, 0.0]
+
+
+# metric -> (vectors, expected score of each against QUERY), best match first.
+CASES = {
+    "cosine": ([unit(c) for c in (0.95, 0.6, 0.1, -0.5)], [0.95, 0.6, 0.1, -0.5]),
+    "dot": ([[a, 0.0, 0.0, 0.0] for a in (3.0, 1.5, -0.5, -2.0)], [3.0, 1.5, -0.5, -2.0]),
+    "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
+}
+
+client = TestClient(app)
+created = []
+failures = []
+
+
+def create(name, metric, index_type):
+    response = client.post("/collections", json={"name": name, "index_type": index_type,
+                                                  "distance_metric": metric})
+    assert response.status_code == 201, response.text
+    if name not in created:
+        created.append(name)
+    coll = wc.get_client().collections.get(name)
+    for i, vector in enumerate(CASES[metric][0]):
+        coll.data.insert(properties={"content": f"Score chunk {i}", "source_file": "score.txt",
+                                     "chunk_index": i}, vector=vector)
+
+
+def check(name, metric):
+    expected = CASES[metric][1]
+    for mode in ("hnsw", "flat"):
+        with patch("services.rag_pipeline.ollama.chat", new=AsyncMock(return_value="Controlled")), \
+                patch("services.rag_pipeline.ollama.embed", new=AsyncMock(return_value=QUERY)):
+            response = client.post("/query", json={"collection": name, "question": "score",
+                                                   "retrieval_mode": mode, "top_k": 4,
+                                                   "include_citations": True})
+        label = f"{metric} collection, {mode} mode"
+        if response.status_code != 200:
+            failures.append(f"{label}: {response.status_code} {response.text}")
+            continue
+        got = [c["score"] for c in response.json()["citations"]]
+        ok = (len(got) == len(expected)
+              and all(isinstance(g, (int, float)) and abs(g - e) < 1e-3 for g, e in zip(got, expected))
+              and got == sorted(got, reverse=True))
+        print(("PASS " if ok else "FAIL ") + f"{label}: scores {got}, expected {expected}", flush=True)
+        if not ok:
+            failures.append(f"{label}: scores {got}, expected {expected}")
+
+
+with tempfile.TemporaryDirectory(prefix="citation-score-") as directory, \
+        patch.object(settings, "upload_dir", directory):
+    try:
+        for metric, index_type in (("cosine", "hnsw"), ("dot", "flat"), ("l2-squared", "flat")):
+            name = prefix + metric.replace("-", "").capitalize()
+            create(name, metric, index_type)
+            check(name, metric)
+        # Same name, another metric: the next query must use the new metric.
+        name = prefix + "Cosine"
+        response = client.delete("/collections/" + name + "?confirm=true")
+        assert response.status_code == 200, response.text
+        create(name, "l2-squared", "hnsw")
+        print("recreated " + name + " with l2-squared", flush=True)
+        check(name, "l2-squared")
+    finally:
+        for name in created:
+            try:
+                if wc._collection_exists_sync(name):
+                    response = client.delete("/collections/" + name + "?confirm=true")
+                    if response.status_code != 200:
+                        failures.append(f"cleanup {name}: {response.status_code} {response.text}")
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"cleanup {name}: {error!r}")
+        wc.close_client()
+
+if failures:
+    print("FAIL " + "; ".join(failures), flush=True)
+    sys.exit(1)
+print("PASS citation scores convert by each collection's metric, best first", flush=True)
 ```
 
 ### scripts/verify/12_persistence.sh
@@ -19321,7 +19495,7 @@ async function fixture(browser, base) {
       }
       if (path === '/api/query') {
         entry.done = true;
-        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+        return Promise.resolve(response(window.queryConfigFixture.queryResult || { answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
       }
       if (path.startsWith('/api/retrieval/config')) {
         return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
@@ -19536,6 +19710,31 @@ async function runQueryConfigTests(browser, base, reporter) {
     await release(page, '/api/retrieval/config', A, { method: 'POST' });
     await assertSettings(page, { ...A, top_k: 19 });
     assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+  }]);
+  // #376: a citation's score is a number (higher is better) or null when Weaviate gave none.
+  cases.push(['citations show a numeric score and n/a for a null score', async page => {
+    await page.evaluate(() => {
+      window.queryConfigFixture.queryResult = {
+        answer: 'Fixture answer', retrieval_latency_ms: 1, llm_latency_ms: 1, chunks_retrieved: 2,
+        citations: [
+          { source_file: 'scored.txt', chunk_index: 3, score: 0.9123, excerpt: 'Scored excerpt' },
+          { source_file: 'unscored.txt', chunk_index: 4, score: null, excerpt: 'Unscored excerpt' },
+        ],
+      };
+    });
+    assert.equal(await clickByText(page, 'Q&A'), true);
+    await page.waitForSelector('textarea');
+    await page.evaluate(() => {
+      const box = [...document.querySelectorAll('label')].find(l => l.innerText.includes('Show source citations')).querySelector('input');
+      if (!box.checked) box.click();
+    });
+    await setValue(page, '() => document.querySelector("textarea")', 'Which sources?');
+    assert.equal(await clickByText(page, 'Ask'), true);
+    await page.waitForFunction(() => document.body.innerText.includes('Unscored excerpt') || document.body.innerText.includes('Fixture answer'));
+    await sleep(200);
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /chunk 3 \S score 0\.912\b/, 'the numeric score is not shown with 3 decimals');
+    assert.match(text, /chunk 4 \S score n\/a/, 'the null score is not shown as n/a');
   }]);
   for (const [name, test] of cases) {
     let s;
