@@ -338,6 +338,17 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
+The registry is written atomically (#388): each create or delete writes the whole registry to a
+uniquely named temporary file in the same folder, fsyncs it and replaces
+`collection_registry.json` with it, under one lock in the API process, so a crash or a failed
+write (for example on a full `ingest_uploads` volume) leaves the old file whole. The file is
+owner-only (mode 0600). A registry that exists but can't be read (it can't be opened, isn't
+UTF-8 JSON, or isn't a JSON object) is never treated as empty: it is left unchanged and logged.
+`GET /collections` then answers with `created_at` `null` for every collection, and
+`POST /collections` and `DELETE /collections/{name}` still create or delete the collection and
+answer as usual, without recording or removing its entry, until the file is fixed or removed.
+A missing file is an empty registry.
+
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to list the collections
 (unreachable, timed out or any other error) (#373): "Cannot list the collections: Weaviate
 could not be read. Try again when Weaviate is available." `detail` is `null`. The cause is
@@ -2718,6 +2729,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *10 collections with identical object counts.*
 - [x] `collection_registry.json` and `ingest_configs/` persist across restarts; `GET /collections` reflects correct `created_at` after restart.
       *`created_at`, index type and distance metric all preserved.*
+- [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
+      *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
