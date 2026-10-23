@@ -110,7 +110,7 @@ errors, and `message` is already written for humans.
 
 | | Online install | Offline install |
 |---|---|---|
-| Source | `package.sh` (~150 KB) | `package-offline.sh` (~4.6 GB) |
+| Source | `package.sh` (~1.3 MB) | `package-offline.sh` (~4.6 GB) |
 | Images | built on target | `docker load` from bundle |
 | Models | pulled from ollama registry | restored from bundle volume |
 | **Resulting API** | **identical** | **identical** |

@@ -14,6 +14,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ('package.sh', 'package-offline.sh')
@@ -21,6 +22,9 @@ REFUSAL = 'not the top level of a git checkout'
 COMMITTED_README = 'Scratch project.\n'
 GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
        '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+# The scratch repository and both scripts read no system or global (or XDG) git
+# config, so a user's core.hooksPath or attributes can't change the result (#447).
+GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 
 # Answers what package-offline.sh asks of docker, and logs each call.
 STUB_DOCKER = r'''#!/usr/bin/env bash
@@ -58,6 +62,7 @@ class PackageArchiveTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.tmp = Path(temp.name).resolve()
+        self.git_env = dict(os.environ, **GIT_ISOLATION)
         self.repo = self.tmp / 'project'
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
@@ -81,11 +86,11 @@ class PackageArchiveTests(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         write(bin_dir / 'docker', STUB_DOCKER, 0o755)
         self.log = self.tmp / 'docker.log'
-        self.env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
-                        STUB_DOCKER_LOG=str(self.log), GIT_CONFIG_NOSYSTEM='1')
+        self.env = dict(self.git_env, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log))
 
     def git(self, *args, cwd=None):
-        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, check=True,
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, env=self.git_env, check=True,
                               capture_output=True, text=True).stdout
 
     def run_script(self, directory, script, out):
@@ -94,6 +99,20 @@ class PackageArchiveTests(unittest.TestCase):
 
     def assert_ran(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def expected_bundle(self):
+        return ({'rag-docker/' + name for name in self.tracked}
+                | {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'})
+
+    def assert_archives_hold_the_tracked_files(self, directory):
+        zip_out, bundle_out = self.tmp / 'check.zip', self.tmp / 'check.tar'
+        self.assert_ran(self.run_script(directory, 'package.sh', zip_out))
+        self.assert_ran(self.run_script(directory, 'package-offline.sh', bundle_out))
+        with zipfile.ZipFile(zip_out) as archive:
+            self.assertEqual({i.filename for i in archive.infolist() if not i.filename.endswith('/')},
+                             self.tracked)
+        with tarfile.open(bundle_out) as archive:
+            self.assertEqual({m.name for m in archive.getmembers() if m.isfile()}, self.expected_bundle())
 
     def test_zip_holds_exactly_the_tracked_files(self):
         out = self.tmp / 'out.zip'
@@ -134,6 +153,27 @@ class PackageArchiveTests(unittest.TestCase):
                     self.assertFalse(out.exists())
         calls = self.log.read_text() if self.log.exists() else ''
         self.assertEqual(calls, '', 'docker was called before the refusal')
+
+    def test_runs_in_a_checkout_reached_through_a_symlink(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.repo, target_is_directory=True)
+        self.assert_archives_hold_the_tracked_files(link)
+
+    def test_ignores_the_users_git_config(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        hostile = Path(temp.name).resolve()
+        marker = hostile / 'hook-ran'
+        write(hostile / 'hooks' / 'pre-commit', f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', 0o755)
+        write(hostile / 'attributes', 'README.md export-ignore\n')
+        write(hostile / 'gitconfig', f'[core]\n\thooksPath = {hostile / "hooks"}\n'
+                                     f'\tattributesFile = {hostile / "attributes"}\n')
+        with mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(hostile / 'gitconfig')):
+            # A fresh scratch repository, built while the caller's global config is hostile.
+            self.setUp()
+            self.assert_archives_hold_the_tracked_files(self.repo)
+        self.assertIn('README.md', self.tracked)
+        self.assertFalse(marker.exists(), 'the global pre-commit hook ran')
 
 
 class EmbeddedCopyTests(unittest.TestCase):

@@ -270,7 +270,7 @@ Run `docker compose down -v` to delete all volumes and start fresh.
 
 ```
 rag-docker/
-├── package.sh            # Builds a source-only zip (~150 KB; target needs internet)
+├── package.sh            # Builds a source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh    # Builds a self-contained offline bundle (~4.6 GB)
 ├── install-offline.sh    # Installs from that bundle with no network access
 ├── api/                  # FastAPI backend
@@ -497,7 +497,7 @@ internet access.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive size | ~150 KB | **~4.6 GB** |
+| Archive size | ~1.3 MB | **~4.6 GB** |
 | Contains | source only | source + all 5 images + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | First-run time on target | 10–20 min (downloads + build) | a few min (decompress + load only) |
@@ -515,7 +515,7 @@ the target machine.
 #### 1. Package it
 
 ```bash
-bash package.sh              # writes rag-docker.zip (~150 KB)
+bash package.sh              # writes rag-docker.zip (~1.3 MB)
 ```
 
 The zip holds exactly the files git tracks in the current commit (`HEAD`), built

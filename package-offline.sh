@@ -4,7 +4,7 @@
 #
 #   bash package-offline.sh [output.tar]
 #
-# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
 #   * the source tree: the files git tracks in the current commit (HEAD),
