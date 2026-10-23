@@ -472,6 +472,44 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
   }
 
+  // ── the created name as stored (#372) ──────────────────────────────────────
+  // Weaviate capitalises a collection's first letter, and the list shows that
+  // name. The Import page selected the typed name, which matched no option, so
+  // React showed the first option instead while uploads went to the typed name.
+  // /api/collections is answered here, the list with a decoy first, so that
+  // fallback can't pass the check; nothing is created on the stack.
+  r.section('the created name as stored (#372)');
+  {
+    const TYPED = 'vfySpelling372', STORED = 'VfySpelling372', DECOY = 'VfyDecoy372';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const s = await session(browser, BASE, 'engineer');
+    try {
+      await s.page.setRequestInterception(true);
+      let created = false;
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'POST') {
+          created = true;
+          return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ name: STORED, status: 'created' }) });
+        }
+        const list = created ? [info(DECOY), info(STORED)] : [info(DECOY)];
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+      });
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      await clickByText(s.page, '+ New'); await sleep(300);
+      await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", TYPED);
+      await clickByText(s.page, 'Create'); await sleep(1500);
+      const selected = await s.page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        const select = label && label.parentElement.querySelector('select');
+        return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+      });
+      r.check('Import: after "+ New", the selector holds the created collection as stored',
+              !!selected && selected.value === STORED, JSON.stringify(selected));
+      r.check('Import stored-name fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── upload size limit ──────────────────────────────────────────────────────
   // The Import page refuses a selection over the proxy's limit before sending.
   // The file is sparse: it reports 513 MB but occupies no disk, and the check

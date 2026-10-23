@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+
+from services.collection_writes import canonical
 
 
 def _numeric(value):
@@ -29,6 +31,10 @@ TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
+# A collection name as a caller sends it, replaced by the name Weaviate stores
+# (first character upper-cased), so every file, registry entry, session, metric
+# and guard is keyed by one spelling (#372).
+CollectionName = Annotated[str, AfterValidator(canonical)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -40,7 +46,7 @@ class HnswConfig(BaseModel):
 
 
 class CreateCollectionRequest(BaseModel):
-    name: str
+    name: CollectionName
     index_type: IndexType = "hnsw"
     distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
@@ -140,7 +146,7 @@ class IngestConfigResponse(BaseModel):
 # SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
 # export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -152,7 +158,7 @@ class RetrievalConfigResponse(BaseModel):
     collection: str
     retrieval_mode: str
     top_k: int
-    alpha: float
+    alpha: Annotated[float, Field(allow_inf_nan=False)]   # JSON has no NaN (#477)
     ef: Optional[int]
     response_format: str
     is_default: bool
@@ -166,7 +172,7 @@ class HelpResponse(BaseModel):
 # ── Export / Import ───────────────────────────────────────────────────────────
 
 class ExportRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     include_models: bool = False
 
 
@@ -295,16 +301,16 @@ class _ChunkingFields(BaseModel):
 
 
 class RechunkRequest(_ChunkingFields):
-    collection: str
+    collection: CollectionName
 
 
 class ReembedRequest(_ChunkingFields):
     """Chunking fields are optional here, and only legal with `with-sources`."""
-    collection: str
+    collection: CollectionName
 
 
 class ReindexRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     index_type: Optional[IndexType] = None
     distance_metric: Optional[DistanceMetric] = None
 
@@ -343,7 +349,7 @@ class TuneOptionsResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -369,7 +375,7 @@ class QueryResponse(BaseModel):
 # ── Gold Standard ─────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     sample_size: int = 20
     seed: Optional[int] = None
 

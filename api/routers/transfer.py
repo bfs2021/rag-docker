@@ -95,10 +95,11 @@ def _list_packages_sync() -> list[dict]:
     out = []
     for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
         try:
-            manifest = packager.read_manifest(p)
+            fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:
-            # A file that is not a readable package still belongs in the listing;
-            # import will report precisely why it cannot be used.
+            # A file that is not a readable package, or whose manifest has a
+            # wrongly typed field (#451), still belongs in the listing; import
+            # will report precisely why it cannot be used.
             out.append({"filename": p.name, "size_bytes": p.stat().st_size,
                         "collection": None, "chunk_count": None,
                         "fidelity": None, "created_at": None, "readable": False})
@@ -106,10 +107,7 @@ def _list_packages_sync() -> list[dict]:
         out.append({
             "filename": p.name,
             "size_bytes": p.stat().st_size,
-            "collection": manifest.get("collection", {}).get("name"),
-            "chunk_count": manifest.get("collection", {}).get("chunk_count"),
-            "fidelity": manifest.get("fidelity"),
-            "created_at": manifest.get("created_at"),
+            **fields,
             "readable": True,
         })
     return out

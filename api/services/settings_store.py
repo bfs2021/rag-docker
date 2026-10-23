@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -14,12 +15,23 @@ log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
 
 
+def _sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def publish(path: Path, config: dict) -> None:
     """Publish this request's complete value, preserving the old file on failure.
 
     Serialize the whole transaction within this API process. Exclusive temporary
     names ensure even independent processes cannot rename each other's payloads.
     A later successful save may supersede this value after atomic replacement.
+    The folder is fsynced after the replacement (#445); if that fails, the save
+    raises with the new value already in place.
     """
     with _write_lock:
         payload = json.dumps(config, indent=2, sort_keys=True)
@@ -33,6 +45,7 @@ def publish(path: Path, config: dict) -> None:
                 output.write(payload)
             temporary.replace(path)
             temporary = None
+            _sync_folder(path.parent)
         finally:
             if temporary is not None:
                 try:

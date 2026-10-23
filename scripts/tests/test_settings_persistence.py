@@ -1,6 +1,8 @@
 """Deterministic settings publication regressions; no backend or model calls."""
+import errno
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -193,6 +195,89 @@ class SettingsPersistenceTests(unittest.TestCase):
             with self.subTest(service=service.__name__):
                 self.assert_failure_preserves_old_value(service,
                     patch.object(Path, 'replace', side_effect=OSError('injected replace fault')), OSError)
+
+    @contextmanager
+    def recorded(self, events, fail_folder_sync=False):
+        """Record replace and the folder sync's open, fsync and close (#445).
+        With fail_folder_sync, an fsync of a folder fails as on a broken volume."""
+        real_replace, real_open = Path.replace, os.open
+        real_fsync, real_close = os.fsync, os.close
+
+        def replace(source, target):
+            events.append(('replace', Path(target)))
+            return real_replace(source, target)
+
+        def open_(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            events.append(('open', fd, Path(path)))
+            return fd
+
+        def fsync(fd):
+            folder = stat.S_ISDIR(os.fstat(fd).st_mode)
+            events.append(('fsync folder' if folder else 'fsync file', fd))
+            if folder and fail_folder_sync:
+                raise OSError(errno.EIO, 'injected folder sync fault')
+            return real_fsync(fd)
+
+        def close(fd):
+            events.append(('close', fd))
+            return real_close(fd)
+
+        with patch.object(Path, 'replace', replace), \
+             patch.object(os, 'open', side_effect=open_), \
+             patch.object(os, 'fsync', side_effect=fsync), \
+             patch.object(os, 'close', side_effect=close):
+            yield
+
+    def after_replace(self, events):
+        names = [event[0] for event in events]
+        self.assertEqual(names.count('replace'), 1, events)
+        return events[names.index('replace') + 1:]
+
+    def test_the_folder_is_fsynced_after_the_replacement(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events):
+                    service.save(attempted)
+                after = self.after_replace(events)
+                self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+                fd, folder = after[0][1], after[0][2]
+                self.assertEqual(folder, service._dir())
+                self.assertEqual((after[1][1], after[2][1]), (fd, fd))
+                self.assertEqual(service.load(old['collection']), attempted)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_import_publication_fsyncs_the_folder_after_the_replacement(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            _, incoming, _ = self.values(ingest_config)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            events = []
+            with self.recorded(events):
+                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [])
+            after = self.after_replace(events)
+            self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+            self.assertEqual(after[0][2], ingest_config._path(incoming['collection']).parent)
+            self.assertEqual(ingest_config.load(incoming['collection']), incoming)
+
+    def test_a_failed_folder_sync_raises_with_the_new_value_in_place(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events, fail_folder_sync=True), self.assertRaises(OSError):
+                    service.save(attempted)
+                after = self.after_replace(events)
+                self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+                self.assertEqual(after[2][1], after[0][1], "the folder's descriptor was left open")
+                self.assertEqual(service.load(old['collection']), attempted)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
 
     def test_serialization_failure_preserves_old_value(self):
         for service in SERVICES:

@@ -190,19 +190,26 @@ ENDPY
     fi
 
     # First start: no volumes but the model copy, which is external and kept by
-    # `down -v`. The model pull isn't timed: the verify project copies the models.
-    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
-    started=$(python3 -c "import time;print(time.time())")
-    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
-    up_ok=$?
-    took=$(python3 -c "import time;print(int(time.time()-$started))")
-    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
-    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
-      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
-    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
-    # It started from nothing: the collection made above is gone with its volume.
-    check_eq "that first start began with no collections" \
-      "$(api_get "/collections" | jfield "['collections']")" "[]"
+    # `down -v`, so the models are already present, as SPECIFICATIONS.md's
+    # criterion says; the pull from empty is a recorded manual measurement (#465).
+    # Only on the verify project: elsewhere `down -v` would remove every volume.
+    removal_refusal=$(volume_removal_refusal_reason)
+    if [ -n "$removal_refusal" ]; then
+      check "a first start from empty volumes brings every service healthy within 300s" 1 "$removal_refusal"
+    else
+      (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+      started=$(python3 -c "import time;print(time.time())")
+      (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+      up_ok=$?
+      took=$(python3 -c "import time;print(int(time.time()-$started))")
+      [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+      check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+        "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+      wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # It started from nothing: the collection made above is gone with its volume.
+      check_eq "that first start began with no collections" \
+        "$(api_get "/collections" | jfield "['collections']")" "[]"
+    fi
   fi
 fi
 
