@@ -507,7 +507,8 @@ the files of that model already copied are removed from the package and from
 `files`, and a warning names the model (#449). Import takes a model with a
 `models/<name>/<tag>/manifest.json` as bundled, so a partly copied model must
 never be left behind. A model used for both embedding and the LLM is copied
-once.
+once; the two are compared by name and tag, so `x` and `x:latest` are one
+model (#494).
 
 Two tags of one name (an embedding model `foo:a` and an LLM `foo:b`) are both
 bundled, each in its own folder (#487). Import uses a folder only for the name
@@ -901,6 +902,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` and its `chunks_written` kept; an import interrupted by the restart answers the same (#309); tune likewise, by `test_jobstore.py` |
 | E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
 | E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
+| E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
 
 ---
 
