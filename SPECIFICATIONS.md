@@ -345,7 +345,11 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 The registry is written atomically (#388): each create or delete writes the whole registry to a
 uniquely named temporary file in the same folder, fsyncs it and replaces
 `collection_registry.json` with it, under one lock in the API process, so a crash or a failed
-write (for example on a full `ingest_uploads` volume) leaves the old file whole. The file is
+write (for example on a full `ingest_uploads` volume) leaves the old file whole. The folder is
+then fsynced, so a power loss right after a save doesn't lose the replacement; if that fsync
+fails, the save fails with the new file already in place (#445). At startup, before the first
+request, the API removes the temporary files (`.collection_registry.json.*.tmp`) of saves a
+crash interrupted; one it can't remove is logged and kept (#445). The file is
 owner-only (mode 0600). A registry that exists but can't be read (it can't be opened, isn't
 UTF-8 JSON, or isn't a JSON object) is never treated as empty: it is left unchanged and logged.
 `GET /collections` then answers with `created_at` `null` for every collection, and
@@ -787,7 +791,9 @@ acknowledges that request's complete value was published; a later successful sav
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
 Failed saves clean up their own temporary file when filesystem permissions
-allow. Package import publishes ingest settings through this same lock and
+allow. After the replacement the folder is fsynced, so a power loss right after a
+save doesn't lose it (#445); a failed folder fsync doesn't acknowledge the save
+either, though the new value is then already in place. Package import publishes ingest settings through this same lock and
 atomic writer. Published files use mode 0600 (API owner read/write), including
 replacements of older files.
 
@@ -2805,6 +2811,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *`created_at`, index type and distance metric all preserved.*
 - [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
       *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
+- [x] The collection registry and settings saves fsync their folder after the replacement, and a failed folder fsync fails the save; API startup removes the `.collection_registry.json.*.tmp` files of interrupted registry saves, keeping the registry and every other file (#445).
+      *Evidence: `scripts/tests/test_collection_registry.py` (suite 01) and `scripts/tests/test_settings_persistence.py` (suite 07); the folder-fsync checks and the startup check (a leftover still there after the lifespan) fail on the code before #445.*
 - [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
