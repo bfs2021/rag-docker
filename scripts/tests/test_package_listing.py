@@ -157,6 +157,20 @@ class ListingTestCase(unittest.TestCase):
         self.assertEqual(self.listing()[path.name], dict(
             filename=path.name, size_bytes=path.stat().st_size, readable=False, **NULLS))
 
+    def test_manifest_size_bound_is_inclusive(self):
+        # Boundary of the bound: exactly MANIFEST_LIMIT bytes lists, one byte more does not.
+        base = len(json.dumps(dict(MANIFEST, padding="")).encode())
+        at_limit = dict(MANIFEST, padding="a" * (MANIFEST_LIMIT - base))
+        self.assertEqual(len(json.dumps(at_limit).encode()), MANIFEST_LIMIT)
+        path = manifest_first(self.exports / f"{STEM}.tar.gz", manifest=at_limit)
+        self.assertEqual(packager.read_manifest(path), at_limit)
+        self.assert_readable(self.listing()[path.name])
+        over = dict(MANIFEST, padding="a" * (MANIFEST_LIMIT - base + 1))
+        path = manifest_first(self.exports / f"{STEM}.tar.gz", manifest=over)
+        with self.assertRaises(ValueError):
+            packager.read_manifest(path)
+        self.assertFalse(self.listing()[path.name]["readable"])
+
     def test_unreadable_files_are_listed_readable_false(self):
         good = manifest_first(self.exports / f"{STEM}.tar.gz")
         bad = {

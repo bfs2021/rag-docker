@@ -18633,6 +18633,17 @@ check_eq "a tuned collection ships retrieve.py" "$script" "True"
 
 python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
 check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+# A real export, archived manifest first, lists as readable with its metadata (#383).
+api_get "/packages" > /tmp/vfy_pkglist.json
+python3 - "$PKG" "$C" "$chunks_before" > /tmp/vfy_pkglist.txt 2>&1 <<'ENDPY'
+import json, sys
+pkg, coll, chunks = sys.argv[1], sys.argv[2], int(sys.argv[3])
+entry = next((p for p in json.load(open("/tmp/vfy_pkglist.json"))["packages"] if p["filename"] == pkg), None)
+print(entry)
+sys.exit(0 if entry and entry["readable"] is True and entry["collection"] == coll
+         and entry["chunk_count"] == chunks and entry["fidelity"] == "with-sources" and entry["created_at"] else 1)
+ENDPY
+check "GET /packages lists the new export as readable with its manifest metadata (#383)" $? "$(tail -1 /tmp/vfy_pkglist.txt)"
 
 # ── E30: vectors are attributed to the collection's stored model (#196) ──────
 EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
