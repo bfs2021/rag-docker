@@ -494,6 +494,13 @@ bundle unrelated weights. Ollama writes blob filenames with a hyphen
 Every model file appears in the package manifest's `files` map and is digest
 verified on import like any other file.
 
+A model is bundled whole or not at all. If any of its files can't be copied,
+the files of that model already copied are removed from the package and from
+`files`, and a warning names the model (#449). Import takes a model with a
+`models/<model-name>/manifest.json` as bundled, so a partly copied model must
+never be left behind. A model used for both embedding and the LLM is copied
+once.
+
 **The API service must mount the Ollama model volume** (`ollama_models:/ollama`)
 for any of this to work. Installing a model means writing its exact manifest and
 blobs: offline there is no registry to pull from, and rebuilding the model
@@ -812,7 +819,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
-| `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
+| `IMPORT_IN_PROGRESS` | HTTP 409 from `POST /import` for a concurrent import of the same package file (compared by its name in `./exports`), and an import job's failure when another import into the same target collection is running, whatever either job's `on_conflict`, with `error_detail` `{"collection": "<target>"}` (#391) |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |

@@ -347,6 +347,13 @@ import json; d=json.load(open('/tmp/vfy_job.json')); import sys
 sys.exit(0 if d['chunks_stored'] == 1 else 1)"
 check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
 
+# Chunker limits and insert batching (#386), with the backends mocked, in an
+# isolated container with the repository mounted.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_chunk_limits.py)
+check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
+check "chunk inserts are batched and retried while the index isn't ready" $?
+
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"

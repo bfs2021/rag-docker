@@ -13,6 +13,8 @@ class SessionImplementationTests(unittest.TestCase):
                                       ('api/services/packager.py', '```', 'python'),
                                       ('scripts/verify/README.md', '````', 'markdown'),
                                       ('scripts/verify/05_transfer.sh', '```', 'bash'),
+                                      ('scripts/verify/15_transfer_paths.sh', '```', 'bash'),
+                                      ('scripts/verify/transfer_packages.py', '```', 'python'),
                                       ('api/services/retrieval_config.py', '```', 'python'),
                                       ('api/templates/retrieve.py.tmpl', '```', 'python'),
                                       ('scripts/tests/test_retrieval_import.py', '```', 'python'),
