@@ -788,19 +788,17 @@ supported runtime API. This encapsulation is not a security boundary against
 Python private-state access.
 
 Before trace/log queueing and again at the final protobuf transport boundary,
-the runtime drops arbitrary text. Queue records use runtime-owned resources and
-fixed scopes; log wrappers also use fixed limits and discard exception objects
-and context references. The runtime logger copies supplied plain records and both
-layers of supplied wrappers before SDK normalization or exception expansion,
-so caller-owned records remain unchanged. For supplied records and keyword
-emission, only schema-approved attribute strings are snapshotted before SDK
-delegation; forbidden mutable values are discarded, not recursively copied.
-Callers must not mutate their mappings while that snapshot is being constructed.
-Non-mapping attributes consistently become empty. Every emission form receives
-runtime-owned limits before SDK processing (16 attributes, 128 characters), so
-ambient `OTEL_LOGRECORD_ATTRIBUTE_*` and `OTEL_ATTRIBUTE_*` limits cannot truncate
-approved log attributes or cause emission errors.
-Wire resources contain only the three explicit
+the runtime drops arbitrary text and rebuilds queued scope/resource metadata,
+context and log limits without retaining exception objects. The runtime logger
+copies supplied plain records and both wrapper layers before SDK normalization
+or exception expansion, preserving caller-owned inputs. Keyword emission is
+also supported. Approved string attributes are snapshotted before SDK delegation;
+forbidden mutable values are discarded rather than recursively copied. Callers
+must not mutate mappings during snapshot construction. Non-mapping attributes
+become empty. Every form receives fixed limits before SDK processing (16
+attributes, 128 characters); ambient log or general attribute limits cannot
+truncate approved values or cause emission errors. Wire resources contain
+only the three explicit
 service fields; scope is `rag.telemetry`. Request names use the fixed registered
 HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
 path values and query strings are never recorded. Other names are finite
@@ -808,22 +806,24 @@ path values and query strings are never recorded. Other names are finite
 listed in `api/services/telemetry.py`; unknown names become `rag.operation`.
 Attributes are finite operation, outcome (ok/error/cancelled/partial), error type
 (timeout/connection/validation/internal), registered method-and-route,
-HTTP status class (1xx–5xx) and tuning operation values. Raw exception messages,
+HTTP status class (1xx–5xx or unknown), method, dependency and tuning operation values. Raw exception messages,
 job/session identifiers, model names, customer names and content are excluded.
 All other attributes, span events, trace state, status descriptions, log severity
-text and arbitrary log bodies are removed; log body becomes `rag.operation`.
+text and arbitrary log bodies are removed. Only the fixed completion bodies
+documented below survive; other bodies become `rag.operation`.
 At most one link survives, containing only fixed-size nonzero trace/span IDs and
 a sampled flag. Trace/span IDs remain correlation fields, never authentication.
-The foundation metric allowlist is `rag.telemetry.check`; SDK views remove all
-metric dimensions before aggregation. An explicit always-off exemplar filter
-prevents original measurement attributes from entering SDK exemplar reservoirs,
-even with ambient `OTEL_METRICS_EXEMPLAR_FILTER=always_on`. Export removes
-descriptions, units and exemplars. Export admits exactly one finite data point per metric; empty,
-malformed and multi-point metrics are rejected before consuming batch capacity.
-Multi-point input cannot be merged safely after removing dimensions. Histograms
+The operational metric allowlist and finite dimensions are documented below.
+The private meter validates values before SDK aggregation; instrument-specific
+views and the final export boundary enforce its schema. Export removes arbitrary
+descriptions and exemplars and preserves only fixed declared units. Metric
+exemplar sampling is explicitly disabled, regardless of ambient exemplar settings,
+so dropped attributes never enter an exemplar reservoir. The original
+dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
+All points in a metric are validated before admitting the record. Histograms
 require at most 31 finite, strictly increasing boundaries, consistent bucket
 totals and finite optional sum/min/max with min no greater than max. Invalid
-histograms are dropped. Later stories extend this schema deliberately.
+records cannot reserve a name or consume valid metric capacity.
 Do not pass content into instrumentation even though the exporter excludes it:
 active SDK spans may retain inputs until completion.
 
@@ -846,7 +846,8 @@ deployed end-to-end acceptance remain separate work.
 Each request starts a locally sampled trace. One strictly valid version-00 W3C
 `traceparent` can supply a correlation link; duplicated, malformed, oversized,
 zero-ID and unsupported-version headers are ignored. Caller sampled flags do
-not control local sampling. `tracestate` and `baggage` are ignored. Headers never
+not control local sampling. Valid flag bytes span 00–ff; only the sampled bit
+is retained on the link. `tracestate` and `baggage` are ignored. Headers never
 change application identity, permissions, service metadata or response headers.
 
 Query spans cover reformulation, retrieval and synthesis. Ingest covers parsing,
@@ -869,5 +870,89 @@ waiter does not stop a running thread; that thread's span ends when its actual
 work exits. Async cancellation and existing timeouts close their spans. The API
 does not gain a worker drain, new retry or new deadline. Forced process death or
 workers surviving telemetry shutdown can lose their final spans; traces are not
-a durable execution ledger. Operational metrics/log correlation and a collector
-profile are subsequent stories.
+a durable execution ledger. Collector provisioning and deployed acceptance remain
+a separate story.
+
+
+### Operational metrics and correlated logs (#284)
+
+The private meter records executions independently of trace sampling or the
+traces flag. No automatic HTTP/client instrumentation is installed. Request,
+job and dependency measurements have separate denominators; nested stage spans
+do not increment these counts. Every completed execution, including failure or
+cancellation, contributes one count and one monotonic duration in seconds.
+
+| Instrument | Type / unit | Finite dimensions |
+| --- | --- | --- |
+| `rag.api.requests` | Counter / `{request}` | `http.route`, `http.method`, `http.status_class`, `rag.outcome` |
+| `rag.api.duration` | Histogram / `s` | Same as API requests |
+| `rag.api.active` | UpDownCounter / `{request}` | `http.method` |
+| `rag.dependency.calls` | Counter / `{call}` | `rag.dependency`, `rag.outcome` |
+| `rag.dependency.duration` | Histogram / `s` | Same as dependency calls |
+| `rag.dependency.errors` | Counter / `{error}` | `rag.dependency`, `error.type` |
+| `rag.job.completed` | Counter / `{job}` | `rag.operation`, `rag.outcome` |
+| `rag.job.duration` | Histogram / `s` | Same as job completions |
+| `rag.job.active` | UpDownCounter / `{job}` | `rag.operation` |
+
+Routes are the finite METHOD plus route-template strings in `ROUTES` in
+`api/services/telemetry.py`, or `unmatched`. Raw paths are never dimensions.
+Methods are GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT or
+`unknown`. Status classes are 1xx–5xx or `unknown` when no response start was
+observed. Outcomes are `ok`, `error` or `cancelled`; partial job results count as
+`error` and remain `partial` in logs and durable job status. HTTP 4xx/5xx count
+as errors. Dependency errors exclude cancellation; their error type is
+`timeout`, `connection`, `validation` or `internal`. Jobs cover ingest, export,
+import, tuning and evaluation generation. Dependency operations are the finite
+`ollama.*` and `weaviate.*` names in the same source registry. Iterator duration
+covers its entire consumption lifetime, including time between pulls; premature
+close is cancellation. Iterator construction captures the originating runtime,
+parent span and job token; factory execution and pulls remain lazy and rebind
+that context without leaking it across yields. An unconsumed iterator emits
+nothing. Model token usage is not available and is not invented.
+
+Histograms use explicit boundaries in seconds: 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 (plus the implicit overflow bucket).
+All valid finite series survive export regardless of the trace/log batch size.
+Malformed, duplicate or excess points reject their entire metric record before
+admission; later valid records remain eligible, including the same metric name.
+Compatible same-name records merge their distinct approved series across scopes
+and resources; repeated identities keep the first snapshot without summing.
+Later records with incompatible kinds, temporality or monotonicity are rejected.
+No valid disjoint series is truncated. SDK aggregation cannot
+allocate a series for arbitrary values under permitted keys. Job IDs, user IDs,
+collection names, filenames, prompts, raw exceptions and trace exemplars never
+become metric dimensions.
+
+Active instruments report process-local concurrency as the sum of increments
+and decrements. They start at actual scope entry and settle at scope exit.
+Cancelling a thread's waiter does not finish its running worker. A task cancelled
+before execution has no started/completed measurement. Process death resets
+active state and cannot synthesize historical completions. Existing job status
+and `/metrics/latency` contracts are unchanged.
+
+If an active-instrument SDK factory or update fails, its mutation state is
+unknown. That entire active instrument is suppressed for the runtime lifetime,
+including subsequent measurements and later wire exports. There is no retry or
+invented reset; other instruments and completion logs continue. This sacrifices
+active-instrument availability until restart, and does not reconstruct correct
+concurrency or remove previously exported backend history or in-flight exports.
+Local validation rejection does not suppress a healthy instrument.
+
+The private `SafeMeter` is a restricted finite-schema interface. It supports
+only the counter, histogram and up/down factories listed above. Unknown names
+and wrong factory/name combinations return inert instruments; gauge and
+observable factories are unsupported. It does not promise general SDK Meter
+compatibility or arbitrary custom metrics.
+
+Explicit structured completion logs use `rag.api.completed`,
+`rag.dependency.completed` or `rag.job.completed` bodies, INFO for successful
+work and WARN otherwise. Finite attributes carry outcomes and categories;
+trace/span IDs correlate with the owning scope. Each job execution generates a
+32-character random hexadecimal `rag.job_token`, inherited by its dependency
+logs and restored after execution. This token is never a durable/application
+job or session ID, metric dimension, authorization value or durable lookup key.
+Concurrent jobs receive separate tokens. With tracing disabled, operation logs
+still emit, with absent trace/span IDs. Logs can be disabled independently.
+Existing application log messages are not forwarded to OTLP: exception text,
+credentials, document content and arbitrary bodies remain excluded. Telemetry
+measurement or logger failures do not change application results.

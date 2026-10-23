@@ -1036,3 +1036,16 @@ cover actual Ollama client errors, iterator/batch boundaries, finite routes,
 untrusted headers, disabled/failing telemetry and sanitized OTLP links. Backend
 operations are faked; no collector setup or full deployed end-to-end claim is
 made by these offline tests.
+
+
+### Operational telemetry (#284)
+
+Suite 01 also runs `scripts/tests/test_telemetry_operations.py` in the built API
+image with `--network none`. Real SDK aggregation and a container-local OTLP
+receiver check exact counts/durations/active values, repeated IDs without new
+series, preserved multiple points, fixed correlated logs, cancellation and
+sampled-out/disabled tracing. Actual ingest/export/import/tuning/evaluation
+launchers use synthetic dependencies to prove handled outcomes preserve durable
+status. No live application content, external model or hosted collector is used.
+Exporter error and malformed-wire cases check bounded failure isolation;
+collector deployment acceptance remains #285.

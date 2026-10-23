@@ -14,6 +14,8 @@ section "§10.5 Infrastructure"
 check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_tracing.py)
 check "OTel request, worker and dependency trace continuity" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
+check "OTel operational metrics and sanitized correlated logs" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
 # Both distribution scripts in a scratch git repository, docker stubbed (#384).
