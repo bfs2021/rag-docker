@@ -27,6 +27,9 @@ check "E12 embedding mismatch and post-install Ollama check regressions" $?
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# The package listing reads each manifest without decompressing the package (#383).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
+check "the package listing reads only up to each manifest (#383)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?

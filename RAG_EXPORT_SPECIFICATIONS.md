@@ -148,7 +148,9 @@ carry the corpus's parameters.
 ### 3.2 Endpoints
 
 - `GET /retrieval/config/{collection}` → the saved config, or the defaults above
-  with `is_default: true`, matching how `/ingest/config/{collection}` behaves.
+  with `is_default: true`, matching how `/ingest/config/{collection}` behaves. A saved
+  file that can't be read, isn't JSON, isn't a JSON object or has a field of the wrong
+  type is logged and also answered with the defaults (#439); export still refuses it (§5).
 - `POST /retrieval/config` → upsert; collection in the **body**, not the path.
 
 The path shape deliberately mirrors ingest config, including the asymmetry that
@@ -205,6 +207,12 @@ ragpkg-.../
 │   └── <sha256>            raw bytes
 └── models/                 present only when models are bundled
 ```
+
+In the archive, `manifest.json` comes right after the directory entry, before
+every other file, so a reader that wants only the manifest (the package listing)
+can stop there (#383). Readers MUST NOT rely on that order: packages built before
+#383 have `README.md`, `chunks.jsonl`, `collection.json`, `goldstandard/` and
+`ingest_config.json` before it.
 
 Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
