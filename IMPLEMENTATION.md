@@ -14294,9 +14294,11 @@ note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields ans
 `SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
-refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
-(on the verify project, with the exports from `stack.sh up`, as above):
+refused before backend, model or staging work, with every backend mocked.
+`07_settings.sh` runs it in the API image with the repository mounted read-only
+and no network (#386). Its embedded-source check reads `IMPLEMENTATION.md`, so
+to run it by hand mount the whole repository (on the verify project, with the
+exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -14381,7 +14383,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
-| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
@@ -14412,6 +14414,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
+| `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
+| `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
+| `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -14422,7 +14429,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
-| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
 | `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
@@ -14478,8 +14485,11 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On the verify project (`bash scripts/verify/stack.sh up`, then paste the
-`export` lines it prints), whose model copy holds the embedding model, run:
+`05_transfer.sh` runs `model_integrity.py` in the verify project's API
+container, and `test_model_bundle.py` in the API image with the repository
+mounted (#386). To run them by hand, on the verify project
+(`bash scripts/verify/stack.sh up`, then paste the `export` lines it prints),
+whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
@@ -16405,6 +16415,8 @@ check "OTel embedded implementation stays synchronized" $?
 # Both distribution scripts in a scratch git repository, docker stubbed (#384).
 python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
 check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
@@ -17312,6 +17324,13 @@ import json; d=json.load(open('/tmp/vfy_job.json')); import sys
 sys.exit(0 if d['chunks_stored'] == 1 else 1)"
 check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
 
+# Chunker limits and insert batching (#386), with the backends mocked, in an
+# isolated container with the repository mounted.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_chunk_limits.py)
+check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
+check "chunk inserts are batched and retried while the index isn't ready" $?
+
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
@@ -17834,6 +17853,9 @@ cd "$(dirname "$0")" && . ./lib.sh
 proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
+section "Collection list rows and retrieval-mode dispatch, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_retrieval_controls.py)
+check "test_retrieval_controls.py registered regression checks" $?
 section "Physical index and effective query controls"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
 check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
@@ -18734,6 +18756,12 @@ check "concurrent imports of one package or one target refused (#391)" $?
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# Bundled models (#386): install safety, E21 and E22 with a temporary store,
+# then the real pulled embedding model copied through a temporary package.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_model_bundle.py)
+check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
+check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
@@ -22581,7 +22609,7 @@ Dockerfile
 
 ### package.sh
 
-Source-only archive (~150 KB). The target machine rebuilds the images and
+Source-only archive (~1.3 MB). The target machine rebuilds the images and
 re-downloads the models, so it needs internet.
 
 ```bash
@@ -22657,7 +22685,7 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #
 #   bash package-offline.sh [output.tar]
 #
-# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
 #   * the source tree: the files git tracks in the current commit (HEAD),
@@ -22822,6 +22850,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ('package.sh', 'package-offline.sh')
@@ -22829,6 +22858,9 @@ REFUSAL = 'not the top level of a git checkout'
 COMMITTED_README = 'Scratch project.\n'
 GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
        '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+# The scratch repository and both scripts read no system or global (or XDG) git
+# config, so a user's core.hooksPath or attributes can't change the result (#447).
+GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 
 # Answers what package-offline.sh asks of docker, and logs each call.
 STUB_DOCKER = r'''#!/usr/bin/env bash
@@ -22866,6 +22898,7 @@ class PackageArchiveTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.tmp = Path(temp.name).resolve()
+        self.git_env = dict(os.environ, **GIT_ISOLATION)
         self.repo = self.tmp / 'project'
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
@@ -22889,11 +22922,11 @@ class PackageArchiveTests(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         write(bin_dir / 'docker', STUB_DOCKER, 0o755)
         self.log = self.tmp / 'docker.log'
-        self.env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
-                        STUB_DOCKER_LOG=str(self.log), GIT_CONFIG_NOSYSTEM='1')
+        self.env = dict(self.git_env, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log))
 
     def git(self, *args, cwd=None):
-        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, check=True,
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, env=self.git_env, check=True,
                               capture_output=True, text=True).stdout
 
     def run_script(self, directory, script, out):
@@ -22902,6 +22935,20 @@ class PackageArchiveTests(unittest.TestCase):
 
     def assert_ran(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def expected_bundle(self):
+        return ({'rag-docker/' + name for name in self.tracked}
+                | {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'})
+
+    def assert_archives_hold_the_tracked_files(self, directory):
+        zip_out, bundle_out = self.tmp / 'check.zip', self.tmp / 'check.tar'
+        self.assert_ran(self.run_script(directory, 'package.sh', zip_out))
+        self.assert_ran(self.run_script(directory, 'package-offline.sh', bundle_out))
+        with zipfile.ZipFile(zip_out) as archive:
+            self.assertEqual({i.filename for i in archive.infolist() if not i.filename.endswith('/')},
+                             self.tracked)
+        with tarfile.open(bundle_out) as archive:
+            self.assertEqual({m.name for m in archive.getmembers() if m.isfile()}, self.expected_bundle())
 
     def test_zip_holds_exactly_the_tracked_files(self):
         out = self.tmp / 'out.zip'
@@ -22942,6 +22989,27 @@ class PackageArchiveTests(unittest.TestCase):
                     self.assertFalse(out.exists())
         calls = self.log.read_text() if self.log.exists() else ''
         self.assertEqual(calls, '', 'docker was called before the refusal')
+
+    def test_runs_in_a_checkout_reached_through_a_symlink(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.repo, target_is_directory=True)
+        self.assert_archives_hold_the_tracked_files(link)
+
+    def test_ignores_the_users_git_config(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        hostile = Path(temp.name).resolve()
+        marker = hostile / 'hook-ran'
+        write(hostile / 'hooks' / 'pre-commit', f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', 0o755)
+        write(hostile / 'attributes', 'README.md export-ignore\n')
+        write(hostile / 'gitconfig', f'[core]\n\thooksPath = {hostile / "hooks"}\n'
+                                     f'\tattributesFile = {hostile / "attributes"}\n')
+        with mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(hostile / 'gitconfig')):
+            # A fresh scratch repository, built while the caller's global config is hostile.
+            self.setUp()
+            self.assert_archives_hold_the_tracked_files(self.repo)
+        self.assertIn('README.md', self.tracked)
+        self.assertFalse(marker.exists(), 'the global pre-commit hook ran')
 
 
 class EmbeddedCopyTests(unittest.TestCase):
@@ -23771,6 +23839,9 @@ section "Concurrent settings publication and failed-write preservation"
 check "controlled retrieval/ingest concurrency and publication failures" $?
 (cd ../.. && python3 scripts/tests/test_settings_implementation.py)
 check "settings embedded implementation copies match runtime" $?
+section "Settings refused before work, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_settings_validation.py)
+check "test_settings_validation.py registered regression checks" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -29752,7 +29823,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session, safe_attributes
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
@@ -30470,7 +30541,7 @@ class TelemetryTests(unittest.TestCase):
         from contextlib import asynccontextmanager
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, Mock
-        api=Path(os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+        api=Path(os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
         tree=ast.parse((api/'main.py').read_text())
         function=next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name=='lifespan')
         namespace={'asynccontextmanager':asynccontextmanager,'FastAPI':object}

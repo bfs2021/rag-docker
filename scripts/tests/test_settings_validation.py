@@ -282,7 +282,10 @@ class InternalBoundaryTests(unittest.TestCase):
         client=MagicMock();client.collections.get.return_value.iterator.return_value=[]
         client.collections.get.return_value.aggregate.over_all.return_value.total_count=0
         client.collections.get.return_value.batch.dynamic.return_value.__enter__.return_value.number_errors=0
-        with patch.object(wc,'_collection_config_sync',return_value=config), \
+        # _rebuild writes its cutover record under UPLOAD_DIR: keep it in a temporary one.
+        with tempfile.TemporaryDirectory() as uploads, \
+             patch.object(settings,'upload_dir',uploads), \
+             patch.object(wc,'_collection_config_sync',return_value=config), \
              patch.object(wc,'get_client',return_value=client), \
              patch.object(wc,'_create_collection_sync') as create, \
              patch.object(wc,'_insert_chunks_sync'), \

@@ -2270,7 +2270,7 @@ rag-docker/
 │   ├── ragclient.py            # HTTP client + error translation
 │   ├── paths.py                # Inbox path validation
 │   └── tools/                  # 15 tools across 5 modules
-├── package.sh                  # Source-only zip (~150 KB; target needs internet)
+├── package.sh                  # Source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh          # Self-contained bundle (~4.6 GB; no network needed)
 ├── install-offline.sh          # Installs from that bundle on an air-gapped Mac
 ├── proxy/
@@ -2864,6 +2864,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
 - [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
   *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373. Suite 01 also checks through the proxy on the running stack that an unknown route answers 404 `NOT_FOUND` and a wrong method `METHOD_NOT_ALLOWED` (#411).*
+- [x] `package.sh` and `package-offline.sh` archives hold exactly the files git tracks in the current commit (`HEAD`), with no untracked or ignored file and no uncommitted change, and both scripts refuse to run unless their directory is the top level of a git checkout (§11.2, #384).
+  *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
 
 ---
 
@@ -2897,7 +2899,7 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive | ~150 KB zip | ~4.6 GB tar |
+| Archive | ~1.3 MB zip | ~4.6 GB tar |
 | Contains | source only | source + all 5 images + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
