@@ -151,6 +151,8 @@ carry the corpus's parameters.
   with `is_default: true`, matching how `/ingest/config/{collection}` behaves. A saved
   file that can't be read, isn't JSON, isn't a JSON object or has a field of the wrong
   type is logged and also answered with the defaults (#439); export still refuses it (§5).
+  A non-finite `alpha` counts as the wrong type, and a saved `is_default` key also gives
+  the defaults, though export ignores that key like any unknown one (#477).
 - `POST /retrieval/config` → upsert; collection in the **body**, not the path.
 
 The path shape deliberately mirrors ingest config, including the asymmetry that
@@ -213,6 +215,8 @@ every other file, so a reader that wants only the manifest (the package listing)
 can stop there (#383). Readers MUST NOT rely on that order: packages built before
 #383 have `README.md`, `chunks.jsonl`, `collection.json`, `goldstandard/` and
 `ingest_config.json` before it.
+What the listing takes from the manifest, and when a wrongly typed value makes
+it list the package as unreadable, is in §4.4 (#451).
 
 Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
@@ -249,6 +253,12 @@ and on import.
 
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
+
+The package listing (`GET /packages`) shows `collection.name` and
+`collection.chunk_count`, `fidelity` and `created_at`, with the types above:
+`collection` an object, `chunk_count` an integer, the other three strings. A
+value that is absent or `null` is listed as `null`; any other type is not
+coerced, and the package is listed `readable: false` (#451).
 
 `files` covers every file except `manifest.json`, `README.md` and `retrieve.py`.
 
@@ -711,6 +721,23 @@ or when a step fails before the original is deleted. If marking gold-standard
 sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
 the original collection is unchanged, and the retained copy is discarded.
 
+### 7.5 Weaviate unreadable at a tune route
+
+A tune route that can't read Weaviate answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON
+error, with `detail` `{"collection": "<name>"}`; the cause is logged, not returned. Two checks
+can fail this way:
+
+- **The existence check** (#349): `POST /tune/rechunk`, `POST /tune/reembed`,
+  `POST /tune/reindex` and `GET /tune/{collection}` read Weaviate to check that the
+  collection exists. No job is created and nothing is registered.
+- **The re-chunk coverage check** (#340): `POST /tune/rechunk` and `POST /tune/reembed`
+  with chunking fields read the stored chunks to check that there is something to rebuild
+  (§13 E17), and `GET /tune/{collection}`, for a collection with retained originals, reads them to
+  decide whether to offer re-chunking. For a start, no job is created and its guards are released.
+
+A re-embed without chunking fields and a re-index don't run the coverage check. Try again
+when Weaviate is available.
+
 ---
 
 ## 8. Lifecycle Rules
@@ -781,7 +808,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SERVICE_UNAVAILABLE` | HTTP 503 from `POST /export`: Weaviate can't be read to check whether the collection exists; no job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (#366) |
+| `SERVICE_UNAVAILABLE` | HTTP 503: Weaviate can't be read to check whether the collection exists, from `POST /export` (#366) and from `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/{collection}` (#349); or can't be read for the re-chunk coverage check, from `POST /tune/rechunk`, `POST /tune/reembed` with chunking fields and `GET /tune/{collection}` (#340). No job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (§7.5) |
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |

@@ -87,10 +87,14 @@ def resolve(collection: str) -> tuple[dict, bool]:
     """Return (config, is_default). Never raises; always usable.
 
     Saved settings that cannot be served, JSON that is not an object or a field of
-    the wrong type (#439), are logged and give the defaults, like an unreadable file.
+    the wrong type (#439), a non-finite alpha or the response's own is_default key
+    (#477), are logged and give the defaults, like an unreadable file.
     """
     try:
         config, is_default = merged(collection)
+        if "is_default" in config:
+            # Not a setting; the router would get the keyword twice (#477).
+            raise ValueError("saved settings hold is_default")
         RetrievalConfigResponse.model_validate({**config, "is_default": is_default})
     except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
         log.warning("Invalid retrieval config for %r; falling back to defaults", collection)

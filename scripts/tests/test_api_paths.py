@@ -305,6 +305,32 @@ class RetrievalConfigFileTests(ApiTestCase):
         self.assertEqual(self.get_config(), {**DEFAULTS, "top_k": 0, "ef": 513,
                                              "is_default": False})
 
+    def test_a_fractional_or_nested_value_falls_back_to_the_defaults(self):
+        # #439: other values the GET response can't carry; each answered 500 before it.
+        for value in (1.5, {"a": 1}, [7]):
+            with self.subTest(top_k=value):
+                self.saved_file().write_text(json.dumps({"top_k": value}))
+                self.assert_falls_back()
+
+    def test_a_saved_is_default_key_falls_back_to_the_defaults(self):
+        # #477: a hand-edited file holding the response-only key `is_default` passed
+        # resolve()'s check, then the router's RetrievalConfigResponse(is_default=...,
+        # **cfg) got the keyword twice and the route answered 500 INTERNAL_ERROR.
+        for value in (True, False):
+            with self.subTest(is_default=value):
+                self.saved_file().write_text(json.dumps({"top_k": 9, "is_default": value}))
+                self.assert_falls_back()
+
+    def test_a_non_finite_alpha_falls_back_to_the_defaults(self):
+        # #477: JSON has no NaN or Infinity, so the response sent `"alpha": null` with
+        # `is_default: false`; a finite alpha out of range is still served as saved.
+        for text in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(alpha=text):
+                self.saved_file().write_text('{"alpha": %s}' % text)
+                self.assert_falls_back()
+        self.saved_file().write_text(json.dumps({"alpha": 1.5}))
+        self.assertEqual(self.get_config(), {**DEFAULTS, "alpha": 1.5, "is_default": False})
+
 
 # ── GET /metrics/latency (PL:B1, PL:B2, PL:B3) ───────────────────────────────
 
