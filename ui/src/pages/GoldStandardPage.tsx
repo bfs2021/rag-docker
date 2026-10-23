@@ -1,6 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, Session, GoldPair } from '../api/client'
 
+// The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
+// UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
+// 0-9 and '_' dropped, and the collection part shortened to keep 128 characters.
+function defaultExportName(collection: string, now = new Date()): string {
+  const iso = now.toISOString()
+  const ts = `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}_${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}`
+  const safe = collection.replace(/ /g, '_').replace(/[^A-Za-z0-9_]/g, '')
+  const suffix = `_${ts}.json`
+  return safe.slice(0, 128 - suffix.length) + suffix
+}
+
 export default function GoldStandardPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -62,13 +73,14 @@ export default function GoldStandardPage() {
       const loaded = await api.getSession(id)
       activeSessionRef.current = loaded.session_id
       setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
-      setFilename('')
+      setFilename(defaultExportName(loaded.collection ?? 'export'))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { setLoading(false) }
   }
 
   async function generate() {
+    if (!sampleSizeValid) return
     if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
     setLoading(true)
@@ -79,8 +91,7 @@ export default function GoldStandardPage() {
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
       setSession(null)
-      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
-      setFilename(`${collection}_${ts}.json`)
+      setFilename(defaultExportName(collection))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -115,7 +126,8 @@ export default function GoldStandardPage() {
     try {
       const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
       setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
-      window.open(api.downloadUrl(res.filename), '_blank')
+      // downloadUrl puts the name into the path as given, so encode it here (#393).
+      window.open(api.downloadUrl(encodeURIComponent(res.filename)), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { exportPendingRef.current = false; setExportPending(false) }
@@ -142,6 +154,8 @@ export default function GoldStandardPage() {
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
+  // An empty field reads as 0, so it is refused too (#393).
+  const sampleSizeValid = Number.isInteger(sampleSize) && sampleSize >= 1 && sampleSize <= 100
   const historical = Boolean(session?.stale || session?.orphaned)
   const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
@@ -159,13 +173,14 @@ export default function GoldStandardPage() {
             </select>
           </div>
           <div>
-            <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
-            <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
+            <label htmlFor="sample-size" className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
+            <input id="sample-size" type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || exportPending || !sampleSizeValid} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
+        {!sampleSizeValid && <p role="alert" className="text-red-600 text-sm mt-3">Sample size must be a whole number from 1 to 100.</p>}
         {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
         {session && session.status === 'generating' && (
