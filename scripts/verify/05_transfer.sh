@@ -29,6 +29,12 @@ check "concurrent imports of one package or one target refused (#391)" $?
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# Bundled models (#386): install safety, E21 and E22 with a temporary store,
+# then the real pulled embedding model copied through a temporary package.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_model_bundle.py)
+check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
+check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
