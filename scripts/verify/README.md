@@ -113,6 +113,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -142,7 +147,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -529,7 +534,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -537,9 +542,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`; run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
@@ -796,6 +803,16 @@ template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND` and `PUT /query` answers `METHOD_NOT_ALLOWED`.
 
+Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
+and the job workers mocked, it sends each route that takes a collection name a lowercase-first
+spelling (`myDocs`) and checks that the registry, the 201 and 202 answers, the ingest and
+retrieval settings files, the query metric and the metrics filter, retained originals found by
+`GET /tune`, and the export, tune, ingest and generation workers all get the stored name
+(`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
+ingests under a lowercase-first name, reads the tuning options and exports under the stored
+name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
+metrics under both spellings.
+
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
@@ -832,9 +849,10 @@ with only `question` and `collection` reaches the pipeline with the defaults (`h
 search with the end-user prompt; the reformulation, end-user and engineer prompts and their
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
-from the defaults, and one that isn't JSON or can't be read gives the defaults with
-`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
-instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type gives the
+defaults with `is_default: true` and a warning, while coercible and out-of-range values are
+still served as saved (#439). `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -851,9 +869,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.

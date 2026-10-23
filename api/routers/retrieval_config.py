@@ -9,14 +9,14 @@ import asyncio
 
 from fastapi import APIRouter
 
-from models.schemas import RetrievalConfigResponse, SaveRetrievalConfigBody
+from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
 from services import retrieval_config
 
 router = APIRouter(prefix="/retrieval")
 
 
 @router.get("/config/{collection}", response_model=RetrievalConfigResponse)
-async def get_retrieval_config(collection: str):
+async def get_retrieval_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(retrieval_config.resolve, collection)
     return RetrievalConfigResponse(is_default=is_default, **cfg)
 
