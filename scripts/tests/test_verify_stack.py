@@ -1059,7 +1059,7 @@ class CraftedPackageWriteTests(unittest.TestCase):
     Desktop the container can read a freshly closed bind-mounted file as empty."""
 
     def test_every_crafted_package_is_renamed_into_place(self):
-        for name, var, count in (('05_transfer.sh', 'part', 5), ('retrieval_settings.py', 'part', 1),
+        for name, var, count in (('05_transfer.sh', 'part', 6), ('retrieval_settings.py', 'part', 1),
                                  ('legacy_retrieval.py', 'partial', 1)):
             with self.subTest(file=name):
                 source = (VERIFY / name).read_text()
