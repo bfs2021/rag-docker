@@ -1620,7 +1620,8 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from models.schemas import (SEARCH_EF_MAX, SEARCH_EF_MIN, RetrievalConfigResponse,
+                            SaveRetrievalConfigBody)
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1668,16 +1669,35 @@ def load(collection: str) -> dict | None:
         return None
 
 
-def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+def merged(collection: str) -> tuple[dict, bool]:
+    """Return (saved settings over the defaults, is_default), as saved.
+
+    Raises TypeError when the saved JSON is not an object. Export uses this rather
+    than resolve(), so it can refuse bad saved settings with a next step.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
     # Fill in any key added since the file was written, so an older config does
     # not lose a field that callers now expect.
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
-    return merged, False
+    config = {"collection": collection, **DEFAULTS, **saved}
+    config["collection"] = collection
+    return config, False
+
+
+def resolve(collection: str) -> tuple[dict, bool]:
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object or a field of
+    the wrong type (#439), are logged and give the defaults, like an unreadable file.
+    """
+    try:
+        config, is_default = merged(collection)
+        RetrievalConfigResponse.model_validate({**config, "is_default": is_default})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid retrieval config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
+    return config, is_default
 
 
 def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
@@ -6067,9 +6087,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -14368,9 +14388,10 @@ with only `question` and `collection` reaches the pipeline with the defaults (`h
 search with the end-user prompt; the reformulation, end-user and engineer prompts and their
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
-from the defaults, and one that isn't JSON or can't be read gives the defaults with
-`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
-instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type gives the
+defaults with `is_default: true` and a warning, while coercible and out-of-range values are
+still served as saved (#439). `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
