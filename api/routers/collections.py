@@ -59,10 +59,21 @@ def _load_registry() -> dict:
     return reg
 
 
+def _sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _save_registry(reg: dict) -> None:
     """Publish the whole registry atomically (#388): a uniquely named temporary file
-    in the same folder, fsynced, then os.replace. A failure at any step leaves the
-    old file whole and no temporary file, and raises. Callers hold _registry_lock."""
+    in the same folder, fsynced, then os.replace, then the folder fsynced (#445). A
+    failure before the replace leaves the old file whole and no temporary file, and
+    raises; a failed folder fsync raises with the new file in place. Callers hold
+    _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(reg, indent=2)
@@ -80,6 +91,20 @@ def _save_registry(reg: dict) -> None:
         except OSError:
             pass
         raise
+    _sync_folder(p.parent)
+
+
+def remove_interrupted_saves() -> None:
+    """Remove the temporary files of registry saves a crash interrupted (#445).
+    The registry itself is whole: a save replaces it only once its temporary file
+    is complete. Called once at startup, before any request, so no save is in
+    progress. A leftover that can't be removed is logged and kept."""
+    p = _registry_path()
+    for leftover in p.parent.glob(f".{p.name}.*.tmp"):
+        try:
+            leftover.unlink()
+        except OSError:
+            _log.exception("Could not remove interrupted registry write %s", leftover)
 
 
 @router.get("", response_model=CollectionsResponse)

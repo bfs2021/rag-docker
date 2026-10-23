@@ -819,7 +819,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
-| `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
+| `IMPORT_IN_PROGRESS` | HTTP 409 from `POST /import` for a concurrent import of the same package file (compared by its name in `./exports`), and an import job's failure when another import into the same target collection is running, whatever either job's `on_conflict`, with `error_detail` `{"collection": "<target>"}` (#391) |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |

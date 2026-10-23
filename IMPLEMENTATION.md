@@ -7258,7 +7258,13 @@ ON_CONFLICT = ("abort", "rename", "replace")
 
 # Job records survive an API restart (#23); see jobstore.py.
 _jobs = jobstore.JobStore("import")
+# Package names being imported: the file the worker opens, whatever the path
+# spelling sent (#391).
 _active: set[str] = set()
+# Target collections claimed by an import job, canonical name -> job id. A second
+# import into the same target is refused whatever its conflict mode, so two
+# imports never build, mark or clean up one collection at once (#391).
+_targets: dict[str, str] = {}
 _lock = threading.Lock()
 
 # Weaviate capitalises the first character of a collection name and rejects
@@ -7463,6 +7469,38 @@ def _sweep_orphaned_snapshots() -> None:
 def canonical(name: str) -> str:
     """The name Weaviate will actually store, so collision checks are honest."""
     return name[:1].upper() + name[1:] if name else name
+
+
+def _package_key(filename: str) -> str:
+    """The package the worker opens, so every spelling of one file is one key."""
+    return Path(filename).name
+
+
+def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
+    """Claim `target` for this import, or refuse while another import holds it.
+
+    `instead_of`, a name this job claimed earlier, is released in the same step:
+    a `rename` no longer writes the name it moved away from.
+    """
+    name = canonical(target)
+    with _lock:
+        owner = _targets.get(name)
+        if owner is not None and owner != job_id:
+            raise PackageError(
+                "IMPORT_IN_PROGRESS",
+                f"Another import into '{name}' is running. Start this import again "
+                "once it finishes.",
+                {"collection": name})
+        if instead_of is not None and _targets.get(canonical(instead_of)) == job_id:
+            del _targets[canonical(instead_of)]
+        _targets[name] = job_id
+    return name
+
+
+def _release_targets(job_id: str) -> None:
+    with _lock:
+        for name in [name for name, owner in _targets.items() if owner == job_id]:
+            del _targets[name]
 
 
 def _safe_file(name: str) -> str:
@@ -7939,6 +7977,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
+        # One import per target, whatever its conflict mode, claimed before the
+        # existence check and held until the job ends (#391).
+        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
@@ -7955,7 +7996,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     {"collection": target})
 
             if exists and on_conflict == "rename":
-                target = _rename_target(original, id8)
+                target = _claim_target(job_id, _rename_target(original, id8), instead_of=target)
 
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
@@ -8047,15 +8088,17 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         shutil.rmtree(work, ignore_errors=True)
         collection_writes.end_job("import", job_id)
         with _lock:
-            _active.discard(filename)
+            _active.discard(_package_key(filename))
+        _release_targets(job_id)
 
 
 async def start_import_job(filename: str, on_conflict: str) -> str:
     job_id = str(uuid.uuid4())[:8]
+    key = _package_key(filename)
     with _lock:
-        if filename in _active:
+        if key in _active:
             raise RuntimeError(filename)
-        _active.add(filename)
+        _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -8078,7 +8121,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         })
     except BaseException:
         with _lock:
-            _active.discard(filename)
+            _active.discard(key)
         raise
     asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
     return job_id
@@ -9184,10 +9227,21 @@ def _load_registry() -> dict:
     return reg
 
 
+def _sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _save_registry(reg: dict) -> None:
     """Publish the whole registry atomically (#388): a uniquely named temporary file
-    in the same folder, fsynced, then os.replace. A failure at any step leaves the
-    old file whole and no temporary file, and raises. Callers hold _registry_lock."""
+    in the same folder, fsynced, then os.replace, then the folder fsynced (#445). A
+    failure before the replace leaves the old file whole and no temporary file, and
+    raises; a failed folder fsync raises with the new file in place. Callers hold
+    _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(reg, indent=2)
@@ -9205,6 +9259,20 @@ def _save_registry(reg: dict) -> None:
         except OSError:
             pass
         raise
+    _sync_folder(p.parent)
+
+
+def remove_interrupted_saves() -> None:
+    """Remove the temporary files of registry saves a crash interrupted (#445).
+    The registry itself is whole: a save replaces it only once its temporary file
+    is complete. Called once at startup, before any request, so no save is in
+    progress. A leftover that can't be removed is logged and kept."""
+    p = _registry_path()
+    for leftover in p.parent.glob(f".{p.name}.*.tmp"):
+        try:
+            leftover.unlink()
+        except OSError:
+            _log.exception("Could not remove interrupted registry write %s", leftover)
 
 
 @router.get("", response_model=CollectionsResponse)
@@ -10726,6 +10794,11 @@ async def lifespan(app: FastAPI):
         # Sweep only durably owned scratch. Verified recovery collections and
         # unowned marker-like names must survive startup.
         log = logging.getLogger(__name__)
+        try:
+            from routers import collections as collection_routes
+            await asyncio.to_thread(collection_routes.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted collection registry writes failed")
         try:
             abandoned = await wc.sweep_staging()
             if abandoned:
@@ -13793,7 +13866,9 @@ needs no stack.
 With API dependencies installed, run
 `python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
 retrieval save contention, unique temporary paths, first-save directory races,
-and failed serialization/create/write/close/replace preservation. The test also
+failed serialization/create/write/close/replace preservation, and the folder
+fsync after the replacement, including import publication and a failed folder
+fsync (#445). The test also
 checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
 directories and does not connect to Weaviate or Ollama.
 
@@ -13811,7 +13886,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the seven controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13855,6 +13930,56 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
+had no check. It runs four controlled tests, then live checks on a collection of its own.
+`scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
+missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
+a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
+top-level directories, and a package with no manifest, a manifest that isn't JSON or a newer
+`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). Through `importer._run`, with Weaviate and the
+model checks mocked, a digest-valid package naming a collection Weaviate can't use is
+`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
+above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
+`abort` and `rename`. `scripts/tests/test_transfer_paths.py` (API container, through the app)
+checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
+import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
+`JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,
+`GET /packages` with a readable and an unreadable package, the help page's "its own number of"
+fallback when the embedding probe fails and `HELP_RENDER_FAILED` for a missing partial or an
+unsubstituted placeholder, 409 `TUNE_IN_PROGRESS` for a second tune start under either
+spelling, and a re-chunk that produces no chunks failing `SOURCES_REQUIRED` before any rebuild.
+`scripts/tests/test_retrieve_script.py` (API container) renders `retrieve.py` with the exporter
+and runs it with `python -I -S` against a stub API: standard-library imports only, the baked
+defaults sent, every flag overriding its default, and the exit codes of
+`RAG_EXPORT_SPECIFICATIONS.md` section 5.1 (2 bad usage; 3 refused connection, 502/503/504 and
+timeout; 4 enveloped `COLLECTION_NOT_FOUND`; 5 bare 404, other errors and non-JSON), each
+failure one `error:` sentence and a hint. `scripts/tests/test_distribution.py` (host, standard
+library) builds `package.sh`'s zip and `package-offline.sh`'s bundle from a copy of the tracked
+tree with excluded files planted and reads them back, runs `package-offline.sh` and
+`install-offline.sh` with `docker` and `sleep` replaced by logging stubs (nothing is saved,
+loaded or started), and checks the bundled image list against
+`docker compose config --images`. The copy is a real git repository with the tracked files
+committed (git ignoring the user's and the system's configuration), because both scripts
+archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
+real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
+such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+
+The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
+`ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
+`transfer_packages.py` (one per refusal above) and a missing file, each refused with its code
+and no collection created, a malformed copy refused by `replace` with the collection intact,
+the package's bytes, size and mtime unchanged by a `rename` import, the same chunks and scores
+from the original and the import for vector, hybrid and near-text retrieval (E11; `/query`
+rewrites the question with the LLM first, so answers are not compared), an export with models
+requested and the model store setting pointed at a missing folder (warning,
+`models_bundled: false`, no `models/`), the packaged `retrieve.py` exiting 3 against a closed
+port (E10) and, unless `RAG_SKIP_SLOW=1`, answering with the baked top-k and with `--top-k 2`
+(E8, E9) and from the import, and a re-chunk after the retained original is replaced with blank
+text failing `SOURCES_REQUIRED`. `sweep_stale_workdirs` (TR:C30) is covered by
+`test_startup_sweep.py`.
+
 `scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
 an import job of a digest-valid package embedded with another model is refused
 `EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
@@ -13863,6 +13988,20 @@ no promise of re-embedding; a same-name package of another width is refused too.
 It also checks that a model installed from a package is confirmed through Ollama's
 model list: reported, not reported, and Ollama unreachable. Only Ollama is
 replaced. `05_transfer.sh` runs it in the verify project's API container.
+
+`scripts/tests/test_import_guard.py` (#391) runs concurrent import jobs with
+Weaviate mocked: two spellings of one package file (`./x.tar.gz`, `a/../x.tar.gz`)
+answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
+building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
+`on_conflict`, never builds, and leaves the first job's in-progress marker in place;
+imports into different targets run side by side; a `rename` claims its new name and
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -14186,7 +14325,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
-| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -14215,6 +14354,12 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
+| `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
+| `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
+| `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -14504,7 +14649,12 @@ JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logge
 `POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
 200 with `created_at` `null`, with updates resuming once the file is readable again. It also
 checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
-the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`. It also checks (#445) that a save
+fsyncs the registry's folder after the replace and closes it, that a failed folder fsync fails
+the save with the new file in place and no temporary file, and that API startup (the lifespan,
+in a child process with the backend sweeps mocked) removes `.collection_registry.json.*.tmp`
+leftovers while keeping the registry, other files, files in subfolders and what a link points
+to, logging a leftover it can't remove.
 
 Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
 runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
@@ -18520,6 +18670,8 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
 check "E12 embedding mismatch and post-install Ollama check regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_guard.py)
+check "concurrent imports of one package or one target refused (#391)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
@@ -19731,7 +19883,443 @@ drop_collection "$C"
 cleanup_prefixed
 bash ./10_validity.sh
 check "retained-session validity acceptance suite" $?
+
+# -- transfer and tuning paths with no check before (#387) --------------------
+# Import refusals, on_conflict, unknown job ids, /packages, export without the
+# model store, retrieve.py (E8-E10), E11 and the distribution scripts; its own
+# collection and packages, removed again.
+bash ./15_transfer_paths.sh
+check "transfer and tuning paths suite (#387)" $?
 summary
+```
+
+### scripts/verify/15_transfer_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Transfer and tuning paths with no check before (#387): import refusals, on_conflict,
+# unknown job ids, /packages, the package file left alone, export without the model store,
+# retrieve.py (E8-E10), equivalent retrieval after import (E11) and a re-chunk that produces
+# no chunks. Run by 05_transfer.sh.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}Paths"
+SLUG=$(printf '%s' "$C" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g')
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
+QUESTION="who approves overtime?"
+
+section "Transfer and tuning paths (#387)"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_package_refusals.py)
+check "package refusal regressions (checks 1 and 2, collection name, chunk records)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_transfer_paths.py)
+check "transfer and tuning route regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieve_script.py)
+check "retrieve.py flag and exit-code regressions (E8-E10)" $?
+python3 "$REPO_ROOT/scripts/tests/test_distribution.py"
+check "package.sh, package-offline.sh and install-offline.sh regressions" $?
+
+count_of() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p_job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_p_imp.json
+  local j; j=$(jfield "['job_id']" < /tmp/vfy_p_imp.json)
+  # No job (a refused request): record that instead of polling a job that isn't there.
+  if [ -z "$j" ] || [ "$j" = None ]; then cp /tmp/vfy_p_imp.json /tmp/vfy_p_job.json; return; fi
+  wait_for_job "/import/job/$j" 900 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_p_job.json
+}
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
+check_eq "the suite's collection is ingested" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_p_ing.json)" 900)" "completed"
+chunks=$(count_of "$C")
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
+check_eq "... and exported" \
+  "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" 1800)" "completed"
+PKG=$(api_get "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" | jfield "['filename']")
+
+# -- unknown job ids (TR:A10, TR:C5, TU:34) -----------------------------------
+for kind in export import tune; do
+  code=$(api_code "$API/$kind/job/vfy-no-such-job")
+  ecode=$(api_get "/$kind/job/vfy-no-such-job" | jfield "['error']['code']")
+  [ "$code" = 404 ] && [ "$ecode" = JOB_NOT_FOUND ]
+  check "an unknown $kind job id is 404 JOB_NOT_FOUND" $? "HTTP $code, code '$ecode'"
+done
+
+# -- on_conflict is required and checked (TR:C2) ------------------------------
+for body in "{\"filename\":\"$PKG\"}" "{\"filename\":\"$PKG\",\"on_conflict\":null}" \
+            "{\"filename\":\"$PKG\",\"on_conflict\":\"merge\"}"; do
+  code=$(api_post_code "/import" "$body")
+  ecode=$(api_post "/import" "$body" | jfield "['error']['code']")
+  [ "$code" = 422 ] && [ "$ecode" = INVALID_PARAMETER ]
+  check "POST /import $body is 422 INVALID_PARAMETER" $? "HTTP $code, code '$ecode'"
+done
+
+# -- GET /packages, readable and not (TR:D1) ----------------------------------
+JUNK="ragpkg-$SLUG-junk.tar.gz"
+printf 'not a package\n' > "$EXPORTS/.$JUNK.part" && mv "$EXPORTS/.$JUNK.part" "$EXPORTS/$JUNK"
+api_get "/packages" > /tmp/vfy_p_list.json
+python3 - "$EXPORTS" "$PKG" "$JUNK" "$C" "$chunks" <<'ENDPY'
+import json, os, sys
+exports, pkg, junk, coll, chunks = sys.argv[1:6]
+listed = {p["filename"]: p for p in json.load(open("/tmp/vfy_p_list.json"))["packages"]}
+want = {pkg: {"filename": pkg, "size_bytes": os.path.getsize(os.path.join(exports, pkg)),
+              "collection": coll, "chunk_count": int(chunks), "fidelity": "with-sources",
+              "readable": True},
+        junk: {"filename": junk, "size_bytes": os.path.getsize(os.path.join(exports, junk)),
+               "collection": None, "chunk_count": None, "fidelity": None, "created_at": None,
+               "readable": False}}
+bad = [name for name, fields in want.items()
+       if name not in listed or any(listed[name].get(k) != v for k, v in fields.items())]
+bad += [] if (listed.get(pkg) or {}).get("created_at") else [pkg + " has no created_at"]
+print("    listed:", json.dumps({k: listed.get(k) for k in want}))
+sys.exit(1 if bad else 0)
+ENDPY
+check "GET /packages lists the package readable, with its fields, and junk as readable: false" $?
+rm -f "$EXPORTS/$JUNK"
+
+# -- import refusals (TR:C7-C10, C16, C34) ------------------------------------
+# Each crafted copy of the package is refused with its code, and no collection appears.
+names_before=$(collection_names)
+run_import "ragpkg-$SLUG-absent.tar.gz" rename
+check_eq "a package that does not exist is refused as PACKAGE_UNREADABLE" \
+  "$(jfield "['error_code']" < /tmp/vfy_p_job.json)" "PACKAGE_UNREADABLE"
+for spec in nongzip:PACKAGE_UNREADABLE truncated:PACKAGE_UNREADABLE symlink:PACKAGE_UNREADABLE \
+            hardlink:PACKAGE_UNREADABLE dotdot:PACKAGE_UNREADABLE twodirs:PACKAGE_UNREADABLE \
+            nomanifest:PACKAGE_FORMAT_UNSUPPORTED badmanifest:PACKAGE_FORMAT_UNSUPPORTED \
+            newformat:PACKAGE_FORMAT_UNSUPPORTED badname:PACKAGE_FORMAT_UNSUPPORTED \
+            badline:PACKAGE_CORRUPT baduuid:PACKAGE_CORRUPT badprops:PACKAGE_CORRUPT \
+            novector:PACKAGE_CORRUPT wrongwidth:PACKAGE_CORRUPT countup:PACKAGE_CORRUPT \
+            countdown:PACKAGE_CORRUPT; do
+  kind=${spec%%:*}; want=${spec#*:}
+  P=$(python3 ./transfer_packages.py "$EXPORTS/$PKG" "$kind")
+  run_import "$P" rename
+  got=$(jfield "['error_code']" < /tmp/vfy_p_job.json)
+  names_after=$(collection_names)
+  [ "$got" = "$want" ] && [ "$names_after" = "$names_before" ]
+  check "a $kind package is refused as $want and creates no collection" $? \
+    "code '$got': $(jfield "['error']" < /tmp/vfy_p_job.json | cut -c1-120)"
+  rm -f "$EXPORTS/$P"
+done
+P=$(python3 ./transfer_packages.py "$EXPORTS/$PKG" badline -replace)
+run_import "$P" replace
+check_eq "replace with a malformed chunk record is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_p_job.json)" "PACKAGE_CORRUPT"
+check_eq "... and leaves the existing collection's chunks alone" "$(count_of "$C")" "$chunks"
+rm -f "$EXPORTS/$P"
+
+# -- the package file is left unchanged (TR:C28) ------------------------------
+package_state() { python3 - "$EXPORTS/$PKG" <<'ENDPY'
+import hashlib, os, sys
+st = os.stat(sys.argv[1])
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), st.st_size, st.st_mtime_ns)
+ENDPY
+}
+state_before=$(package_state)
+run_import "$PKG" rename
+read -r istat IMP <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_p_job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "the package imports under a new name" "$istat" "completed"
+check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
+
+# -- E11: the import retrieves what the original does -------------------------
+# /query rewrites each question with the LLM first, so two answers can differ even for
+# identical collections; retrieval is compared directly, for each path /query uses.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
+import asyncio, sys
+from services import ollama_client
+from services import weaviate_client as wc
+original, imported, question = sys.argv[1:4]
+
+async def retrieve(name, vector):
+    return {"vector": await wc.near_vector_query(name, vector, 6),
+            "hybrid": await wc.hybrid_query(name, question, 0.5, 6),
+            "near-text": await wc.near_text_query(name, question, 6)}
+
+async def main():
+    vector = await ollama_client.embed(question)
+    return await retrieve(original, vector), await retrieve(imported, vector)
+
+try:
+    a, b = asyncio.run(main())
+finally:
+    wc.close_client()
+ok = True
+for path in a:
+    key = lambda rows: sorted((r["source_file"], r["chunk_index"], r["score"]) for r in rows)
+    x, y = key(a[path]), key(b[path])
+    same = len(x) == len(y) > 0 and all(
+        p[:2] == q[:2] and abs(p[2] - q[2]) < 1e-4 for p, q in zip(x, y))
+    print(f"    {path}: {len(x)} and {len(y)} chunk(s), {'the same' if same else 'DIFFERENT'}")
+    ok = ok and same
+sys.exit(0 if ok else 1)
+ENDPY
+check "E11: the imported collection retrieves the same chunks and scores as the original" $?
+
+# -- export without the model store (TR:A19) ----------------------------------
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_p_models.json 2>/tmp/vfy_p_models.err <<'ENDPY'
+import json, sys, tarfile
+from unittest.mock import patch
+from config import settings
+from services import packager
+from services import weaviate_client as wc
+try:
+    with patch.object(settings, "ollama_models_dir", "/nonexistent-ollama-store-387"):
+        result = packager.build(sys.argv[1], include_models=True)
+finally:
+    wc.close_client()
+with tarfile.open(packager.exports_dir() / result["filename"]) as tar:
+    names = tar.getnames()
+    manifest = json.load(tar.extractfile(next(n for n in names if n.endswith("/manifest.json"))))
+print(json.dumps({"filename": result["filename"], "models_bundled": result["models_bundled"],
+                  "warnings": result["warnings"], "manifest": [manifest["models_bundled"],
+                                                               manifest["bundled_models"]],
+                  "models": [n for n in names if "/models" in n]}))
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_models.json"))
+except ValueError:
+    print("    " + open("/tmp/vfy_p_models.err").read()[-300:]); sys.exit(1)
+ok = (d["models_bundled"] is False and d["manifest"] == [False, []] and d["models"] == []
+      and "models were requested but the Ollama model store is not mounted; the package was "
+          "built without them" in d["warnings"])
+print("    " + json.dumps(d))
+sys.exit(0 if ok else 1)
+ENDPY
+check "export with models but no model store warns, bundles nothing and says so in the manifest" $?
+NOSTORE=$(jfield "['filename']" < /tmp/vfy_p_models.json)
+[ -n "$NOSTORE" ] && [ "$NOSTORE" != "None" ] && rm -f "$EXPORTS/$NOSTORE"
+
+# -- retrieve.py from the package (E8-E10) ------------------------------------
+RTMP=$(mktemp -d)
+python3 - "$EXPORTS/$PKG" "$RTMP" <<'ENDPY'
+import pathlib, sys, tarfile
+with tarfile.open(sys.argv[1]) as tar:
+    member = next(m for m in tar.getmembers() if m.isfile() and m.name.endswith("/retrieve.py"))
+    pathlib.Path(sys.argv[2], "retrieve.py").write_bytes(tar.extractfile(member).read())
+ENDPY
+check "the package carries retrieve.py" $?
+python3 -I -S "$RTMP/retrieve.py" --api-url "http://127.0.0.1:9/api" "$QUESTION" \
+  > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+rc=$?
+[ "$rc" = 3 ] && grep -q '^error: Cannot reach the API at http://127.0.0.1:9/api' /tmp/vfy_p_r.err \
+  && ! grep -q Traceback /tmp/vfy_p_r.err
+check "E10: retrieve.py exits 3 with one sentence when nothing answers" $? \
+  "exit $rc: $(head -1 /tmp/vfy_p_r.err)"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "E8/E9/E11: retrieve.py answers from the original and the import" "RAG_SKIP_SLOW=1"
+else
+  want_citations=$(( chunks < 6 ? chunks : 6 ))
+  for run in "default:$want_citations" "top2:2"; do
+    name=${run%%:*}; want=${run#*:}
+    args=(--api-url "$API" --json --citations)
+    [ "$name" = top2 ] && args+=(--top-k 2)
+    python3 -I -S "$RTMP/retrieve.py" "${args[@]}" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - "$want" <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+ENDPY
+    answered=$?
+    [ "$rc" = 0 ] && [ "$answered" = 0 ]
+    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+      "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  done
+  python3 -I -S "$RTMP/retrieve.py" --api-url "$API" --collection "$IMP" "$QUESTION" \
+    > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+  rc=$?
+  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
+  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+fi
+rm -rf "$RTMP"
+
+# -- a re-chunk that produces no chunks (TU:16) -------------------------------
+# The retained original is replaced with blank text; its stored chunks stay.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+sources.store(c, "policies.txt", b"   \n\n   \n", replace=True)
+docs = sources.load_index(c)["documents"]
+sys.exit(0 if [e["filenames"] for e in docs.values()] == [["policies.txt"]] else 1)
+ENDPY
+check "the retained policies.txt is replaced with blank text" $?
+api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_p_tune.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_p_tune.json)
+if [ -n "$tjob" ] && [ "$tjob" != None ]; then
+  tstatus=$(wait_for_job "/tune/job/$tjob" 900)
+  api_get "/tune/job/$tjob" > /tmp/vfy_p_tjob.json
+else
+  tstatus="not started: $(head -c 200 /tmp/vfy_p_tune.json)"; echo '{}' > /tmp/vfy_p_tjob.json
+fi
+[ "$tstatus" = failed ] && [ "$(jfield "['error_code']" < /tmp/vfy_p_tjob.json)" = SOURCES_REQUIRED ] \
+  && jfield "['error']" < /tmp/vfy_p_tjob.json | grep -q "produced no chunks"
+check "a re-chunk that produces no chunks fails SOURCES_REQUIRED" $? \
+  "status '$tstatus': $(jfield "['error']" < /tmp/vfy_p_tjob.json)"
+check_eq "... and leaves the collection's chunks alone" "$(count_of "$C")" "$chunks"
+
+[ "$IMP" != "-" ] && [ "$IMP" != "$C" ] && drop_collection "$IMP"
+drop_collection "$C"
+rm -f "$EXPORTS/$PKG"
+summary
+```
+
+### scripts/verify/transfer_packages.py
+
+```python
+#!/usr/bin/env python3
+"""Write one damaged copy of an export package, for the import refusal checks (#387).
+
+    python3 transfer_packages.py <package.tar.gz> <kind> [suffix]
+
+Writes `<stem>-<kind><suffix>.tar.gz` beside the package and prints its name. The copy is
+written under a `.part` name and renamed into place: on Docker Desktop the API can read a
+freshly written bind-mounted file as empty (#184). Standard library only; run on the host by
+`15_transfer_paths.sh`.
+
+Kinds, by the import check that refuses them:
+  check 1, PACKAGE_UNREADABLE:  nongzip truncated symlink hardlink dotdot twodirs
+  check 2, PACKAGE_FORMAT_UNSUPPORTED:  nomanifest badmanifest newformat badname
+  records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
+The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
+the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+"""
+import hashlib
+import io
+import json
+import pathlib
+import sys
+import tarfile
+import tempfile
+
+KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "nomanifest",
+         "badmanifest", "newformat", "badname", "badline", "baduuid", "badprops", "novector",
+         "wrongwidth", "countup", "countdown")
+
+
+def extract(src, work):
+    with tarfile.open(src) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(work, filter="data")
+        else:                                   # the suite's own package, before 3.9.17
+            tar.extractall(work)
+    return next(p for p in work.iterdir() if p.is_dir())
+
+
+def edit_records(root, change):
+    path = root / "chunks.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    lines = [json.dumps(row) for row in rows]
+    change(rows, lines)
+    path.write_text("\n".join(lines) + "\n")
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"]["chunks.jsonl"] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def edit_manifest(root, change):
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text())
+    change(manifest)
+    path.write_text(json.dumps(manifest, indent=2))
+
+
+def record(index, change):
+    def apply(rows, lines):
+        row = rows[index]
+        change(row)
+        lines[index] = json.dumps(row)
+    return apply
+
+
+def member(tar, name, **fields):
+    info = tarfile.TarInfo(name)
+    data = b"" if fields else b"written outside the package\n"
+    info.size = len(data)
+    for key, value in fields.items():
+        setattr(info, key, value)
+    tar.addfile(info, io.BytesIO(data))
+
+
+def write(src, kind, out):
+    if kind == "nongzip":
+        out.write_text("this is not a gzip archive\n")
+        return
+    if kind == "truncated":
+        data = src.read_bytes()
+        out.write_bytes(data[: len(data) // 2])
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = extract(src, pathlib.Path(td))
+        if kind == "nomanifest":
+            (root / "manifest.json").unlink()
+        elif kind == "badmanifest":
+            (root / "manifest.json").write_text("{not json")
+        elif kind == "newformat":
+            edit_manifest(root, lambda m: m.update(package_format=m["package_format"] + 1))
+        elif kind == "badname":
+            edit_manifest(root, lambda m: m["collection"].update(name="1bad-name"))
+        elif kind == "countup":
+            edit_manifest(root, lambda m: m["collection"].update(chunk_count=m["collection"]["chunk_count"] + 1))
+        elif kind == "countdown":
+            edit_manifest(root, lambda m: m["collection"].update(chunk_count=m["collection"]["chunk_count"] - 1))
+        elif kind == "badline":
+            edit_records(root, lambda rows, lines: lines.__setitem__(1, "{not json"))
+        elif kind == "baduuid":
+            edit_records(root, record(0, lambda r: r.update(id="not-a-uuid")))
+        elif kind == "badprops":
+            edit_records(root, record(0, lambda r: r.update(properties=["content"])))
+        elif kind == "novector":
+            edit_records(root, record(0, lambda r: r.pop("vector")))
+        elif kind == "wrongwidth":
+            edit_records(root, record(0, lambda r: r.update(vector=r["vector"][:-1])))
+        with tarfile.open(out, "w:gz") as tar:
+            tar.add(root, arcname=root.name)
+            if kind == "symlink":
+                member(tar, root.name + "/link", type=tarfile.SYMTYPE, linkname="/etc/passwd")
+            elif kind == "hardlink":
+                member(tar, root.name + "/hard", type=tarfile.LNKTYPE,
+                       linkname=root.name + "/manifest.json")
+            elif kind == "dotdot":
+                member(tar, "../escape-387.txt")
+            elif kind == "twodirs":
+                member(tar, "second/extra.txt")
+
+
+def main(argv):
+    if len(argv) not in (3, 4) or argv[2] not in KINDS:
+        sys.exit(__doc__)
+    src, kind = pathlib.Path(argv[1]), argv[2]
+    suffix = argv[3] if len(argv) == 4 else ""
+    out = src.parent / (src.name[: -len(".tar.gz")] + f"-{kind}{suffix}.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        write(src, kind, part)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
 ```
 
 ### scripts/verify/batch_recovery.py
@@ -24863,6 +25451,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -24874,12 +25463,23 @@ log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
 
 
+def _sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def publish(path: Path, config: dict) -> None:
     """Publish this request's complete value, preserving the old file on failure.
 
     Serialize the whole transaction within this API process. Exclusive temporary
     names ensure even independent processes cannot rename each other's payloads.
     A later successful save may supersede this value after atomic replacement.
+    The folder is fsynced after the replacement (#445); if that fails, the save
+    raises with the new value already in place.
     """
     with _write_lock:
         payload = json.dumps(config, indent=2, sort_keys=True)
@@ -24893,6 +25493,7 @@ def publish(path: Path, config: dict) -> None:
                 output.write(payload)
             temporary.replace(path)
             temporary = None
+            _sync_folder(path.parent)
         finally:
             if temporary is not None:
                 try:
@@ -24933,8 +25534,10 @@ if __name__ == '__main__':
 
 ```python
 """Deterministic settings publication regressions; no backend or model calls."""
+import errno
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -25127,6 +25730,89 @@ class SettingsPersistenceTests(unittest.TestCase):
             with self.subTest(service=service.__name__):
                 self.assert_failure_preserves_old_value(service,
                     patch.object(Path, 'replace', side_effect=OSError('injected replace fault')), OSError)
+
+    @contextmanager
+    def recorded(self, events, fail_folder_sync=False):
+        """Record replace and the folder sync's open, fsync and close (#445).
+        With fail_folder_sync, an fsync of a folder fails as on a broken volume."""
+        real_replace, real_open = Path.replace, os.open
+        real_fsync, real_close = os.fsync, os.close
+
+        def replace(source, target):
+            events.append(('replace', Path(target)))
+            return real_replace(source, target)
+
+        def open_(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            events.append(('open', fd, Path(path)))
+            return fd
+
+        def fsync(fd):
+            folder = stat.S_ISDIR(os.fstat(fd).st_mode)
+            events.append(('fsync folder' if folder else 'fsync file', fd))
+            if folder and fail_folder_sync:
+                raise OSError(errno.EIO, 'injected folder sync fault')
+            return real_fsync(fd)
+
+        def close(fd):
+            events.append(('close', fd))
+            return real_close(fd)
+
+        with patch.object(Path, 'replace', replace), \
+             patch.object(os, 'open', side_effect=open_), \
+             patch.object(os, 'fsync', side_effect=fsync), \
+             patch.object(os, 'close', side_effect=close):
+            yield
+
+    def after_replace(self, events):
+        names = [event[0] for event in events]
+        self.assertEqual(names.count('replace'), 1, events)
+        return events[names.index('replace') + 1:]
+
+    def test_the_folder_is_fsynced_after_the_replacement(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events):
+                    service.save(attempted)
+                after = self.after_replace(events)
+                self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+                fd, folder = after[0][1], after[0][2]
+                self.assertEqual(folder, service._dir())
+                self.assertEqual((after[1][1], after[2][1]), (fd, fd))
+                self.assertEqual(service.load(old['collection']), attempted)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_import_publication_fsyncs_the_folder_after_the_replacement(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            _, incoming, _ = self.values(ingest_config)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            events = []
+            with self.recorded(events):
+                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [])
+            after = self.after_replace(events)
+            self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+            self.assertEqual(after[0][2], ingest_config._path(incoming['collection']).parent)
+            self.assertEqual(ingest_config.load(incoming['collection']), incoming)
+
+    def test_a_failed_folder_sync_raises_with_the_new_value_in_place(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events, fail_folder_sync=True), self.assertRaises(OSError):
+                    service.save(attempted)
+                after = self.after_replace(events)
+                self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+                self.assertEqual(after[2][1], after[0][1], "the folder's descriptor was left open")
+                self.assertEqual(service.load(old['collection']), attempted)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
 
     def test_serialization_failure_preserves_old_value(self):
         for service in SERVICES:
