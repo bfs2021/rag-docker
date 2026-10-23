@@ -837,9 +837,11 @@ search with the end-user prompt; the reformulation, end-user and engineer prompt
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
 from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
-(an array, a number, a string, a boolean) or has a field of the wrong type gives the
-defaults with `is_default: true` and a warning, while coercible and out-of-range values are
-still served as saved (#439). `GET /metrics/latency` is
+(an array, a number, a string, a boolean) or has a field of the wrong type (also a fractional
+or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
+and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
+and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
+finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
