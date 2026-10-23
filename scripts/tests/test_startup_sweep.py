@@ -230,6 +230,36 @@ asyncio.run(run())
                       ".build-k2 (2 MB), .ragpkg-docs-1.tar.gz.partial (1 MB)", result.stderr)
         self.assertIn("ingest-k1 (1 MB)", result.stderr)
 
+    def test_a_failing_export_sweep_is_logged_and_startup_carries_on(self):
+        write(self.uploads / "ingest-k3" / "upload.txt", size=MB)
+        build = write(self.exports / ".build-k4" / "f.txt", size=MB)
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', side_effect=OSError('exports unreadable')), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+asyncio.run(run())
+"""
+        env = {**os.environ, "UPLOAD_DIR": str(self.uploads), "EXPORTS_DIR": str(self.exports),
+               "SOURCES_DIR": str(self.base / "sources")}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True,
+                                text=True, timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SERVING", result.stdout)
+        self.assertIn("Startup sweep of interrupted exports failed", result.stderr)
+        self.assertIn("exports unreadable", result.stderr)
+        # The work-directory sweep is independent of the export sweep.
+        self.assertFalse((self.uploads / "ingest-k3").exists())
+        self.assertTrue(build.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

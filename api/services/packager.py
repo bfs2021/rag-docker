@@ -265,9 +265,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -321,6 +321,21 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"Baked-in defaults for this package: collection `{collection}`, mode "
             f"`{cfg['retrieval_mode']}`, top-k {cfg['top_k']}, alpha {cfg['alpha']}, "
             f"answer style `{cfg['response_format']}`.")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+    """Archive the staged package as `<stem>/`, with manifest.json first (#383).
+
+    The directory entry, then the manifest, then everything else in the sorted
+    order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
+    at the manifest instead of decompressing chunks.jsonl to reach it.
+    """
+    with tarfile.open(dest, "w:gz") as tar:
+        tar.add(stage, arcname=stem, recursive=False)
+        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+        for entry in sorted(os.listdir(stage)):
+            if entry != "manifest.json":
+                tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
 def build(
@@ -526,8 +541,7 @@ def build(
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(stage, arcname=stem)
+        _write_archive(stage, stem, tmp_archive)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -561,16 +575,67 @@ class PackageError(Exception):
         self.detail = detail
 
 
+# The listing reads only the manifest (#383). It holds one `files` entry per file
+# in the package, so 16 MiB is far more than any real package needs; a larger
+# manifest is refused unread and the package is listed as unreadable.
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _is_top_manifest(name: str) -> bool:
+    """True for `<top-level directory>/manifest.json`, not one deeper down."""
+    parts = PurePosixPath(name).parts
+    return len(parts) == 2 and parts[1] == "manifest.json"
+
+
 def read_manifest(archive: Path) -> dict:
-    """Read manifest.json out of a package without extracting the whole archive."""
+    """Read the top-level manifest.json out of a package, for the listing.
+
+    Members are read one at a time and nothing after the manifest is touched,
+    so a package is not decompressed in full (#383). New packages put the
+    manifest first; in older ones chunks.jsonl comes before it and is read past.
+    Raises when the package has no readable manifest, or one larger than
+    MANIFEST_MAX_BYTES or not a JSON object.
+    """
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if Path(member.name).name == "manifest.json" and member.isfile():
-                fh = tar.extractfile(member)
-                if fh is None:
-                    break
-                return json.loads(fh.read().decode("utf-8"))
+        while (member := tar.next()) is not None:
+            if not (_is_top_manifest(member.name) and member.isfile()):
+                continue
+            if member.size > MANIFEST_MAX_BYTES:
+                raise ValueError(f"manifest.json is {member.size} bytes, over the "
+                                 f"{MANIFEST_MAX_BYTES}-byte limit")
+            fh = tar.extractfile(member)
+            if fh is None:
+                break
+            manifest = json.loads(fh.read(member.size).decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            return manifest
     raise ValueError("no manifest.json in package")
+
+
+def listing_fields(manifest: dict) -> dict:
+    """The four values the listing shows, from a manifest read_manifest returned.
+
+    An absent or null value is listed as None. A value of the wrong JSON type
+    (spec §4.4) raises instead of being coerced, so the package is listed as
+    unreadable rather than the whole listing failing (#451).
+    """
+    collection = manifest.get("collection")
+    if collection is None:
+        collection = {}
+    elif not isinstance(collection, dict):
+        raise ValueError("manifest collection is not a JSON object")
+    fields = {"collection": collection.get("name"),
+              "chunk_count": collection.get("chunk_count"),
+              "fidelity": manifest.get("fidelity"),
+              "created_at": manifest.get("created_at")}
+    for key in ("collection", "fidelity", "created_at"):
+        if fields[key] is not None and not isinstance(fields[key], str):
+            raise ValueError(f"manifest {key} is not a string")
+    count = fields["chunk_count"]
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+        raise ValueError("manifest chunk_count is not an integer")
+    return fields
 
 
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:

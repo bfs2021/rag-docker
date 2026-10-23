@@ -11,6 +11,7 @@ import logging
 from fastapi import APIRouter
 
 from models.schemas import (
+    CollectionName,
     ReembedRequest,
     ReindexRequest,
     RechunkRequest,
@@ -104,7 +105,7 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: str):
+async def tune_options(collection: CollectionName):
     """What this collection can be tuned with, given its fidelity."""
     try:
         exists = await wc.collection_exists(collection)
