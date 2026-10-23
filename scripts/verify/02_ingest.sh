@@ -615,6 +615,10 @@ check "delete-while-busy: job kinds, request orderings and the job's report" $?
 check "ingest jobs count submitted, accepted and stored chunks apart" $?
 python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
 check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+# One spelling for per-collection state (#372): every route takes a collection
+# name as Weaviate stores it, so a lowercase first letter keys nothing apart.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_spelling.py)
+check "routes key per-collection state by the stored collection name (#372)" $?
 
 # DELETE needs ?confirm=true, checked before the collection is looked up (#302).
 CC="${PREFIX}Confirm"

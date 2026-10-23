@@ -33,6 +33,9 @@ check "test_batch_recovery_fixture.py registered regression checks" $?
 check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
 (cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
 check "real embedding model exported, installed and refused when mismatched" $?
+# The package listing reads each manifest without decompressing the package (#383).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
+check "the package listing reads only up to each manifest (#383)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -1153,6 +1156,57 @@ ENDPY
   fi
   drop_collection "$XR"
 fi
+
+# ── one spelling for per-collection state (#372) ─────────────────────────────
+# Weaviate stores a collection with its first letter capitalised. Everything
+# below is sent under the lowercase-first spelling; the registry, the retained
+# originals, the package and the metrics must all land under the stored name.
+SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
+SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+drop_collection "$SC"
+api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
+check_eq "#372: creating '$SL' answers the stored name" \
+  "$(jfield "['name']" < /tmp/vfy_sp_create.json)" "$SC"
+check "#372: the list gives '$SC' its created_at" "$(api_get "/collections" | python3 -c "
+import json,sys
+c=[c for c in json.load(sys.stdin)['collections'] if c['name']=='$SC']
+print(0 if c and c[0]['created_at'] else 1)")"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SL" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_sp_up.json
+check_eq "#372: an upload to '$SL' answers the stored name" \
+  "$(jfield "['collection']" < /tmp/vfy_sp_up.json)" "$SC"
+check_eq "#372: the upload completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_sp_up.json)" 900)" "completed"
+# Read back under the stored name: an upload under the typed spelling used to
+# file its originals where the stored name never looked.
+api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
+check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
+api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
+check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
+api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
+check_eq "#372: the export of '$SC' carries the originals uploaded as '$SL'" \
+  "$(jfield "['fidelity']" < /tmp/vfy_sp_expjob.json)" "with-sources"
+sppkg=$(jfield "['filename']" < /tmp/vfy_sp_expjob.json)
+api_post "/tune/rechunk" "{\"collection\":\"$SL\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_sp_tj.json
+check_eq "#372: a re-chunk of '$SL' completes" \
+  "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_sp_tj.json)" 1800)" "completed"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#372: a query's metrics under both spellings" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  # The body goes through a variable: inside "$(...)" its braces would be
+  # brace-expanded into three requests.
+  spq="{\"question\":\"who approves overtime?\",\"collection\":\"$SL\",\"top_k\":3}"
+  spcode=$(api_post_code "/query" "$spq")
+  check_eq "#372: a query on '$SL' answers" "$spcode" "200"
+  spl=$(api_get "/metrics/latency?collection=$SL&history_limit=0" | jfield "['total_records']")
+  spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
+  check "#372: the metrics filter finds the query under both spellings" \
+    "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+fi
+[ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
+drop_collection "$SC"
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
