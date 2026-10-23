@@ -6026,6 +6026,20 @@ class _Builder:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
 
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
     """Expand `@@INCLUDE:name@@` from templates/partials/<name>.md.
@@ -6263,20 +6277,27 @@ def build(
         # 5b. bundled models, resolved through each model's manifest
         bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # A model shared by embedding and the LLM is copied once, so removing
+            # a failed copy can never remove a copy that succeeded.
+            wanted = list(dict.fromkeys([settings.embed_model, settings.llm_model]))
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
                 for model in wanted:
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        bundled.append(model.split(":")[0])
+                        bundled.append(model_bundle.model_ref(model))
         models_bundled = bool(bundled)
 
         if unresolved:
@@ -7237,7 +7258,13 @@ ON_CONFLICT = ("abort", "rename", "replace")
 
 # Job records survive an API restart (#23); see jobstore.py.
 _jobs = jobstore.JobStore("import")
+# Package names being imported: the file the worker opens, whatever the path
+# spelling sent (#391).
 _active: set[str] = set()
+# Target collections claimed by an import job, canonical name -> job id. A second
+# import into the same target is refused whatever its conflict mode, so two
+# imports never build, mark or clean up one collection at once (#391).
+_targets: dict[str, str] = {}
 _lock = threading.Lock()
 
 # Weaviate capitalises the first character of a collection name and rejects
@@ -7444,6 +7471,38 @@ def canonical(name: str) -> str:
     return name[:1].upper() + name[1:] if name else name
 
 
+def _package_key(filename: str) -> str:
+    """The package the worker opens, so every spelling of one file is one key."""
+    return Path(filename).name
+
+
+def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
+    """Claim `target` for this import, or refuse while another import holds it.
+
+    `instead_of`, a name this job claimed earlier, is released in the same step:
+    a `rename` no longer writes the name it moved away from.
+    """
+    name = canonical(target)
+    with _lock:
+        owner = _targets.get(name)
+        if owner is not None and owner != job_id:
+            raise PackageError(
+                "IMPORT_IN_PROGRESS",
+                f"Another import into '{name}' is running. Start this import again "
+                "once it finishes.",
+                {"collection": name})
+        if instead_of is not None and _targets.get(canonical(instead_of)) == job_id:
+            del _targets[canonical(instead_of)]
+        _targets[name] = job_id
+    return name
+
+
+def _release_targets(job_id: str) -> None:
+    with _lock:
+        for name in [name for name, owner in _targets.items() if owner == job_id]:
+            del _targets[name]
+
+
 def _safe_file(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
@@ -7557,7 +7616,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
     embed_model = settings.embed_model
     llm_model = settings.llm_model
-    bundled = model_bundle.bundled_models(pkg)
+    # `name:tag`; a folder counts only for the tag it holds (#487).
+    bundled = model_bundle.bundled_models(pkg, manifest)
 
     for model, required in ((embed_model, True), (llm_model, False)):
         if not model_bundle.supports_name(model):
@@ -7610,7 +7670,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {name}`, then import again.",
                 {"model": name})
-        if name not in bundled:
+        if model_bundle.model_ref(model) not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -7625,7 +7685,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
-            model_bundle.install_model(pkg, model)
+            model_bundle.install_model(pkg, model, manifest)
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
@@ -7918,6 +7978,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
+        # One import per target, whatever its conflict mode, claimed before the
+        # existence check and held until the job ends (#391).
+        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
@@ -7934,7 +7997,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     {"collection": target})
 
             if exists and on_conflict == "rename":
-                target = _rename_target(original, id8)
+                target = _claim_target(job_id, _rename_target(original, id8), instead_of=target)
 
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
@@ -8026,15 +8089,17 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         shutil.rmtree(work, ignore_errors=True)
         collection_writes.end_job("import", job_id)
         with _lock:
-            _active.discard(filename)
+            _active.discard(_package_key(filename))
+        _release_targets(job_id)
 
 
 async def start_import_job(filename: str, on_conflict: str) -> str:
     job_id = str(uuid.uuid4())[:8]
+    key = _package_key(filename)
     with _lock:
-        if filename in _active:
+        if key in _active:
             raise RuntimeError(filename)
-        _active.add(filename)
+        _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -8057,7 +8122,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         })
     except BaseException:
         with _lock:
-            _active.discard(filename)
+            _active.discard(key)
         raise
     asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
     return job_id
@@ -8077,6 +8142,11 @@ The manifest names every blob the model needs, so bundling resolves blobs
 *through the manifest* rather than copying the blob store. The store here holds
 2.3 GB across 9 blobs for two models; a naive copy would sweep up unrelated
 weights, and on a machine with other models pulled it would be far worse.
+
+In a package each model gets its own folder, `models/<name>/<tag>/`, so two
+tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+files. Packages built before #487 used `models/<name>/`; such a folder is used
+only for the one tag the package manifest gives that name.
 
 Copying the files verbatim is deliberate. Offline there is no registry to pull
 from, and rebuilding a model through Ollama's HTTP API would mean reconstructing
@@ -8116,6 +8186,12 @@ def split_ref(model: str) -> tuple[str, str]:
     if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
         raise ValueError("Model name and tag must be simple path components")
     return name, tag
+
+
+def model_ref(model: str) -> str:
+    """'phi3.5' -> 'phi3.5:latest': the name and tag a package folder holds."""
+    name, tag = split_ref(model)
+    return f"{name}:{tag}"
 
 
 def manifest_path(model: str) -> Path:
@@ -8223,9 +8299,10 @@ def is_installed(model: str) -> bool:
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
-    """Files to place under `models/<model>/`, as (relative path, source).
+    """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
-    Returns them rather than copying so the caller can digest each file into the
+    Each tag has its own folder, so two tags of one name never overwrite each
+    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
     package manifest as it is written.
     """
     mp = manifest_path(model)
@@ -8233,22 +8310,66 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
         raise FileNotFoundError(f"Ollama has no manifest for '{model}' at {mp}")
     manifest = json.loads(mp.read_text())
 
-    name, _ = split_ref(model)
-    files: list[tuple[str, Path]] = [(f"models/{name}/manifest.json", mp)]
+    name, tag = split_ref(model)
+    files: list[tuple[str, Path]] = [(f"models/{name}/{tag}/manifest.json", mp)]
     for digest in _digests(manifest):
         blob = blob_path(digest)
         if not blob.is_file():
             raise FileNotFoundError(
                 f"Model '{model}' references blob {digest} which is not in the store")
-        files.append((f"models/{name}/blobs/{digest.replace(':', '-')}", blob))
+        files.append((f"models/{name}/{tag}/blobs/{digest.replace(':', '-')}", blob))
     return files
 
 
-def bundled_models(pkg: Path) -> list[str]:
+def _legacy_tag(name: str, package_manifest) -> str | None:
+    """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
+
+    Those packages didn't record it. The package manifest names the embedding
+    model and the LLM; when exactly one tag of `name` is among them, the folder
+    holds that tag. Two tags of one name shared the folder, the last copy
+    overwriting the first's manifest, so the folder can't be trusted for either.
+    """
+    if not isinstance(package_manifest, dict):
+        return None
+    tags = set()
+    for section in ("embedding", "llm"):
+        entry = package_manifest.get(section)
+        model = entry.get("model") if isinstance(entry, dict) else None
+        if isinstance(model, str) and supports_name(model):
+            model_name, tag = split_ref(model)
+            if model_name == name:
+                tags.add(tag)
+    return tags.pop() if len(tags) == 1 else None
+
+
+def bundled_source(pkg: Path, model: str, package_manifest=None) -> Path | None:
+    """The package folder holding exactly this name and tag, or None."""
+    name, tag = split_ref(model)
+    folder = _contained(pkg, "models", name, tag)
+    if _contained(folder, "manifest.json").is_file():
+        return folder
+    legacy = _contained(pkg, "models", name)
+    if _contained(legacy, "manifest.json").is_file() and _legacy_tag(name, package_manifest) == tag:
+        return legacy
+    return None
+
+
+def bundled_models(pkg: Path, package_manifest=None) -> list[str]:
+    """`name:tag` of each model the package bundles, by the rules of `bundled_source`."""
     d = pkg / "models"
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
+    refs = set()
+    for folder in d.iterdir():
+        if not folder.is_dir():
+            continue
+        if (folder / "manifest.json").is_file():
+            tag = _legacy_tag(folder.name, package_manifest)
+            if tag is not None:
+                refs.add(f"{folder.name}:{tag}")
+        refs.update(f"{folder.name}:{sub.name}" for sub in folder.iterdir()
+                    if sub.is_dir() and (sub / "manifest.json").is_file())
+    return sorted(refs)
 
 
 def _publish(path: Path, write, *, replace: bool = True) -> None:
@@ -8277,19 +8398,20 @@ def _publish(path: Path, write, *, replace: bool = True) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def install_model(pkg: Path, model: str) -> None:
+def install_model(pkg: Path, model: str, package_manifest=None) -> None:
     """Verify all referenced bytes before publishing the captured manifest.
 
     Existing content is checked and reused unchanged. A corrupt existing blob
     is refused rather than replacing shared content behind other model names.
     An interrupted install can leave valid unreferenced blobs, never a newly
-    published manifest whose bytes were not checked.
+    published manifest whose bytes were not checked. Only a folder holding this
+    exact name and tag is installed (#487); `package_manifest` tells which tag
+    a pre-#487 folder holds.
     """
-    name, _ = split_ref(model)
-    src = _contained(pkg, "models", name)
-    src_manifest = _contained(src, "manifest.json")
-    if not src_manifest.is_file():
+    src = bundled_source(pkg, model, package_manifest)
+    if src is None:
         raise FileNotFoundError(f"Package does not bundle '{model}'")
+    src_manifest = _contained(src, "manifest.json")
     manifest_bytes = src_manifest.read_bytes()
     digests = _digests(json.loads(manifest_bytes))
     destination = manifest_path(model)
@@ -10060,6 +10182,11 @@ def _metrics_path() -> Path:
     return _METRICS_FILE
 
 
+def _metrics_file_name() -> Path:
+    """The metrics file's path for log messages, known even when creating its folder failed."""
+    return _METRICS_FILE or Path(settings.upload_dir) / "metrics.jsonl"
+
+
 def _read_tail(path: Path) -> tuple[list[str], bool]:
     """The last MAX_RECORDS valid lines of `path`, read from at most its last
     _TAIL_BYTES, and whether they are all the file holds."""
@@ -10121,7 +10248,7 @@ def load_from_disk() -> None:
                 return
             lines, whole = _read_tail(p)
         except Exception:                                 # noqa: BLE001
-            _log.exception("Could not load the query metrics from %s", _METRICS_FILE)
+            _log.exception("Could not load the query metrics from %s", _metrics_file_name())
             return
         for line in lines:
             _ring.append(json.loads(line))
@@ -10176,7 +10303,8 @@ async def record(
         await asyncio.to_thread(_append_sync, json.dumps(entry))
     except Exception:                                     # noqa: BLE001
         _log.warning("Could not write the query metrics record for %r to %s; "
-                     "the answer is still returned", collection, _METRICS_FILE, exc_info=True)
+                     "the answer is still returned", collection, _metrics_file_name(),
+                     exc_info=True)
 
 
 def _percentile(data: list[float], p: int) -> float:
@@ -13650,8 +13778,8 @@ with tempfile.TemporaryDirectory(prefix='model-integrity-', dir=settings.upload_
         models.install_model(pkg, model)
         assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
         print('PASS already-present real blobs reused unchanged', flush=True)
-        name, _ = models.split_ref(model)
-        damaged = pkg / 'models' / name / 'blobs' / digests[-1].replace(':', '-')
+        name, tag = models.split_ref(model)
+        damaged = pkg / 'models' / name / tag / 'blobs' / digests[-1].replace(':', '-')
         damaged.write_bytes(b'ordinary mismatched review bytes')
         try:
             models.install_model(pkg, model)
@@ -13784,7 +13912,7 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `03_query.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
 nothing. The first-start check in `16_api_paths.sh` removes the project's
 volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
@@ -13822,7 +13950,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the seven controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13924,6 +14052,20 @@ no promise of re-embedding; a same-name package of another width is refused too.
 It also checks that a model installed from a package is confirmed through Ollama's
 model list: reported, not reported, and Ollama unreachable. Only Ollama is
 replaced. `05_transfer.sh` runs it in the verify project's API container.
+
+`scripts/tests/test_import_guard.py` (#391) runs concurrent import jobs with
+Weaviate mocked: two spellings of one package file (`./x.tar.gz`, `a/../x.tar.gz`)
+answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
+building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
+`on_conflict`, never builds, and leaves the first job's in-progress marker in place;
+imports into different targets run side by side; a `rename` claims its new name and
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -14158,9 +14300,11 @@ note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields ans
 `SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
-refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
-(on the verify project, with the exports from `stack.sh up`, as above):
+refused before backend, model or staging work, with every backend mocked.
+`07_settings.sh` runs it in the API image with the repository mounted read-only
+and no network (#386). Its embedded-source check reads `IMPLEMENTATION.md`, so
+to run it by hand mount the whole repository (on the verify project, with the
+exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -14245,7 +14389,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
-| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
@@ -14276,6 +14420,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
+| `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
+| `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
+| `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -14286,7 +14435,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
-| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
 | `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
@@ -14309,7 +14458,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -14342,8 +14491,11 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On the verify project (`bash scripts/verify/stack.sh up`, then paste the
-`export` lines it prints), whose model copy holds the embedding model, run:
+`05_transfer.sh` runs `model_integrity.py` in the verify project's API
+container, and `test_model_bundle.py` in the API image with the repository
+mounted (#386). To run them by hand, on the verify project
+(`bash scripts/verify/stack.sh up`, then paste the `export` lines it prints),
+whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
@@ -14622,14 +14774,20 @@ Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
 It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
 app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
-record can't be written (an unusable file, a full volume), with the failure logged; that a
-line left unfinished by a failed write doesn't cost the next record; that `metrics.jsonl`
-never holds more than 1,000 lines and keeps the newest records; that a compaction whose
-temporary write or replace fails leaves the old file whole and no temporary file, and is
-tried again; that 1,100 concurrent records all land; and that a restart restores the last 500
-records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
-files a crash left, and starts when the file can't be read or compacted. It also checks the
-`IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+record can't be written (an unusable file, a full volume, an `UPLOAD_DIR` that can't be
+created), with the failure logged naming the metrics file and the record still counted by
+`GET /metrics/latency`; that a line left unfinished by a failed write doesn't cost the next
+record; that an append bringing `metrics.jsonl` to 1,000 lines compacts it and the newest
+records are kept; that a compaction whose temporary write or replace fails leaves the old file
+whole and no temporary file, and is tried again; that 1,100 concurrent records all land; and
+that a restart restores the last 500 records, loads a file within the bound without rewriting
+it, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, loads nothing from a
+last 1 MiB with no line break, removes temporary files a crash left, and starts when the file
+can't be read or compacted or `UPLOAD_DIR` can't be created. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`. With `RAG_ALLOW_RESTART=1`, suite 03
+also restarts the API after its LLM queries and checks that `GET /metrics/latency` reports
+the same records afterwards (#374); a `RAG_SKIP_SLOW=1` run has no queries to reload and
+doesn't reach it.
 
 Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
 `scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
@@ -16269,6 +16427,8 @@ check "OTel embedded implementation stays synchronized" $?
 # Both distribution scripts in a scratch git repository, docker stubbed (#384).
 python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
 check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
@@ -17176,6 +17336,13 @@ import json; d=json.load(open('/tmp/vfy_job.json')); import sys
 sys.exit(0 if d['chunks_stored'] == 1 else 1)"
 check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
 
+# Chunker limits and insert batching (#386), with the backends mocked, in an
+# isolated container with the repository mounted.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_chunk_limits.py)
+check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
+check "chunk inserts are batched and retried while the index isn't ready" $?
+
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
@@ -17698,6 +17865,9 @@ cd "$(dirname "$0")" && . ./lib.sh
 proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
+section "Collection list rows and retrieval-mode dispatch, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_retrieval_controls.py)
+check "test_retrieval_controls.py registered regression checks" $?
 section "Physical index and effective query controls"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
 check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
@@ -17916,6 +18086,30 @@ done
 [ "$eu_total" -lt "$en_total" ]
 check "end_user answers are shorter than engineer on average" $? \
   "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
+
+# ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
+# The queries above wrote metrics records; a restart goes through the
+# lifespan's load_from_disk, so GET /metrics/latency must report the same records.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "query metrics reload after an API restart (#374)" 1 "$restart_refusal"
+  else
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_before.json
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_after.json
+    python3 -c "
+import json,sys
+b=json.load(open('/tmp/vfy_metrics_before.json')); a=json.load(open('/tmp/vfy_metrics_after.json'))
+sys.exit(0 if b['total_records'] > 0 and a['history'] == b['history'] else 1)"
+    check "query metrics reload after an API restart (#374)" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "query metrics reload after an API restart (#374)" "set RAG_ALLOW_RESTART=1 to include it"
+fi
 
 drop_collection "$C"
 cleanup_prefixed
@@ -18592,10 +18786,18 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
 check "E12 embedding mismatch and post-install Ollama check regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_guard.py)
+check "concurrent imports of one package or one target refused (#391)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# Bundled models (#386): install safety, E21 and E22 with a temporary store,
+# then the real pulled embedding model copied through a temporary package.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_model_bundle.py)
+check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
+check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
@@ -22454,7 +22656,7 @@ Dockerfile
 
 ### package.sh
 
-Source-only archive (~150 KB). The target machine rebuilds the images and
+Source-only archive (~1.3 MB). The target machine rebuilds the images and
 re-downloads the models, so it needs internet.
 
 ```bash
@@ -22530,7 +22732,7 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #
 #   bash package-offline.sh [output.tar]
 #
-# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
 #   * the source tree: the files git tracks in the current commit (HEAD),
@@ -22695,6 +22897,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ('package.sh', 'package-offline.sh')
@@ -22702,6 +22905,9 @@ REFUSAL = 'not the top level of a git checkout'
 COMMITTED_README = 'Scratch project.\n'
 GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
        '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+# The scratch repository and both scripts read no system or global (or XDG) git
+# config, so a user's core.hooksPath or attributes can't change the result (#447).
+GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 
 # Answers what package-offline.sh asks of docker, and logs each call.
 STUB_DOCKER = r'''#!/usr/bin/env bash
@@ -22739,6 +22945,7 @@ class PackageArchiveTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.tmp = Path(temp.name).resolve()
+        self.git_env = dict(os.environ, **GIT_ISOLATION)
         self.repo = self.tmp / 'project'
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
@@ -22762,11 +22969,11 @@ class PackageArchiveTests(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         write(bin_dir / 'docker', STUB_DOCKER, 0o755)
         self.log = self.tmp / 'docker.log'
-        self.env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
-                        STUB_DOCKER_LOG=str(self.log), GIT_CONFIG_NOSYSTEM='1')
+        self.env = dict(self.git_env, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log))
 
     def git(self, *args, cwd=None):
-        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, check=True,
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, env=self.git_env, check=True,
                               capture_output=True, text=True).stdout
 
     def run_script(self, directory, script, out):
@@ -22775,6 +22982,20 @@ class PackageArchiveTests(unittest.TestCase):
 
     def assert_ran(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def expected_bundle(self):
+        return ({'rag-docker/' + name for name in self.tracked}
+                | {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'})
+
+    def assert_archives_hold_the_tracked_files(self, directory):
+        zip_out, bundle_out = self.tmp / 'check.zip', self.tmp / 'check.tar'
+        self.assert_ran(self.run_script(directory, 'package.sh', zip_out))
+        self.assert_ran(self.run_script(directory, 'package-offline.sh', bundle_out))
+        with zipfile.ZipFile(zip_out) as archive:
+            self.assertEqual({i.filename for i in archive.infolist() if not i.filename.endswith('/')},
+                             self.tracked)
+        with tarfile.open(bundle_out) as archive:
+            self.assertEqual({m.name for m in archive.getmembers() if m.isfile()}, self.expected_bundle())
 
     def test_zip_holds_exactly_the_tracked_files(self):
         out = self.tmp / 'out.zip'
@@ -22815,6 +23036,27 @@ class PackageArchiveTests(unittest.TestCase):
                     self.assertFalse(out.exists())
         calls = self.log.read_text() if self.log.exists() else ''
         self.assertEqual(calls, '', 'docker was called before the refusal')
+
+    def test_runs_in_a_checkout_reached_through_a_symlink(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.repo, target_is_directory=True)
+        self.assert_archives_hold_the_tracked_files(link)
+
+    def test_ignores_the_users_git_config(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        hostile = Path(temp.name).resolve()
+        marker = hostile / 'hook-ran'
+        write(hostile / 'hooks' / 'pre-commit', f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', 0o755)
+        write(hostile / 'attributes', 'README.md export-ignore\n')
+        write(hostile / 'gitconfig', f'[core]\n\thooksPath = {hostile / "hooks"}\n'
+                                     f'\tattributesFile = {hostile / "attributes"}\n')
+        with mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(hostile / 'gitconfig')):
+            # A fresh scratch repository, built while the caller's global config is hostile.
+            self.setUp()
+            self.assert_archives_hold_the_tracked_files(self.repo)
+        self.assertIn('README.md', self.tracked)
+        self.assertFalse(marker.exists(), 'the global pre-commit hook ran')
 
 
 class EmbeddedCopyTests(unittest.TestCase):
@@ -23644,6 +23886,9 @@ section "Concurrent settings publication and failed-write preservation"
 check "controlled retrieval/ingest concurrency and publication failures" $?
 (cd ../.. && python3 scripts/tests/test_settings_implementation.py)
 check "settings embedded implementation copies match runtime" $?
+section "Settings refused before work, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_settings_validation.py)
+check "test_settings_validation.py registered regression checks" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -26176,8 +26421,10 @@ if __name__ == "__main__":
 ```python
 """Controlled package preflight and generated-script trust-boundary regressions."""
 import ast
+import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -26189,7 +26436,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from models.schemas import SaveRetrievalConfigBody
-from services import importer, packager, retrieval_config
+from services import importer, model_bundle, packager, retrieval_config
 
 
 INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
@@ -26460,37 +26707,110 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
 
-    def build_with_models(self, failing):
-        """Export with both models requested; models named in `failing` cannot bundle."""
+    def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
+                          store_available=True, broken_copy=(), fail_mid_write=()):
+        """Export with both models requested; models named in `failing` cannot bundle.
+
+        Models named in `broken_copy` resolve, but their second file's copy fails.
+        Models named in `fail_mid_write` resolve, but their second file's copy
+        fails after writing part of it. `self.exported` records each resolution."""
         blob = self.root / 'model-blob'
         blob.write_text('inert model bytes')
+        torn = self.root / 'torn-blob'
+        torn.write_text('bytes that never finish copying')
+        self.exported = []
+        copyfile = packager.shutil.copyfile
 
         def export_model(model, stage):
+            self.exported.append(model)
             if model in failing:
                 raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
-            return [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+            folder = 'models/' + '/'.join(model_bundle.split_ref(model))
+            files = [(f"{folder}/manifest.json", blob)]
+            if model in broken_copy:
+                files.append((f"{folder}/blobs/sha256-gone",
+                              self.root / 'missing-blob'))
+            if model in fail_mid_write:
+                files.append((f"{folder}/blobs/sha256-torn", torn))
+            return files
+
+        def copy_or_tear(source, target):
+            if Path(source) == torn:
+                Path(target).write_text('bytes that')
+                raise OSError(28, 'No space left on device')
+            return copyfile(source, target)
 
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
-            mocks.enter_context(patch.object(settings, 'llm_model', 'chat:v2'))
+            mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
             mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
             mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
             mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
-            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=True))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=store_available))
             mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
-            result = packager.build('Corpus', include_models=True)
+            mocks.enter_context(patch.object(packager.shutil, 'copyfile', side_effect=copy_or_tear))
+            result = packager.build('Corpus', include_models=include_models)
         with tarfile.open(self.exports / result['filename']) as archive:
             member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
                           and m.name.count('/') == 1)
             manifest = json.load(archive.extractfile(member))
         return result, manifest
 
+    def extracted(self, result):
+        """The package as import reads it: `open_package` into a fresh directory."""
+        dest = Path(tempfile.mkdtemp(dir=self.root))
+        return packager.open_package(self.exports / result['filename'], dest)
+
+    def test_a_failed_model_copy_leaves_no_part_of_that_model(self):
+        for broken in ({'broken_copy': {'chat:v2'}}, {'fail_mid_write': {'chat:v2'}}):
+            with self.subTest(**broken):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), **broken)
+                pkg, _ = self.extracted(result)
+                self.assertFalse((pkg / 'models' / 'chat').exists())
+                self.assertFalse(any(k.startswith('models/chat/') for k in manifest['files']))
+                self.assertIn('models/embed/v1/manifest.json', manifest['files'])
+                self.assertTrue((pkg / 'models' / 'embed' / 'v1' / 'manifest.json').is_file())
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed:v1'])
+                self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                                    for w in manifest['warnings']))
+
+    def test_a_model_shared_by_embedding_and_llm_is_copied_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(self.exported, ['embed:v1'])
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+
+    def test_manifest_lists_no_models_when_none_were_requested_or_the_store_is_missing(self):
+        for include, store in [(False, True), (True, False)]:
+            with self.subTest(include_models=include, store_available=store):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), include_models=include,
+                                                          store_available=store)
+                self.assertEqual(manifest['bundled_models'], [])
+                self.assertIs(manifest['models_bundled'], False)
+                self.assertIs(result['models_bundled'], False)
+                self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+
+    def test_manifest_lists_a_model_shared_by_embedding_and_llm_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+        self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
+        result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+        self.assertIs(manifest['models_bundled'], True)
+        self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                            for w in manifest['warnings']))
+
     def test_manifest_lists_only_models_actually_bundled(self):
-        for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
-                                  (set(), ['chat', 'embed']), ({'embed:v1', 'chat:v2'}, [])]:
+        for failing, expected in [({'chat:v2'}, ['embed:v1']), ({'embed:v1'}, ['chat:v2']),
+                                  (set(), ['chat:v2', 'embed:v1']), ({'embed:v1', 'chat:v2'}, [])]:
             with self.subTest(failing=sorted(failing)):
                 for leftover in self.exports.iterdir():
                     leftover.unlink()
@@ -26498,9 +26818,10 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(manifest['bundled_models'], expected)
                 self.assertEqual(manifest['models_bundled'], bool(expected))
                 self.assertEqual(result['models_bundled'], bool(expected))
-                for name in ('embed', 'chat'):
-                    self.assertEqual(f'models/{name}/manifest.json' in manifest['files'],
-                                     name in expected)
+                for ref in ('embed:v1', 'chat:v2'):
+                    folder = ref.replace(':', '/')
+                    self.assertEqual(f'models/{folder}/manifest.json' in manifest['files'],
+                                     ref in expected)
                 for model in sorted(failing):
                     self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
                                         for w in manifest['warnings']))
@@ -26591,6 +26912,135 @@ class RetrievalImportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
 
+
+class ModelTagFolderTests(unittest.TestCase):
+    """Two tags of one model name, and a folder used only for its own tag (#487).
+
+    Uses the real model_bundle export and install against temporary Ollama
+    stores holding inert bytes; only Ollama's own listing is stubbed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.store = self.root / 'store'
+        self.target = self.root / 'target'
+        (self.target / 'models').mkdir(parents=True)
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.root / 'uploads'), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.object(importer, '_log'))
+        self.manifests = {model: self.put_model(model) for model in ('foo:a', 'foo:b', 'bar:x')}
+
+    def put_model(self, model):
+        """An Ollama manifest and blobs with bytes of this model's own."""
+        name, tag = model.split(':')
+        blobs = self.store / 'models' / 'blobs'
+        blobs.mkdir(parents=True, exist_ok=True)
+        digests = []
+        for part in ('config', 'weights'):
+            data = f'{part} of {model}'.encode()
+            digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+            (blobs / digest.replace(':', '-')).write_bytes(data)
+            digests.append(digest)
+        manifest = json.dumps({'config': {'digest': digests[0]},
+                               'layers': [{'digest': digests[1]}]}).encode()
+        path = self.store / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(manifest)
+        return manifest
+
+    def export(self, embed, llm):
+        with ExitStack() as mocks:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+                mocks.enter_context(patch.object(settings, key, str(value)))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            result = packager.build('Corpus', include_models=True)
+        return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
+
+    def ensure(self, pkg, manifest, embed, llm):
+        with patch.object(settings, 'ollama_models_dir', str(self.target)), \
+             patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(importer, '_ollama_reports', lambda model: True):
+            return importer._ensure_models(pkg, manifest)
+
+    def installed(self, model):
+        name, tag = model.split(':')
+        path = self.target / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        return path.read_bytes() if path.is_file() else None
+
+    def legacy_package(self, folder_model, manifest_models):
+        """A package in the pre-#487 layout: `models/<name>/` holding `folder_model`."""
+        pkg = self.root / 'legacy'
+        name, tag = folder_model.split(':')
+        source = json.loads(self.manifests[folder_model])
+        (pkg / 'models' / name / 'blobs').mkdir(parents=True)
+        (pkg / 'models' / name / 'manifest.json').write_bytes(self.manifests[folder_model])
+        for digest in [source['config']['digest']] + [layer['digest'] for layer in source['layers']]:
+            blob = self.store / 'models' / 'blobs' / digest.replace(':', '-')
+            (pkg / 'models' / name / 'blobs' / blob.name).write_bytes(blob.read_bytes())
+        embed, llm = manifest_models
+        return pkg, {'embedding': {'model': embed}, 'llm': {'model': llm}}
+
+    # Each test checks the import outcome first, so on develop it fails on the
+    # wrong install itself rather than on the new layout or signature.
+    def test_two_tags_of_one_name_are_bundled_apart_and_each_installed_as_itself(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])  # develop: foo:b's
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+        for model in ('foo:a', 'foo:b'):
+            folder = 'models/' + model.replace(':', '/')
+            self.assertIn(f'{folder}/manifest.json', manifest['files'])
+            self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_bundled_tag_is_never_installed_under_another_tag(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
+
+    def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
+        pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
+
+    def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
+        # The pre-#487 export wrote both tags into models/foo/, the LLM's last.
+        pkg, manifest = self.legacy_package('foo:b', ('foo:a', 'foo:b'))
+        with self.assertRaises(packager.PackageError) as caught:  # develop: installs foo:b as foo:a
+            self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertIsNone(self.installed('foo:a'))
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), [])
+
+    def test_an_old_package_folder_is_not_installed_under_another_tag(self):
+        pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
 
 if __name__ == '__main__':
     unittest.main()
@@ -29420,7 +29870,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session, safe_attributes
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
@@ -30138,7 +30588,7 @@ class TelemetryTests(unittest.TestCase):
         from contextlib import asynccontextmanager
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, Mock
-        api=Path(os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+        api=Path(os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
         tree=ast.parse((api/'main.py').read_text())
         function=next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name=='lifespan')
         namespace={'asynccontextmanager':asynccontextmanager,'FastAPI':object}

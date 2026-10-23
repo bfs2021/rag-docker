@@ -31,7 +31,7 @@ class BundleFixture(unittest.TestCase):
         self.patch = patch.object(settings, 'ollama_models_dir', str(self.store))
         self.patch.start()
         self.addCleanup(self.patch.stop)
-        self.src = self.pkg / 'models' / 'review-model'
+        self.src = self.pkg / 'models' / 'review-model' / 'latest'  # a folder per name and tag (#487)
         (self.src / 'blobs').mkdir(parents=True)
         self.contents = [b'ordinary config bytes', b'ordinary layer bytes']
         self.digests = ['sha256:' + hashlib.sha256(data).hexdigest() for data in self.contents]

@@ -1487,12 +1487,19 @@ could destroy a collection the caller did not mean to touch. It is one of
 
 **Response 202:** `{ "job_id": "...", "status": "queued", "filename": "..." }`
 
-**409 `IMPORT_IN_PROGRESS`** if the same file is already being imported.
+**409 `IMPORT_IN_PROGRESS`** if the same package file is already being imported:
+the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
+`a/../x.tar.gz` are one file (#391).
 
 Everything else — unreadable archive, bad digest, embedding mismatch, name
-collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2) — is reported
-through the job rather than this response, because none of it is knowable without
-reading the package.
+collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
+into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
+job rather than this response, because none of it is knowable without reading the
+package. One import runs per target collection, whatever its `on_conflict`: a second
+import into a collection another import is building fails with `error_code`
+`IMPORT_IN_PROGRESS` and `error_detail` `{"collection": "<target>"}`, and changes
+nothing. A `rename` that moves to a new name competes for that name, not the
+original (#391).
 
 ---
 
@@ -2263,7 +2270,7 @@ rag-docker/
 │   ├── ragclient.py            # HTTP client + error translation
 │   ├── paths.py                # Inbox path validation
 │   └── tools/                  # 15 tools across 5 modules
-├── package.sh                  # Source-only zip (~150 KB; target needs internet)
+├── package.sh                  # Source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh          # Self-contained bundle (~4.6 GB; no network needed)
 ├── install-offline.sh          # Installs from that bundle on an air-gapped Mac
 ├── proxy/
@@ -2614,8 +2621,9 @@ now lives once, in `api/services/ingest_config.py`.
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 - [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373). In `hybrid` and `semantic` modes, where Weaviate embeds the question through Ollama, a Weaviate failure names both Weaviate and Ollama (#411).
-- [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged; the file never holds more than 1,000 lines, is compacted atomically to its last 500 records, and those reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
       *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call (the synthesis in both response formats) and each retrieval mode's Weaviate call; it fails on the code before #373, and its hybrid and semantic wording on the code before #411.*
+- [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged. The file is bounded: an append that brings it to 1,000 lines, counted from the records loaded at startup, compacts it atomically to its last 500 records. A failed compaction leaves it longer until a later append's retry succeeds, and after a failed startup load it can pass 1,000 lines before its first compaction. The last 500 records reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
+      *`scripts/tests/test_metrics.py` (run by `03_query.sh` in the built API image with `--network none`) sends the failed writes through the app over HTTP and checks `GET /metrics/latency` still counts the record; it checks the bound, compaction failures and concurrent records, and the startup load of a whole file, a large legacy file, a tail without a line break and an unreadable file; it fails on the code before #374. With `RAG_ALLOW_RESTART=1`, `03_query.sh` restarts the API after its queries and checks `GET /metrics/latency` reports the same records.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
@@ -2857,6 +2865,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
 - [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
   *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373. Suite 01 also checks through the proxy on the running stack that an unknown route answers 404 `NOT_FOUND` and a wrong method `METHOD_NOT_ALLOWED` (#411).*
+- [x] `package.sh` and `package-offline.sh` archives hold exactly the files git tracks in the current commit (`HEAD`), with no untracked or ignored file and no uncommitted change, and both scripts refuse to run unless their directory is the top level of a git checkout (§11.2, #384).
+  *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
 
 ---
 
@@ -2890,7 +2900,7 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive | ~150 KB zip | ~4.6 GB tar |
+| Archive | ~1.3 MB zip | ~4.6 GB tar |
 | Contains | source only | source + all 5 images + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
