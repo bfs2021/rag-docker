@@ -2587,7 +2587,12 @@ now lives once, in `api/services/ingest_config.py`.
       its own. `test_reingest.py` covers a Finder-style ZIP (only the file queued, the
       AppleDouble member in `skipped`), a `._*` file beside its file, other `__MACOSX/`
       members whatever their suffix, look-alike names that are still queued, and a ZIP of
-      only metadata refused with `NO_SUPPORTED_FILES`. `02_ingest.sh` ingests a Finder-style
+      only metadata refused with `NO_SUPPORTED_FILES`. It also checks that these members
+      are still validated, a damaged one refusing the ZIP and their bytes counting toward
+      the expansion cap, that `./__MACOSX/._r.txt`, `x/../__MACOSX/notes.txt` and
+      `d/./._e.txt` are matched by their normalised names and listed under the archive's
+      spelling, and that a direct upload named `._notes.txt` is still ingested (#455).
+      `02_ingest.sh` ingests a Finder-style
       ZIP through the proxy: the job completes with no errors, stores only the file's
       chunks and lists the AppleDouble member in `skipped`.*
 - [x] Two ingest jobs that replace one logical name in one collection run one at a time: afterwards exactly one job's version is stored, whole (its full chunk set, its `chunks_replaced` equal to the other job's `chunks_stored`, one retained digest naming the name, the winner's); which job runs last is not promised (#22).
