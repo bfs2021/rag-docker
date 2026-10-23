@@ -1487,12 +1487,19 @@ could destroy a collection the caller did not mean to touch. It is one of
 
 **Response 202:** `{ "job_id": "...", "status": "queued", "filename": "..." }`
 
-**409 `IMPORT_IN_PROGRESS`** if the same file is already being imported.
+**409 `IMPORT_IN_PROGRESS`** if the same package file is already being imported:
+the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
+`a/../x.tar.gz` are one file (#391).
 
 Everything else — unreadable archive, bad digest, embedding mismatch, name
-collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2) — is reported
-through the job rather than this response, because none of it is knowable without
-reading the package.
+collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
+into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
+job rather than this response, because none of it is knowable without reading the
+package. One import runs per target collection, whatever its `on_conflict`: a second
+import into a collection another import is building fails with `error_code`
+`IMPORT_IN_PROGRESS` and `error_detail` `{"collection": "<target>"}`, and changes
+nothing. A `rename` that moves to a new name competes for that name, not the
+original (#391).
 
 ---
 
