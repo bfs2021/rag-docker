@@ -613,6 +613,31 @@ def read_manifest(archive: Path) -> dict:
     raise ValueError("no manifest.json in package")
 
 
+def listing_fields(manifest: dict) -> dict:
+    """The four values the listing shows, from a manifest read_manifest returned.
+
+    An absent or null value is listed as None. A value of the wrong JSON type
+    (spec §4.4) raises instead of being coerced, so the package is listed as
+    unreadable rather than the whole listing failing (#451).
+    """
+    collection = manifest.get("collection")
+    if collection is None:
+        collection = {}
+    elif not isinstance(collection, dict):
+        raise ValueError("manifest collection is not a JSON object")
+    fields = {"collection": collection.get("name"),
+              "chunk_count": collection.get("chunk_count"),
+              "fidelity": manifest.get("fidelity"),
+              "created_at": manifest.get("created_at")}
+    for key in ("collection", "fidelity", "created_at"):
+        if fields[key] is not None and not isinstance(fields[key], str):
+            raise ValueError(f"manifest {key} is not a string")
+    count = fields["chunk_count"]
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+        raise ValueError("manifest chunk_count is not an integer")
+    return fields
+
+
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """Extract, refusing any member that would land outside dest.
 

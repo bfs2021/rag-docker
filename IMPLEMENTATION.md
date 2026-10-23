@@ -6435,6 +6435,31 @@ def read_manifest(archive: Path) -> dict:
     raise ValueError("no manifest.json in package")
 
 
+def listing_fields(manifest: dict) -> dict:
+    """The four values the listing shows, from a manifest read_manifest returned.
+
+    An absent or null value is listed as None. A value of the wrong JSON type
+    (spec §4.4) raises instead of being coerced, so the package is listed as
+    unreadable rather than the whole listing failing (#451).
+    """
+    collection = manifest.get("collection")
+    if collection is None:
+        collection = {}
+    elif not isinstance(collection, dict):
+        raise ValueError("manifest collection is not a JSON object")
+    fields = {"collection": collection.get("name"),
+              "chunk_count": collection.get("chunk_count"),
+              "fidelity": manifest.get("fidelity"),
+              "created_at": manifest.get("created_at")}
+    for key in ("collection", "fidelity", "created_at"):
+        if fields[key] is not None and not isinstance(fields[key], str):
+            raise ValueError(f"manifest {key} is not a string")
+    count = fields["chunk_count"]
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+        raise ValueError("manifest chunk_count is not an integer")
+    return fields
+
+
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """Extract, refusing any member that would land outside dest.
 
@@ -9615,10 +9640,11 @@ def _list_packages_sync() -> list[dict]:
     out = []
     for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
         try:
-            manifest = packager.read_manifest(p)
+            fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:
-            # A file that is not a readable package still belongs in the listing;
-            # import will report precisely why it cannot be used.
+            # A file that is not a readable package, or whose manifest has a
+            # wrongly typed field (#451), still belongs in the listing; import
+            # will report precisely why it cannot be used.
             out.append({"filename": p.name, "size_bytes": p.stat().st_size,
                         "collection": None, "chunk_count": None,
                         "fidelity": None, "created_at": None, "readable": False})
@@ -9626,10 +9652,7 @@ def _list_packages_sync() -> list[dict]:
         out.append({
             "filename": p.name,
             "size_bytes": p.stat().st_size,
-            "collection": manifest.get("collection", {}).get("name"),
-            "chunk_count": manifest.get("collection", {}).get("chunk_count"),
-            "fidelity": manifest.get("fidelity"),
-            "created_at": manifest.get("created_at"),
+            **fields,
             "readable": True,
         })
     return out
@@ -14165,7 +14188,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
-| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`; run in the API image with no network, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |

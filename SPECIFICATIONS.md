@@ -1672,6 +1672,14 @@ past, which is slower but works. The manifest read is bounded at 16 MiB: a large
 manifest is not read and its package is listed `readable: false`, as is one whose
 manifest is missing, damaged, not UTF-8, not valid JSON or not a JSON object.
 
+The listed values are typed as in the manifest (`RAG_EXPORT_SPECIFICATIONS.md`
+§4.4): `collection` an object, its `name` a string and its `chunk_count` an
+integer, `fidelity` and `created_at` strings. A value that is absent or `null`
+(`collection` included) is listed as `null`. A value of any other JSON type is not
+coerced (`"12"`, `12.0` and `true` are not integers): the package is listed
+`readable: false` with null metadata, and the listing still answers 200 with the
+other packages (#451).
+
 The package format itself — filename convention, layout, manifest and
 `chunks.jsonl` — is specified in `RAG_EXPORT_SPECIFICATIONS.md` §4.
 
@@ -2823,6 +2831,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
 - [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first.*
+- [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).
+      *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): eight wrongly typed manifests are each listed `readable: false` beside a readable package, and `collection: null` and absent values list as `null`; both checks fail on the code before #451 (the listing answered 500).*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
