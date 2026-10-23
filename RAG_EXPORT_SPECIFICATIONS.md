@@ -83,8 +83,10 @@ filesystem path. If an indexed blob is missing on disk, export warns and omits
 that entry from the shipped index; the package remains importable with its
 available sources and chunks. Existing valid indexes keep their original fidelity.
 An invalid on-disk index makes tuning options return a typed 409
-`SOURCE_INDEX_INVALID`; re-embedding from stored chunks and re-indexing do not
-need to read retained sources. A failed retention write after chunk storage does
+`SOURCE_INDEX_INVALID`, and re-chunking (or re-embedding with chunking
+parameters) is refused with the same 409 before any job is created (#389);
+re-embedding from stored chunks and re-indexing do not need to read retained
+sources. A failed retention write after chunk storage does
 not misreport the ingested file as failed.
 
 Retained-source import restores only blobs named by the validated index. Unindexed
@@ -111,7 +113,9 @@ anywhere in the UI.
 Collections ingested before this change have no source directory. They are not
 reconstructed. Their exports are `chunks-only` (§4.3) and the UI MUST label them
 as such wherever export is offered, so the lower fidelity is visible before the
-user ships the package, not after.
+user ships the package, not after. When the UI cannot read a collection's fidelity
+(`GET /tune/{collection}` fails), it MUST say the fidelity is unknown and why,
+never hide the label.
 
 ### 2.5 Disk
 
@@ -144,7 +148,11 @@ carry the corpus's parameters.
 ### 3.2 Endpoints
 
 - `GET /retrieval/config/{collection}` → the saved config, or the defaults above
-  with `is_default: true`, matching how `/ingest/config/{collection}` behaves.
+  with `is_default: true`, matching how `/ingest/config/{collection}` behaves. A saved
+  file that can't be read, isn't JSON, isn't a JSON object or has a field of the wrong
+  type is logged and also answered with the defaults (#439); export still refuses it (§5).
+  A non-finite `alpha` counts as the wrong type, and a saved `is_default` key also gives
+  the defaults, though export ignores that key like any unknown one (#477).
 - `POST /retrieval/config` → upsert; collection in the **body**, not the path.
 
 The path shape deliberately mirrors ingest config, including the asymmetry that
@@ -202,6 +210,14 @@ ragpkg-.../
 └── models/                 present only when models are bundled
 ```
 
+In the archive, `manifest.json` comes right after the directory entry, before
+every other file, so a reader that wants only the manifest (the package listing)
+can stop there (#383). Readers MUST NOT rely on that order: packages built before
+#383 have `README.md`, `chunks.jsonl`, `collection.json`, `goldstandard/` and
+`ingest_config.json` before it.
+What the listing takes from the manifest, and when a wrongly typed value makes
+it list the package as unreadable, is in §4.4 (#451).
+
 Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
 ### 4.3 Fidelity
@@ -231,12 +247,23 @@ and on import.
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
+  "bundled_models": [],
   "files": {"chunks.jsonl": "sha256:...", "collection.json": "sha256:..."}
 }
 ```
 
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
+
+`bundled_models` lists each model the package carries whole, as `name:tag`
+(a name with no tag is `name:latest`), sorted; it is `[]` when none is, and
+`models_bundled` is true exactly when it isn't empty (§6.3, #425, #487).
+
+The package listing (`GET /packages`) shows `collection.name` and
+`collection.chunk_count`, `fidelity` and `created_at`, with the types above:
+`collection` an object, `chunk_count` an integer, the other three strings. A
+value that is absent or `null` is listed as `null`; any other type is not
+coerced, and the package is listed `readable: false` (#451).
 
 `files` covers every file except `manifest.json`, `README.md` and `retrieve.py`.
 
@@ -349,7 +376,13 @@ completion, the written filename.
 - When Weaviate can't be read to check whether the collection exists, the export
   fails with HTTP 503 `SERVICE_UNAVAILABLE` before any job is created; `detail` is
   `{"collection": "<name>"}`. The cause is logged, not returned (#366).
-- Only one export per collection may run at a time; a second request while one is
+- The requested name is first replaced by the name as stored, its first character
+  upper-cased (`SPECIFICATIONS.md` §3.1, #372), so `policies` exports `Policies`
+  with its retained originals and gold-standard sessions. Originals and sessions
+  saved under the lowercase spelling before #372 are not migrated and are not
+  included.
+- Only one export per collection may run at a time, whichever first-letter spelling
+  each request uses (#372); a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
   concurrent exports would race on the temporary file described below. A request
   that arrives while that export is still storing its first record waits for it,
@@ -432,25 +465,33 @@ exports. They MUST NOT abort flagging after a collection has been deleted.
 Check 4 is a refusal, not a warning. Vectors from a different model are
 meaningless rather than merely different, and a collection built from them
 answers every query confidently and wrongly. The error MUST name both models and
-both dimension counts, and state that re-embedding is available when the package
-is `with-sources`.
+both dimension counts, in the message and in `detail` (`package_model`,
+`package_dimensions`, `instance_model`, `instance_dimensions`). This instance's
+count comes from an embedding call; when Ollama can't answer it, the import is
+still refused, `instance_dimensions` is `null` and the message says the count
+couldn't be read. A refused package is not re-embedded, whatever its fidelity, so
+the error offers no re-embedding: the remedy is an instance running the package's
+model, or a re-export from one (#390).
 
 ### 6.3 Bundled models
 
 `include_models` defaults to `false`. When `true`, `models/` contains the
 **embedding model and the LLM named in the manifest**, as the Ollama manifest and
-blob files required to serve them, under `models/<model-name>/`:
+blob files required to serve them, in a folder per name and tag,
+`models/<name>/<tag>/` (a name with no tag has tag `latest`):
 
 ```
 models/
 ├── nomic-embed-text/
-│   ├── manifest.json          the Ollama manifest, verbatim
-│   └── blobs/
-│       └── sha256-<hex>       config and layer blobs it names
+│   └── latest/
+│       ├── manifest.json      the Ollama manifest, verbatim
+│       └── blobs/
+│           └── sha256-<hex>   config and layer blobs it names
 └── phi3.5/
-    ├── manifest.json
-    └── blobs/
-        └── sha256-<hex>
+    └── latest/
+        ├── manifest.json
+        └── blobs/
+            └── sha256-<hex>
 ```
 
 Blobs are resolved **through each model's manifest**, never by copying the blob
@@ -460,6 +501,29 @@ bundle unrelated weights. Ollama writes blob filenames with a hyphen
 
 Every model file appears in the package manifest's `files` map and is digest
 verified on import like any other file.
+
+A model is bundled whole or not at all. If any of its files can't be copied,
+the files of that model already copied are removed from the package and from
+`files`, and a warning names the model (#449). Import takes a model with a
+`models/<name>/<tag>/manifest.json` as bundled, so a partly copied model must
+never be left behind. A model used for both embedding and the LLM is copied
+once; the two are compared by name and tag, so `x` and `x:latest` are one
+model (#494).
+
+Two tags of one name (an embedding model `foo:a` and an LLM `foo:b`) are both
+bundled, each in its own folder (#487). Import uses a folder only for the name
+and tag it holds: a package that bundles `bar:x` doesn't bundle `bar:y`, so an
+instance whose LLM is `bar:y` gets the "absent, not bundled" outcome below,
+never `bar:x`'s files under the name `bar:y`.
+
+Packages built before #487 put a model in `models/<name>/`, without the tag.
+Import reads such a folder's tag from the package manifest: when
+`embedding.model` and `llm.model` name exactly one tag of that name, the folder
+holds that tag. When they name two tags of it, the two models shared the
+folder and one overwrote the other's manifest, so the folder counts as not
+bundled for either. An instance from before #487 that imports a newer package
+doesn't find its models, and gives its "absent, not bundled" outcome.
+`package_format` stays `1`.
 
 **The API service must mount the Ollama model volume** (`ollama_models:/ollama`)
 for any of this to work. Installing a model means writing its exact manifest and
@@ -479,7 +543,7 @@ On import:
 |---|---|
 | Model present and its files match their checksums | skip; do not overwrite. A target's existing model is assumed deliberate |
 | Model present but a file is missing or doesn't match its checksum | embedding model: fail with `MODEL_INTEGRITY_FAILED`, naming the model and saying to restore or re-pull it. LLM: note it on the import and continue. Never overwrite it: blobs are shared, and replacing one could affect other models |
-| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding |
+| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding. If Ollama doesn't report it: the embedding model fails `EMBEDDING_MODEL_MISSING`, the LLM `IMPORT_FAILED`. If Ollama can't be reached, either fails `IMPORT_FAILED`, saying so rather than calling the model missing |
 | Model absent, package does not bundle it | fail with `EMBEDDING_MODEL_MISSING`, naming the model and stating that it must be pulled or a `with-models` package used |
 | Namespaced model name (`user/model`) | it has no path in the model store, so it can't be checked or installed from a package. If Ollama reports it, note that its files weren't checked and continue. If not: the embedding model fails `EMBEDDING_MODEL_MISSING`, saying to pull it; the LLM gets a note. If Ollama can't be reached, the embedding model fails `IMPORT_FAILED`, saying so rather than calling the model missing; the LLM gets a note |
 
@@ -688,6 +752,23 @@ or when a step fails before the original is deleted. If marking gold-standard
 sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
 the original collection is unchanged, and the retained copy is discarded.
 
+### 7.5 Weaviate unreadable at a tune route
+
+A tune route that can't read Weaviate answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON
+error, with `detail` `{"collection": "<name>"}`; the cause is logged, not returned. Two checks
+can fail this way:
+
+- **The existence check** (#349): `POST /tune/rechunk`, `POST /tune/reembed`,
+  `POST /tune/reindex` and `GET /tune/{collection}` read Weaviate to check that the
+  collection exists. No job is created and nothing is registered.
+- **The re-chunk coverage check** (#340): `POST /tune/rechunk` and `POST /tune/reembed`
+  with chunking fields read the stored chunks to check that there is something to rebuild
+  (§13 E17), and `GET /tune/{collection}`, for a collection with retained originals, reads them to
+  decide whether to offer re-chunking. For a start, no job is created and its guards are released.
+
+A re-embed without chunking fields and a re-index don't run the coverage check. Try again
+when Weaviate is available.
+
 ---
 
 ## 8. Lifecycle Rules
@@ -758,15 +839,15 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SERVICE_UNAVAILABLE` | HTTP 503 from `POST /export`: Weaviate can't be read to check whether the collection exists; no job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (#366) |
+| `SERVICE_UNAVAILABLE` | HTTP 503: Weaviate can't be read to check whether the collection exists, from `POST /export` (#366) and from `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/{collection}` (#349); or can't be read for the re-chunk coverage check, from `POST /tune/rechunk`, `POST /tune/reembed` with chunking fields and `GET /tune/{collection}` (#340). No job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (§7.5) |
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
-| `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
+| `IMPORT_IN_PROGRESS` | HTTP 409 from `POST /import` for a concurrent import of the same package file (compared by its name in `./exports`), and an import job's failure when another import into the same target collection is running, whatever either job's `on_conflict`, with `error_detail` `{"collection": "<target>"}` (#391) |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
-| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Reindex and re-embed from stored chunks remain available. |
+| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Answered by the tuning options, and by a re-chunk or a re-embed with chunking parameters before any job is created (#389). Reindex and re-embed from stored chunks remain available. |
 | `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
 | `INTERRUPTED` | the API restarted while the export, import or tune job was queued or running; start it again (#23) |
 
@@ -816,11 +897,12 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, while record-only tuning still works; missing-blob exports pass import preflight |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight |
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` and its `chunks_written` kept; an import interrupted by the restart answers the same (#309); tune likewise, by `test_jobstore.py` |
 | E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
 | E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
+| E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
 
 ---
 

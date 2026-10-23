@@ -133,35 +133,12 @@ It runs code, so the same rule as testing applies: for a cross-repository PR, on
 
 First reset the merged worktree to the evaluated commit (`git -C <bundle>/merged checkout -- . && git -C <bundle>/merged clean -fdq -e node_modules`), because the testing reviewer may have left test edits there.
 
-The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. Write the script to the bundle:
-
-```bash
-cat > <bundle>/build-check.sh <<'EOF'
-set -u
-main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
-# The trusted harness: the main checkout's must be develop's ("The verify project" in reference.md).
-git -C "$main" fetch -q origin develop || { echo "STOP: could not fetch develop"; exit 1; }
-git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml docker-compose.yml || { echo "STOP: the harness isn't develop's"; exit 1; }
-# Held until this script exits; exits 3 if another verify run holds it.
-. "$main/scripts/verify/lock.sh"
-smoke() { for i in $(seq 1 60); do c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"); [ "$c" = 200 ] && { echo "200 after ${i}s"; return 0; }; sleep 1; done; echo "$c: no 200 in 60 s"; return 1; }
-rc=0
-if bash "$main/scripts/verify/stack.sh" up --checkout <bundle>/merged --pull; then
-  smoke http://localhost:8081/api/health || rc=1
-  smoke http://localhost:8081/ || rc=1
-  curl -s http://localhost:8081/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin))' || rc=1
-else
-  echo "stack.sh up failed"; rc=1
-fi
-bash "$main/scripts/verify/stack.sh" down || rc=1
-exit "$rc"
-EOF
-```
+The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. The script is `{skills}/rag-pr-review/build-check.sh`, the maintainer's copy (`{skills}` as in step 7), and takes the bundle path as its first argument. Run it as it is: never copy it into the bundle or rewrite it.
 
 Run it in the background and wait for it as "Waiting for long runs" in `.claude/skills/rag-pr-review-tests/SKILL.md` says, with this script's log and pid file in place of `verify-all.*`:
 
 ```bash
-(bash <bundle>/build-check.sh; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
+(bash {skills}/rag-pr-review/build-check.sh <bundle>; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
 ```
 
 Then read the finished log:

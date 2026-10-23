@@ -267,11 +267,12 @@ sys.path.insert(0, sys.argv[2])
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
-from services import exporter, importer, weaviate_client as wc
+from services import exporter, importer, packager, weaviate_client as wc
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
          patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
          patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
          patch.object(wc, 'close_client'):
         async with lifespan(app):
             print(json.dumps(exporter.get_job('abcd1234')))

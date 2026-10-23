@@ -9,11 +9,14 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 from __future__ import annotations
 from services import telemetry
 
+import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -46,6 +49,65 @@ def exports_dir() -> Path:
     p = Path(settings.exports_dir)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ── Leftovers of a killed job (#377) ─────────────────────────────────────────
+# A build removes its staging directory and temporary archive in a `finally`,
+# which a hard kill skips: each killed export left them in ./exports for good,
+# hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
+# and by kind, never by age; anything else in the folder is left alone.
+_BUILD_DIR = ".build-*"
+_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+
+
+def remove_leftover(entry: Path, *, directory: bool = False,
+                    regular_file: bool = False) -> int | None:
+    """Remove one thing a killed job left behind and return the bytes it held.
+
+    `directory` and `regular_file` say what its name promises. Anything else,
+    a symlink included, is kept, and no link is followed: not to check it, size
+    it or remove it. None when it was kept or could not be removed (logged).
+    """
+    try:
+        info = entry.lstat()
+        if directory and stat.S_ISDIR(info.st_mode):
+            size = 0
+            for parent, _dirs, files in os.walk(entry):     # does not follow links
+                for name in files:
+                    found = os.lstat(os.path.join(parent, name))
+                    if stat.S_ISREG(found.st_mode):
+                        size += found.st_size
+            # Removes links inside without following them, and refuses a link.
+            shutil.rmtree(entry)
+            return size
+        if regular_file and stat.S_ISREG(info.st_mode):
+            entry.unlink()
+            return info.st_size
+        return None
+    except OSError:
+        _log.exception("Could not remove %s", entry)
+        return None
+
+
+def sweep_build_leftovers() -> list[str]:
+    """Remove the staging directories and temporary archives of killed exports.
+
+    Startup only, before this process can have an export of its own running.
+    A missing exports folder is not created.
+    """
+    root = Path(settings.exports_dir)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for entry in sorted(root.iterdir()):
+        as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
+        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        if not (as_dir or as_file):
+            continue
+        size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+    return removed
 
 
 # ── Naming (spec §4.1) ────────────────────────────────────────────────────────
@@ -139,6 +201,20 @@ class _Builder:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
 
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
     """Expand `@@INCLUDE:name@@` from templates/partials/<name>.md.
@@ -204,9 +280,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -260,6 +336,21 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"Baked-in defaults for this package: collection `{collection}`, mode "
             f"`{cfg['retrieval_mode']}`, top-k {cfg['top_k']}, alpha {cfg['alpha']}, "
             f"answer style `{cfg['response_format']}`.")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+    """Archive the staged package as `<stem>/`, with manifest.json first (#383).
+
+    The directory entry, then the manifest, then everything else in the sorted
+    order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
+    at the manifest instead of decompressing chunks.jsonl to reach it.
+    """
+    with tarfile.open(dest, "w:gz") as tar:
+        tar.add(stage, arcname=stem, recursive=False)
+        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+        for entry in sorted(os.listdir(stage)):
+            if entry != "manifest.json":
+                tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
 @telemetry.traced("rag.package")
@@ -360,22 +451,38 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # Models are compared by name and tag, so `x` and `x:latest` are one
+            # model, copied once (#494). Each copy then has its own
+            # models/<name>/<tag>/ folder (#487), so removing a failed copy
+            # never removes another model's files.
+            wanted: dict[str, str] = {}
+            for model in (settings.embed_model, settings.llm_model):
+                try:
+                    key = model_bundle.model_ref(model)
+                except ValueError:
+                    key = model  # no path in the store; export_model refuses it below
+                wanted.setdefault(key, model)
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
-                for model in wanted:
+                for model in wanted.values():
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model_bundle.model_ref(model))
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -421,9 +528,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -437,18 +544,6 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -472,14 +567,12 @@ def build(
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(stage, arcname=stem)
+        _write_archive(stage, stem, tmp_archive)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -513,16 +606,67 @@ class PackageError(Exception):
         self.detail = detail
 
 
+# The listing reads only the manifest (#383). It holds one `files` entry per file
+# in the package, so 16 MiB is far more than any real package needs; a larger
+# manifest is refused unread and the package is listed as unreadable.
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _is_top_manifest(name: str) -> bool:
+    """True for `<top-level directory>/manifest.json`, not one deeper down."""
+    parts = PurePosixPath(name).parts
+    return len(parts) == 2 and parts[1] == "manifest.json"
+
+
 def read_manifest(archive: Path) -> dict:
-    """Read manifest.json out of a package without extracting the whole archive."""
+    """Read the top-level manifest.json out of a package, for the listing.
+
+    Members are read one at a time and nothing after the manifest is touched,
+    so a package is not decompressed in full (#383). New packages put the
+    manifest first; in older ones chunks.jsonl comes before it and is read past.
+    Raises when the package has no readable manifest, or one larger than
+    MANIFEST_MAX_BYTES or not a JSON object.
+    """
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if Path(member.name).name == "manifest.json" and member.isfile():
-                fh = tar.extractfile(member)
-                if fh is None:
-                    break
-                return json.loads(fh.read().decode("utf-8"))
+        while (member := tar.next()) is not None:
+            if not (_is_top_manifest(member.name) and member.isfile()):
+                continue
+            if member.size > MANIFEST_MAX_BYTES:
+                raise ValueError(f"manifest.json is {member.size} bytes, over the "
+                                 f"{MANIFEST_MAX_BYTES}-byte limit")
+            fh = tar.extractfile(member)
+            if fh is None:
+                break
+            manifest = json.loads(fh.read(member.size).decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            return manifest
     raise ValueError("no manifest.json in package")
+
+
+def listing_fields(manifest: dict) -> dict:
+    """The four values the listing shows, from a manifest read_manifest returned.
+
+    An absent or null value is listed as None. A value of the wrong JSON type
+    (spec §4.4) raises instead of being coerced, so the package is listed as
+    unreadable rather than the whole listing failing (#451).
+    """
+    collection = manifest.get("collection")
+    if collection is None:
+        collection = {}
+    elif not isinstance(collection, dict):
+        raise ValueError("manifest collection is not a JSON object")
+    fields = {"collection": collection.get("name"),
+              "chunk_count": collection.get("chunk_count"),
+              "fidelity": manifest.get("fidelity"),
+              "created_at": manifest.get("created_at")}
+    for key in ("collection", "fidelity", "created_at"):
+        if fields[key] is not None and not isinstance(fields[key], str):
+            raise ValueError(f"manifest {key} is not a string")
+    count = fields["chunk_count"]
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+        raise ValueError("manifest chunk_count is not an integer")
+    return fields
 
 
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:

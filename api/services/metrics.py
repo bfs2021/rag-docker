@@ -41,6 +41,11 @@ def _metrics_path() -> Path:
     return _METRICS_FILE
 
 
+def _metrics_file_name() -> Path:
+    """The metrics file's path for log messages, known even when creating its folder failed."""
+    return _METRICS_FILE or Path(settings.upload_dir) / "metrics.jsonl"
+
+
 def _read_tail(path: Path) -> tuple[list[str], bool]:
     """The last MAX_RECORDS valid lines of `path`, read from at most its last
     _TAIL_BYTES, and whether they are all the file holds."""
@@ -102,7 +107,7 @@ def load_from_disk() -> None:
                 return
             lines, whole = _read_tail(p)
         except Exception:                                 # noqa: BLE001
-            _log.exception("Could not load the query metrics from %s", _METRICS_FILE)
+            _log.exception("Could not load the query metrics from %s", _metrics_file_name())
             return
         for line in lines:
             _ring.append(json.loads(line))
@@ -157,7 +162,8 @@ async def record(
         await asyncio.to_thread(_append_sync, json.dumps(entry))
     except Exception:                                     # noqa: BLE001
         _log.warning("Could not write the query metrics record for %r to %s; "
-                     "the answer is still returned", collection, _METRICS_FILE, exc_info=True)
+                     "the answer is still returned", collection, _metrics_file_name(),
+                     exc_info=True)
 
 
 def _percentile(data: list[float], p: int) -> float:

@@ -5,7 +5,7 @@
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -16,6 +16,15 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
+
+  await require('./health_page').runHealthPageTests(browser, BASE, r);
+  await require('./transfer_page').runTransferPageTests(browser, BASE, r);
+
+  await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
+
+  await require('./ui_controls').runUiControlTests(browser, BASE, r);
+
+  await require('./ui_pages').runUiPageTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -346,6 +355,161 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── refused creates and failed collection lists (#379) ───────────────────
+  // A refused create went to the page-level error line behind the modal's
+  // overlay, so it looked like nothing happened, and a failed GET /collections
+  // was swallowed, so an outage looked like "no collections". The POSTs and the
+  // failing lists are answered here, so no collection is created.
+  r.section('refused creates and failed collection lists (#379)');
+  {
+    const LIST_FAIL = 'Synthetic list failure (#379).';
+    const LIST_MESSAGE = 'Could not load the collections: ' + LIST_FAIL;
+    const EXISTS = "Collection 'VfyRefused379' already exists.";
+    const listFailure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: LIST_FAIL, detail: null } }) };
+    const refusal = { status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_EXISTS', message: EXISTS, detail: null } }) };
+    const accepted = { status: 201, contentType: 'application/json', body: JSON.stringify({ name: 'VfyRefused379', status: 'created' }) };
+    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => a.textContent.trim()));
+    // The New Collection modal, and the alert inside it, if any.
+    const modal = page => page.evaluate(() => {
+      const h = [...document.querySelectorAll('h2')].find(x => x.textContent.trim() === 'New Collection');
+      const box = h && h.parentElement;
+      const alert = box && box.querySelector('[role=alert]');
+      return { open: !!h, alert: alert ? alert.textContent.trim() : null };
+    });
+    // Answers GET and POST /api/collections as the test's current modes say.
+    async function stub(s) {
+      const mode = { list: 'pass', post: 'refuse' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'GET' && mode.list === 'fail') return request.respond(listFailure);
+        if (request.method() === 'POST') return request.respond(mode.post === 'refuse' ? refusal : accepted);
+        return request.continue();
+      });
+      return mode;
+    }
+    const posts = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/collections').length;
+
+    // A failed list on each page that loads one.
+    for (const path of ['/collections', '/import', '/qa', '/goldstandard']) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const shown = await alerts(s.page);
+        r.check(`${path}: a failed collection list is shown as an alert`, shown.includes(LIST_MESSAGE), JSON.stringify(shown));
+        r.check(`${path}: a failed collection list causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Collections page: a refused create, then a successful one, which also
+    // reloads the list and clears the failed-list message.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=Name]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Collections: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Collections: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Collections: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'pass';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        r.check('Collections: a successful create closes the modal', !done.open, JSON.stringify(done));
+        const after = await alerts(s.page);
+        r.check('Collections: the next successful list clears the failed-list message', !after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Collections: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Collections create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Import page "+ New": a refused create, then a successful one whose list
+    // reload fails, which is a list error, not a refused create.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Import: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Import: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Import: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'fail';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        const after = await alerts(s.page);
+        r.check('Import: a successful create closes the modal even when the list reload fails', !done.open, JSON.stringify(done));
+        r.check('Import: a failed reload after a create is shown as a failed list', after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+  }
+
+  // ── the created name as stored (#372) ──────────────────────────────────────
+  // Weaviate capitalises a collection's first letter, and the list shows that
+  // name. The Import page selected the typed name, which matched no option, so
+  // React showed the first option instead while uploads went to the typed name.
+  // /api/collections is answered here, the list with a decoy first, so that
+  // fallback can't pass the check; nothing is created on the stack.
+  r.section('the created name as stored (#372)');
+  {
+    const TYPED = 'vfySpelling372', STORED = 'VfySpelling372', DECOY = 'VfyDecoy372';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const s = await session(browser, BASE, 'engineer');
+    try {
+      await s.page.setRequestInterception(true);
+      let created = false;
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'POST') {
+          created = true;
+          return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ name: STORED, status: 'created' }) });
+        }
+        const list = created ? [info(DECOY), info(STORED)] : [info(DECOY)];
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+      });
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      await clickByText(s.page, '+ New'); await sleep(300);
+      await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", TYPED);
+      await clickByText(s.page, 'Create'); await sleep(1500);
+      const selected = await s.page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        const select = label && label.parentElement.querySelector('select');
+        return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+      });
+      r.check('Import: after "+ New", the selector holds the created collection as stored',
+              !!selected && selected.value === STORED, JSON.stringify(selected));
+      r.check('Import stored-name fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── upload size limit ──────────────────────────────────────────────────────
   // The Import page refuses a selection over the proxy's limit before sending.
   // The file is sparse: it reports 513 MB but occupies no disk, and the check
@@ -508,6 +672,92 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();
+    }
+  }
+
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
     }
   }
 
