@@ -2802,8 +2802,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       API call by request interception. Its filename, encoded-URL and sample-size checks fail on the
       code before #393 (`..json`, an empty field after a lookup, a raw `#` in the URL, and a generate
       request sent for 0, 101, 2.5 and an empty field). It also clicks Export in Chromium with the
-      popup blocker on: a save answered in 1 s opens the download tab, and a control answered after
-      6 s opens none.*
+      popup blocker on: a save answered in 1 s opens the download tab, and a control answered once
+      `navigator.userActivation.isActive` is false opens none. It also asserts the expanded row's
+      answer and ground truth, the `export` and no-safe-character filename fallbacks and that a
+      sample size of 1 enables Generate (#469).*
 - [x] The Gold Standard page shows how a generation ended (final status, failed pairs and the `errors` reasons, and the empty collection), stops polling with a message when a poll fails, keeps Generate disabled while a start or generation runs and Regenerate disabled per pair while it runs, and keeps the edit form open with the typed values when the `PATCH` is refused, sending only the changed fields (#380).
       *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
       API call by request interception: a completed, partially failed, failed, cancelled and empty

@@ -14626,8 +14626,12 @@ answers every `/api/` call from the Gold Standard page by request interception
 `{collection}_{YYYYMMDD_HHMMSS}.json` after a generation and after a lookup, made
 safe and shortened to 128 characters as the API's default is; that Export opens the
 download URL with the filename encoded; that a review row expands to the first 300
-characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
-an empty field disables Generate with a message and sends no request. Its #380 half
+characters of the context followed by `…`, then its answer and its ground truth (a
+fixture pair whose two differ, so one cannot stand in for the other); that a session with
+no collection pre-fills `export_{YYYYMMDD_HHMMSS}.json` and a collection with no safe
+characters pre-fills `_{YYYYMMDD_HHMMSS}.json`, as the API names them; and that a sample
+size of 0, 101, 2.5 or an empty field disables Generate with a message and sends no
+request, while 1 and 100 enable it. Its #380 half
 checks how a generation ends and the guards on actions in flight: the outcome shown for a
 completed, partially failed, failed, cancelled and empty-collection session (headline, failed
 pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
@@ -14637,8 +14641,11 @@ the running pair only and repeated clicks send one request; and a refused edit (
 modal open with the typed values and the message, and each edit sends only the changed fields.
 A second
 Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
-real: a save answered in 1 s opens the download tab, and a control answered after
-6 s (past Chromium's user-activation window) opens none. That tab sends one
+real: a save answered in 1 s opens the download tab, and a control opens none. The
+control holds its save answer until the page reports
+`navigator.userActivation.isActive` is false (polled every 100 ms, at most 15 s), so it
+follows Chromium's user-activation window, not a fixed delay, and it fails unless the
+activation was still active when the save request arrived. That tab sends one
 read-only download request for the fixture name to the stack under test, which
 refuses it as an invalid export name. It runs on its own too, like
 `query_config.js`:
@@ -27807,7 +27814,7 @@ if (require.main === module) (async () => {
 ```javascript
 // Gold Standard page details (#393): the default export name, the encoded
 // download URL with the popup blocker on, the review row preview and the sample
-// size bounds. Generation outcomes and the guards on actions in flight (#380):
+// size bounds, the export name fallbacks, and the popup blocker. Generation outcomes and the guards on actions in flight (#380):
 // the final status, failed pairs and reasons, a stopped poll, Generate and
 // Regenerate while they run, and a refused edit. Every /api/ call from the page
 // is answered here; no backend writes.
@@ -27821,9 +27828,11 @@ const SAVED = 'Gold 393 #1?%.json';
 const DOWNLOAD = '/api/goldstandard/download/' + encodeURIComponent(SAVED);
 const CONTEXT = 'abcdefghij'.repeat(40); // 400 characters
 const LONG = 'L'.repeat(140);
+const ANSWER = 'Distinct answer 469';
+const TRUTH = 'Distinct ground truth 469';
 
 const pair = { pair_id: 'p1', question: 'Fixture question 393', answer: 'Fixture answer', contexts: [CONTEXT], ground_truth: 'Fixture answer', source_file: 'fixture.txt', chunk_index: 0, status: 'approved' };
-const sessionBody = collection => ({ session_id: SESSION, collection, status: 'completed', pairs_total: 1, pairs_completed: 1, pairs: [pair] });
+const sessionBody = (collection, p = pair) => ({ session_id: SESSION, collection, status: 'completed', pairs_total: 1, pairs_completed: 1, pairs: [p] });
 const json = (request, status, body) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(body) });
 const apiError = (status, message) => ({ status, body: { error: { code: 'FIXTURE', message, detail: null } } });
 const pair2 = { ...pair, pair_id: 'p2', question: 'Second question 380', status: 'pending' };
@@ -27833,7 +27842,7 @@ const pair2 = { ...pair, pair_id: 'p2', question: 'Second question 380', status:
 async function fixture(browser, base, opts = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
-  const errors = [], generates = [], polls = [], patches = [], regenerates = [], dialogs = [];
+  const activation = {}, errors = [], generates = [], polls = [], patches = [], regenerates = [], dialogs = [];
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
   await page.evaluateOnNewDocument(realOpen => {
@@ -27882,13 +27891,25 @@ async function fixture(browser, base, opts = {}) {
     }
     if (path === '/api/goldstandard/save') {
       if (opts.saveDelay) await sleep(opts.saveDelay);
+      if (opts.saveUntilInactive) {
+        // Hold the answer until the browser says the click's user activation has
+        // lapsed, not for a fixed time; give up after 15 s. page.evaluate would
+        // itself count as a user gesture and keep the activation alive, so ask
+        // through the protocol with userGesture off.
+        const cdp = await page.createCDPSession();
+        const isActive = () => cdp.send('Runtime.evaluate', { expression: 'navigator.userActivation.isActive', returnByValue: true, userGesture: false })
+          .then(x => x.result.value === true, () => false);
+        activation.atRequest = await isActive();
+        for (let i = 0; i < 150 && await isActive(); i++) await sleep(100);
+        activation.lapsed = !(await isActive());
+      }
       return json(request, 200, { filename: SAVED, pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/' + SAVED, historical: false, session_validity: { stale: false } });
     }
     return json(request, 404, { error: { code: 'NOT_FOUND', message: 'Not stubbed by the fixture.' } });
   });
   await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
   await sleep(300);
-  return { ctx, page, errors, generates, polls, patches, regenerates, dialogs };
+  return { ctx, page, activation, errors, generates, polls, patches, regenerates, dialogs };
 }
 
 const filenameValue = page => page.evaluate(() => document.querySelector('input[placeholder="filename.json"]')?.value ?? null);
@@ -27958,6 +27979,18 @@ async function runGoldStandardPageTests(browser, base, r) {
     r.check('a long collection name is shortened to a 128-character filename', value.length === 128 && /^L+_\d{8}_\d{6}\.json$/.test(value), `${value.length}: ${value}`);
   });
 
+  await run('no collection', { session: () => ({ body: { ...sessionBody('x'), collection: undefined } }) }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page);
+    r.check('a session with no collection pre-fills export_{YYYYMMDD_HHMMSS}.json', /^export_\d{8}_\d{6}\.json$/.test(value || ''), String(value));
+  });
+
+  await run('no safe characters', { collection: '#?%!' }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page);
+    r.check('a collection with no safe characters pre-fills _{YYYYMMDD_HHMMSS}.json, as the API names it', /^_\d{8}_\d{6}\.json$/.test(value || ''), String(value));
+  });
+
   await run('download URL', {}, async s => {
     await lookup(s.page);
     await clickByText(s.page, 'Export Approved'); await sleep(500);
@@ -27965,17 +27998,23 @@ async function runGoldStandardPageTests(browser, base, r) {
     r.check('export opens the download URL with the filename encoded', opened.length === 1 && new URL(opened[0], base).pathname === DOWNLOAD && !opened[0].includes('#'), JSON.stringify(opened));
   });
 
-  await run('review row', {}, async s => {
+  await run('review row', { session: () => ({ body: sessionBody('FixtureGold', { ...pair, answer: ANSWER, ground_truth: TRUTH }) }) }, async s => {
     await lookup(s.page);
     const row = await s.page.evaluate(() => {
       const d = [...document.querySelectorAll('details')].find(x => x.textContent.includes('Fixture question 393'));
       if (!d) return null;
       const closed = d.open; d.querySelector('summary').click();
       const ctx = [...d.querySelectorAll('div')].find(x => x.textContent.startsWith('Context:'));
-      return { closed, open: d.open, preview: ctx ? ctx.querySelector('span').textContent : null };
+      const field = label => {
+        const x = [...d.querySelectorAll('div')].find(y => y.firstElementChild?.tagName === 'STRONG' && y.firstElementChild.textContent === label);
+        return x ? x.textContent.slice(label.length).trim() : null;
+      };
+      return { closed, open: d.open, preview: ctx ? ctx.querySelector('span').textContent : null, answer: field('Answer:'), truth: field('Ground Truth:') };
     });
     r.check('a review row expands to the context: its first 300 characters, then …',
       row && row.closed === false && row.open === true && row.preview === CONTEXT.slice(0, 300) + '…', JSON.stringify(row && { ...row, preview: row.preview && row.preview.length }));
+    r.check('a review row expands to its answer', row && row.answer === ANSWER, JSON.stringify(row && row.answer));
+    r.check('a review row expands to its ground truth, apart from the answer', row && row.truth === TRUTH, JSON.stringify(row && row.truth));
   });
 
   await run('sample size', {}, async s => {
@@ -27994,6 +28033,9 @@ async function runGoldStandardPageTests(browser, base, r) {
     await setValue(s.page, '() => document.querySelector("input[type=number]")', '100'); await sleep(100);
     const ok = await state();
     r.check('sample size 100 enables Generate and removes the message', !ok.disabled && !ok.message, JSON.stringify(ok));
+    await setValue(s.page, '() => document.querySelector("input[type=number]")', '1'); await sleep(100);
+    const low = await state();
+    r.check('sample size 1 enables Generate and removes the message', !low.disabled && !low.message, JSON.stringify(low));
   });
 
   r.section('Gold Standard outcomes and in-flight guards (#380)');
@@ -28122,22 +28164,24 @@ async function runGoldStandardPageTests(browser, base, r) {
     ignoreDefaultArgs: ['--disable-popup-blocking'],
   });
   try {
-    for (const [delay, wantTab] of [[1000, true], [6000, false]]) {
-      await run(`popup blocker, save after ${delay} ms`, { realOpen: true, saveDelay: delay }, async s => {
+    for (const [label, wantTab, extra] of [['1 s', true, { saveDelay: 1000 }], ['the click\'s user activation has lapsed', false, { saveUntilInactive: true }]]) {
+      await run(`popup blocker, save after ${label}`, { realOpen: true, ...extra }, async s => {
         await lookup(s.page);
         const tabs = [];
         const onTarget = t => { if (t.type() === 'page' && t.opener()) tabs.push(t.url()); };
         blocking.on('targetcreated', onTarget);
         const button = await s.page.evaluateHandle(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Export Approved'));
         await button.click();
-        await sleep(delay + 1500);
+        // Wait without page.evaluate, which counts as a user gesture and would keep the activation alive.
+        if (extra.saveUntilInactive) for (let i = 0; i < 200 && s.activation.lapsed === undefined; i++) await sleep(100);
+        await sleep(extra.saveUntilInactive ? 1500 : 2500);
         blocking.off('targetcreated', onTarget);
         await s.page.bringToFront();
         const done = /1 pairs exported/.test(await bodyText(s.page));
         if (wantTab) {
           r.check('with the popup blocker on, a save answered in 1 s opens the download tab', done && tabs.length === 1 && new URL(tabs[0]).pathname === DOWNLOAD, JSON.stringify({ done, tabs }));
         } else {
-          r.check('control: the blocker is on (a save answered after 6 s opens no tab)', done && tabs.length === 0, JSON.stringify({ done, tabs }));
+          r.check('control: the blocker is on (a save answered once the user activation has lapsed opens no tab)', done && tabs.length === 0 && s.activation.atRequest === true && s.activation.lapsed === true, JSON.stringify({ done, tabs, activation: s.activation }));
         }
       }, blocking);
     }

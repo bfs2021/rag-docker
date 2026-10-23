@@ -817,8 +817,12 @@ answers every `/api/` call from the Gold Standard page by request interception
 `{collection}_{YYYYMMDD_HHMMSS}.json` after a generation and after a lookup, made
 safe and shortened to 128 characters as the API's default is; that Export opens the
 download URL with the filename encoded; that a review row expands to the first 300
-characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
-an empty field disables Generate with a message and sends no request. Its #380 half
+characters of the context followed by `…`, then its answer and its ground truth (a
+fixture pair whose two differ, so one cannot stand in for the other); that a session with
+no collection pre-fills `export_{YYYYMMDD_HHMMSS}.json` and a collection with no safe
+characters pre-fills `_{YYYYMMDD_HHMMSS}.json`, as the API names them; and that a sample
+size of 0, 101, 2.5 or an empty field disables Generate with a message and sends no
+request, while 1 and 100 enable it. Its #380 half
 checks how a generation ends and the guards on actions in flight: the outcome shown for a
 completed, partially failed, failed, cancelled and empty-collection session (headline, failed
 pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
@@ -828,8 +832,11 @@ the running pair only and repeated clicks send one request; and a refused edit (
 modal open with the typed values and the message, and each edit sends only the changed fields.
 A second
 Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
-real: a save answered in 1 s opens the download tab, and a control answered after
-6 s (past Chromium's user-activation window) opens none. That tab sends one
+real: a save answered in 1 s opens the download tab, and a control opens none. The
+control holds its save answer until the page reports
+`navigator.userActivation.isActive` is false (polled every 100 ms, at most 15 s), so it
+follows Chromium's user-activation window, not a fixed delay, and it fails unless the
+activation was still active when the save request arrived. That tab sends one
 read-only download request for the fixture name to the stack under test, which
 refuses it as an invalid export name. It runs on its own too, like
 `query_config.js`:
