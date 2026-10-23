@@ -7,6 +7,7 @@ Runs with the API's dependencies, inside the verify project's API container:
 Weaviate and gold-standard sessions are mocked; nothing reaches a backend.
 """
 import asyncio
+import contextlib
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 import warnings
@@ -140,6 +142,100 @@ class AdmissionTests(unittest.TestCase):
         _, _, paths = self.admit(upload("r.txt", "first"), upload("r.txt", "second"))
         staged = [p for p in Path(paths[0]).parents[1].rglob("*") if p.is_file()]
         self.assertEqual(staged, paths)
+
+    # A Finder "Compress" ZIP (#378): each file's resource fork and extended
+    # attributes as an AppleDouble file under __MACOSX/, keeping the file's suffix.
+    APPLEDOUBLE = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+    MACOS_SKIP = "(macOS metadata (AppleDouble), not a document)"
+
+    def test_finder_zip_queues_the_file_not_its_appledouble_member(self):
+        job, queued, _ = self.admit(upload("finder.zip", zip_bytes(
+            [("docs/", ""), ("docs/report.txt", "the real report"), ("__MACOSX/", ""),
+             ("__MACOSX/docs/", ""), ("__MACOSX/docs/._report.txt", self.APPLEDOUBLE)])))
+        self.assertEqual(queued, [("docs/report.txt", "finder.zip:docs/report.txt",
+                                   "the real report")])
+        self.assertEqual(job["files_total"], 1)
+        self.assertEqual(job["skipped"],
+                         [f"finder.zip:__MACOSX/docs/._report.txt {self.MACOS_SKIP}"])
+
+    def test_bare_dot_underscore_and_other_macosx_members_are_skipped(self):
+        # ditto and copies to non-Mac volumes write ._<name> beside the file;
+        # under __MACOSX/ the macOS reason wins over an unsupported suffix.
+        job, queued, _ = self.admit(upload("u.zip", zip_bytes(
+            [("notes.md", "notes"), ("._notes.md", self.APPLEDOUBLE),
+             ("a/._b.pdf", self.APPLEDOUBLE), ("__MACOSX/._tool.exe", self.APPLEDOUBLE),
+             ("__MACOSX/readme.txt", "x")])))
+        self.assertEqual(queued, [("notes.md", "u.zip:notes.md", "notes")])
+        self.assertEqual(job["skipped"], [
+            f"u.zip:._notes.md {self.MACOS_SKIP}", f"u.zip:a/._b.pdf {self.MACOS_SKIP}",
+            f"u.zip:__MACOSX/._tool.exe {self.MACOS_SKIP}",
+            f"u.zip:__MACOSX/readme.txt {self.MACOS_SKIP}"])
+
+    def test_names_that_only_look_like_macos_metadata_are_queued(self):
+        names = ["_report.txt", "notes._v2.txt", ".hidden.txt", "__MACOSX_notes.txt",
+                 "docs/__MACOSX.txt", "docs/__MACOSX/readme.txt", "__macosx/lower.txt"]
+        job, queued, _ = self.admit(upload("u.zip", zip_bytes([(n, n) for n in names])))
+        self.assertEqual(sorted(name for name, _, _ in queued), sorted(names))
+        self.assertEqual(job["skipped"], [])
+
+    def test_zip_of_only_macos_metadata_has_no_supported_files(self):
+        response = asyncio.run(ingest.ingest_upload(
+            collection="Coll", strategy="fixed", chunk_size="200", chunk_overlap="0",
+            similarity_threshold="0.85", min_chunk_size="0",
+            files=[upload("only.zip", zip_bytes([("__MACOSX/._r.txt", self.APPLEDOUBLE)]))]))
+        self.assertEqual(response.status_code, 400)
+        error = json.loads(response.body)["error"]
+        self.assertEqual(error["code"], "NO_SUPPORTED_FILES")
+        self.assertIn(f"only.zip:__MACOSX/._r.txt {self.MACOS_SKIP}", error["message"])
+
+    def refused(self, *files):
+        response = asyncio.run(ingest.ingest_upload(
+            collection="Coll", strategy="fixed", chunk_size="200", chunk_overlap="0",
+            similarity_threshold="0.85", min_chunk_size="0", files=list(files)))
+        self.assertEqual(getattr(response, "status_code", None), 400,
+                         "expected a refusal, got a job")
+        return json.loads(response.body)["error"]
+
+    def test_a_damaged_macos_metadata_member_still_refuses_the_zip(self):
+        # Validation is unchanged (#378): metadata is read like any skipped member.
+        payload = b"z" * 100
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            z.writestr("report.txt", "the real report")
+            z.writestr("__MACOSX/._report.txt", payload)
+        data = bytearray(buf.getvalue())
+        data[data.index(payload)] ^= 0x01   # bad CRC in the AppleDouble member
+        error = self.refused(upload("damaged.zip", bytes(data)))
+        self.assertEqual(error["code"], "ARCHIVE_UNREADABLE")
+        self.assertEqual([m["member"] for m in error["detail"]["members"]],
+                         ["__MACOSX/._report.txt"])
+
+    def test_macos_metadata_counts_toward_the_expansion_cap(self):
+        # The AppleDouble member's bytes still count (#298, #378).
+        data = zip_bytes([("report.txt", "r" * 100), ("__MACOSX/._report.txt", b"m" * 200)])
+        with patch.object(settings, "max_zip_expanded_bytes", 250):
+            error = self.refused(upload("big.zip", data))
+        self.assertEqual(error["code"], "ARCHIVE_TOO_LARGE")
+        with patch.object(settings, "max_zip_expanded_bytes", 300):
+            job, queued, _ = self.admit(upload("big.zip", data))
+        self.assertEqual([name for name, _, _ in queued], ["report.txt"])
+
+    def test_normalised_metadata_paths_are_skipped_under_their_archive_spelling(self):
+        # The match is on the logical (normalised) name; skipped keeps the raw name.
+        job, queued, _ = self.admit(upload("n.zip", zip_bytes(
+            [("r.txt", "real"), ("./__MACOSX/._r.txt", self.APPLEDOUBLE),
+             ("x/../__MACOSX/notes.txt", "x"), ("d/./._e.txt", self.APPLEDOUBLE)])))
+        self.assertEqual(queued, [("r.txt", "n.zip:r.txt", "real")])
+        self.assertEqual(job["skipped"], [
+            f"n.zip:./__MACOSX/._r.txt {self.MACOS_SKIP}",
+            f"n.zip:x/../__MACOSX/notes.txt {self.MACOS_SKIP}",
+            f"n.zip:d/./._e.txt {self.MACOS_SKIP}"])
+
+    def test_a_direct_upload_named_like_appledouble_is_still_ingested(self):
+        # Only ZIP members are filtered; direct uploads are unchanged (#378).
+        job, queued, _ = self.admit(upload("._notes.txt", "a direct upload"))
+        self.assertEqual(queued, [("._notes.txt", "._notes.txt", "a direct upload")])
+        self.assertEqual(job["skipped"], [])
 
 
 class FakeCollection:
@@ -599,8 +695,8 @@ class RechunkTests(unittest.TestCase):
 
     def test_the_up_front_check_runs_after_the_guards_and_only_for_rechunks(self):
         # #328 (reviewer): TUNE_IN_PROGRESS and COLLECTION_DELETING are answered
-        # before the walk; a re-index, an invalid index (left to the job) and a
-        # collection with a stored listed name all start a job.
+        # before the walk; a re-index and a collection with a stored listed name
+        # start a job. An invalid index is refused, with no job (#389).
         from services import collection_writes
         sources.store("Coll", "empty.txt", b"one", replace=True)
         chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0,
@@ -639,12 +735,154 @@ class RechunkTests(unittest.TestCase):
 
             started.append(asyncio.run(start("reindex", {})))
             self.assertEqual(get_client.call_count, 0)
-            with patch.object(sources, "load_index", side_effect=ValueError("bad index")):
-                started.append(asyncio.run(start("rechunk", {"chunking": chunking})))
+            with patch.object(sources, "load_index", side_effect=ValueError("bad index")), \
+                    self.assertRaises(tuning.PackageError) as caught:
+                asyncio.run(start("rechunk", {"chunking": chunking}))
+            self.assertEqual(caught.exception.code, "SOURCE_INDEX_INVALID")
+            self.assertEqual((get_client.call_count, tuning._active), (0, set()))
         with self.stored(("other.txt", 0), ("empty.txt", 0)), patch.object(tuning, "_run", run):
             started.append(asyncio.run(start("rechunk", {"chunking": chunking})))
         self.assertEqual(set(tuning._jobs) - before, set(started))
         self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    SOURCE_INDEX_INVALID = ("Cannot re-chunk 'Coll': its retained source index is invalid. "
+                            "Repair it before re-chunking; re-embedding from stored chunks "
+                            "and re-indexing remain available.")
+
+    def invalid_indexes(self):
+        """Each way load_index refuses an index, written in turn for Coll."""
+        directory = sources.collection_dir("Coll")
+        directory.mkdir(parents=True, exist_ok=True)
+        index = directory / sources.INDEX_NAME
+        valid = directory.parent / "valid-index.json"
+        valid.write_text(json.dumps({"version": 1, "documents": {
+            hashlib.sha256(b"one").hexdigest(): {"filenames": ["a.txt"]}}}))
+        for form, write in (
+                ("non-digest key", lambda: index.write_text(json.dumps(
+                    {"version": 1, "documents": {"../outside.txt": {"filenames": ["a.txt"]}}}))),
+                ("non-object document", lambda: index.write_text("[]")),
+                ("linked index", lambda: index.symlink_to(valid))):
+            index.unlink(missing_ok=True)
+            write()
+            with self.assertRaises(ValueError):
+                sources.load_index("Coll")
+            yield form
+
+    def test_an_invalid_source_index_is_refused_at_each_tune_start_over_http(self):
+        # #389: re-chunk, and re-embed with chunking fields, on an invalid
+        # retained source index answered 202 and the job failed TUNE_FAILED.
+        # The start is refused, 409 SOURCE_INDEX_INVALID, before any job exists,
+        # with the guards released and Weaviate never read.
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        requests = {
+            "rechunk": ("/tune/rechunk", {"collection": "Coll"}),
+            "reembed with chunking": ("/tune/reembed", {
+                "collection": "Coll", "chunking_strategy": "fixed", "chunk_size": 80}),
+        }
+        before = set(tuning._jobs)
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(wc, "get_client") as get_client:
+            for form in self.invalid_indexes():
+                for case, (path, body) in requests.items():
+                    with self.subTest(form=form, case=case):
+                        response = client.post(path, json=body)
+                        self.assertEqual(response.status_code, 409, response.text)
+                        self.assertTrue(
+                            response.headers["content-type"].startswith("application/json"))
+                        self.assertEqual(response.json()["error"], {
+                            "code": "SOURCE_INDEX_INVALID",
+                            "message": self.SOURCE_INDEX_INVALID,
+                            "detail": {"collection": "Coll"}})
+                        self.assertEqual(set(tuning._jobs), before)
+                        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                         (set(), []))
+            self.assertEqual(get_client.call_count, 0)
+
+    def test_an_invalid_source_index_still_starts_record_only_tuning_over_http(self):
+        # #389: re-indexing and re-embedding the stored chunk text never read the
+        # retained sources, so an invalid index doesn't refuse them.
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        import anyio.from_thread
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        # #389 (reviewer): one event loop for every request. With TestClient's
+        # per-request loop, a started job's task could be cancelled before it
+        # reached _run, leaving the tune guard held for the next request.
+        stack = contextlib.ExitStack()
+        client.portal = stack.enter_context(anyio.from_thread.start_blocking_portal())
+        self.addCleanup(stack.close)
+
+        def run(job_id, collection, *args, **kwargs):
+            collection_writes.end_job("tune", job_id)
+            with tuning._lock:
+                tuning._active.discard(collection)
+
+        def settle():
+            for _ in range(200):
+                if not tuning._active:
+                    return
+                threading.Event().wait(0.01)
+
+        before = set(tuning._jobs)
+        started = []
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(tuning, "_run", run):
+            for form in self.invalid_indexes():
+                for case, path in (("reindex", "/tune/reindex"),
+                                   ("reembed without chunking", "/tune/reembed")):
+                    with self.subTest(form=form, case=case):
+                        response = client.post(path, json={"collection": "Coll"})
+                        settle()
+                        self.assertEqual(response.status_code, 202, response.text)
+                        self.assertEqual(response.json()["status"], "queued")
+                        self.assertIn(response.json()["job_id"], set(tuning._jobs))
+                        started.append(response.json()["job_id"])
+        self.assertEqual(set(tuning._jobs) - before, set(started))
+        self.assertEqual(len(started), 6)
+        self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
+
+    def test_the_guards_answer_before_an_invalid_source_index(self):
+        # #389 (reviewer): the invalid-index refusal runs after the guards, so a
+        # busy or deleting collection still answers TUNE_IN_PROGRESS or
+        # COLLECTION_DELETING, and the refusal leaves the other tune's guard alone.
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        body = {"collection": "Coll", "chunking_strategy": "fixed", "chunk_size": 80}
+        before = set(tuning._jobs)
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(wc, "get_client") as get_client:
+            for form in self.invalid_indexes():
+                for path in ("/tune/rechunk", "/tune/reembed"):
+                    with self.subTest(form=form, path=path, guard="tune"):
+                        with tuning._lock:
+                            tuning._active.add("Coll")
+                        try:
+                            response = client.post(path, json=body)
+                            self.assertEqual(tuning._active, {"Coll"})
+                        finally:
+                            with tuning._lock:
+                                tuning._active.discard("Coll")
+                        self.assertEqual(response.status_code, 409, response.text)
+                        self.assertEqual(response.json()["error"]["code"], "TUNE_IN_PROGRESS")
+                    with self.subTest(form=form, path=path, guard="delete"), \
+                            patch.object(collection_writes, "register_job",
+                                         side_effect=collection_writes.CollectionDeletingError("Coll")):
+                        response = client.post(path, json=body)
+                        self.assertEqual(response.status_code, 409, response.text)
+                        self.assertEqual(response.json()["error"]["code"], "COLLECTION_DELETING")
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                     (set(), []))
+            self.assertEqual(get_client.call_count, 0)
 
     def test_a_weaviate_error_in_the_up_front_check_is_a_503(self):
         # #340: a Weaviate failure while the start reads the collection was a
@@ -830,6 +1068,53 @@ class RechunkTests(unittest.TestCase):
                 self.assertEqual(set(tuning._jobs), before)
                 self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
                                  (set(), []))
+
+    def test_the_rechunk_check_503_reaches_the_client_over_http_at_each_tune_start(self):
+        # #409: the 503 a re-chunk, and a re-embed with chunking fields, give when
+        # their re-chunk coverage check can't read Weaviate (#340), through the
+        # app as a client calls it: the JSON 503 reaches the client, whether the
+        # walk fails or the connection does, with no job and the guards released.
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        sources.store("Coll", "a.txt", b"one", replace=True)
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        requests = {
+            "rechunk": ("/tune/rechunk", {"collection": "Coll"}),
+            "reembed with chunking": ("/tune/reembed", {
+                "collection": "Coll", "chunking_strategy": "fixed", "chunk_size": 80}),
+        }
+        failures = {
+            "walk": {"return_value": SimpleNamespace(
+                collections=SimpleNamespace(get=lambda name: coll))},
+            "connection": {"side_effect": ConnectionError("weaviate down")},
+        }
+        before = set(tuning._jobs)
+        for failure, effect in failures.items():
+            for case, (path, body) in requests.items():
+                with self.subTest(failure=failure, case=case), \
+                        patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                        patch.object(wc, "get_client", **effect), \
+                        self.assertLogs(tuning._log, "ERROR"):
+                    response = client.post(path, json=body)
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertTrue(response.headers["content-type"].startswith("application/json"))
+                    self.assertEqual(response.json()["error"], {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": "Cannot check whether 'Coll' can be re-chunked: Weaviate "
+                                   "could not be read. No job was started; try again when "
+                                   "Weaviate is available.",
+                        "detail": {"collection": "Coll"}})
+                    self.assertNotIn("weaviate down", response.text)
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                     (set(), []))
 
     def test_a_missing_collection_is_still_404_at_tune_starts_and_options(self):
         # #349 (reviewer): the existence check now sits in a try; a collection

@@ -16,13 +16,28 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Both distribution scripts in a scratch git repository, docker stubbed (#384).
+python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
+check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# The same envelope through the proxy on the running stack (#373).
+check_eq "an unknown API route answers 404 through the proxy (#373)" \
+  "$(api_code "$API/no-such-route-373")" "404"
+check_eq "  ... in the envelope, code NOT_FOUND" \
+  "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
+check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
+  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -328,6 +343,11 @@ finally:
     wc.close_client()
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
+
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
 
 drop_collection "$C"
 cleanup_prefixed

@@ -726,7 +726,9 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+
+from services.collection_writes import canonical
 
 
 def _numeric(value):
@@ -755,6 +757,10 @@ TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
+# A collection name as a caller sends it, replaced by the name Weaviate stores
+# (first character upper-cased), so every file, registry entry, session, metric
+# and guard is keyed by one spelling (#372).
+CollectionName = Annotated[str, AfterValidator(canonical)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -766,7 +772,7 @@ class HnswConfig(BaseModel):
 
 
 class CreateCollectionRequest(BaseModel):
-    name: str
+    name: CollectionName
     index_type: IndexType = "hnsw"
     distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
@@ -866,7 +872,7 @@ class IngestConfigResponse(BaseModel):
 # SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
 # export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -878,7 +884,7 @@ class RetrievalConfigResponse(BaseModel):
     collection: str
     retrieval_mode: str
     top_k: int
-    alpha: float
+    alpha: Annotated[float, Field(allow_inf_nan=False)]   # JSON has no NaN (#477)
     ef: Optional[int]
     response_format: str
     is_default: bool
@@ -892,7 +898,7 @@ class HelpResponse(BaseModel):
 # ── Export / Import ───────────────────────────────────────────────────────────
 
 class ExportRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     include_models: bool = False
 
 
@@ -1021,16 +1027,16 @@ class _ChunkingFields(BaseModel):
 
 
 class RechunkRequest(_ChunkingFields):
-    collection: str
+    collection: CollectionName
 
 
 class ReembedRequest(_ChunkingFields):
     """Chunking fields are optional here, and only legal with `with-sources`."""
-    collection: str
+    collection: CollectionName
 
 
 class ReindexRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     index_type: Optional[IndexType] = None
     distance_metric: Optional[DistanceMetric] = None
 
@@ -1069,7 +1075,7 @@ class TuneOptionsResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -1080,7 +1086,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     source_file: str
     chunk_index: int
-    score: float
+    score: Optional[float]  # higher is better in every mode; null when missing (#376)
     excerpt: str
 
 
@@ -1095,7 +1101,7 @@ class QueryResponse(BaseModel):
 # ── Gold Standard ─────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     sample_size: int = 20
     seed: Optional[int] = None
 
@@ -1187,6 +1193,15 @@ class PatchPairRequest(BaseModel):
                 f"changing {', '.join(content)} requires status='edited'; "
                 f"got status={self.status!r}")
         return self
+
+    @field_validator("question", "answer", "ground_truth")
+    @classmethod
+    def _content_not_empty(cls, v: Optional[str], info) -> Optional[str]:
+        """An empty field would be saved into the RAGAS export as an empty row
+        field. Generation refuses empty model fields the same way (#381)."""
+        if v is not None and not v.strip():
+            raise ValueError(f"{info.field_name} must not be empty or only whitespace")
+        return v
 
     @field_validator("status")
     @classmethod
@@ -1607,7 +1622,8 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from models.schemas import (SEARCH_EF_MAX, SEARCH_EF_MIN, RetrievalConfigResponse,
+                            SaveRetrievalConfigBody)
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1655,16 +1671,39 @@ def load(collection: str) -> dict | None:
         return None
 
 
-def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+def merged(collection: str) -> tuple[dict, bool]:
+    """Return (saved settings over the defaults, is_default), as saved.
+
+    Raises TypeError when the saved JSON is not an object. Export uses this rather
+    than resolve(), so it can refuse bad saved settings with a next step.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
     # Fill in any key added since the file was written, so an older config does
     # not lose a field that callers now expect.
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
-    return merged, False
+    config = {"collection": collection, **DEFAULTS, **saved}
+    config["collection"] = collection
+    return config, False
+
+
+def resolve(collection: str) -> tuple[dict, bool]:
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object or a field of
+    the wrong type (#439), a non-finite alpha or the response's own is_default key
+    (#477), are logged and give the defaults, like an unreadable file.
+    """
+    try:
+        config, is_default = merged(collection)
+        if "is_default" in config:
+            # Not a setting; the router would get the keyword twice (#477).
+            raise ValueError("saved settings hold is_default")
+        RetrievalConfigResponse.model_validate({**config, "is_default": is_default})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid retrieval config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
+    return config, is_default
 
 
 def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
@@ -2749,11 +2788,40 @@ async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
     await asyncio.to_thread(_insert_chunks_sync, collection_name, chunks)
 
 
+# A citation's score is higher-is-better in every retrieval mode (#376), so the
+# distance-based modes turn Weaviate's distance into a similarity by the
+# collection's distance metric.
+_SIMILARITY = {
+    VectorDistances.COSINE: lambda d: 1 - d,            # cosine similarity, -1 to 1
+    VectorDistances.DOT: lambda d: -d,                  # the dot product itself
+    VectorDistances.L2_SQUARED: lambda d: 1 / (1 + d),  # 0 to 1
+}
+
+
+def _distance_to_score(coll):
+    """The distance-to-score conversion for this collection's metric.
+
+    The metric is read on every query, not cached, so a collection deleted and
+    recreated with another metric is converted by its new one. A missing
+    distance, or a config with no metric or a metric with no conversion, gives
+    None. A failed config read raises, and the query answers the #373 503.
+    """
+    vector_config = telemetry.call("weaviate.config", coll.config.get).vector_index_config
+    convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
+
+    def to_score(distance: float | None) -> float | None:
+        if convert is None or distance is None:
+            return None
+        return convert(distance)
+    return to_score
+
+
 def _near_vector_query_sync(
     collection_name: str, vector: list[float], top_k: int
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = telemetry.call("weaviate.query", coll.query.near_vector,
         near_vector=vector,
         limit=top_k,
@@ -2762,12 +2830,11 @@ def _near_vector_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2783,6 +2850,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
+    to_score = _distance_to_score(coll)
     result = telemetry.call("weaviate.query", coll.query.near_text,
         query=query,
         limit=top_k,
@@ -2791,12 +2859,11 @@ def _near_text_query_sync(
     )
     rows = []
     for obj in result.objects:
-        dist = obj.metadata.distance or 0.0
         rows.append({
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": dist,
+            "score": to_score(obj.metadata.distance),
         })
     return rows
 
@@ -2825,7 +2892,8 @@ def _hybrid_query_sync(
             "content": obj.properties.get("content", ""),
             "source_file": obj.properties.get("source_file", ""),
             "chunk_index": obj.properties.get("chunk_index", 0),
-            "score": obj.metadata.score or 0.0,
+            # Weaviate's fusion score, higher is better; missing reads as None (#376).
+            "score": obj.metadata.score,
         })
     return rows
 
@@ -4198,6 +4266,17 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
+def _is_macos_metadata(logical: str) -> bool:
+    """Whether a ZIP member is macOS metadata rather than a document (#378).
+
+    Finder's Compress stores each file's resource fork and extended attributes
+    as an AppleDouble file, __MACOSX/<folder>/._<name>, and other macOS tools
+    write ._<name> beside the file. Either keeps the real file's suffix, so the
+    suffix check would queue it as a document of its own."""
+    path = PurePosixPath(logical)
+    return path.parts[0] == "__MACOSX" or path.name.startswith("._")
+
+
 def _limit_text(limit: int) -> str:
     mib = 1024 * 1024
     if limit >= mib and limit % mib == 0:
@@ -4224,7 +4303,8 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
-    them; nothing is repaired, and nothing from it is ingested (#290).
+    them; nothing is repaired, and nothing from it is ingested (#290). macOS
+    metadata members (__MACOSX/, ._*) are skipped like unsupported ones (#378).
 
     The request's ZIPs may expand to at most the budget (#298): the sizes this
     ZIP declares are checked before anything is read, then the bytes actually
@@ -4290,6 +4370,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
         for member, logical in members:
             basename = PurePosixPath(logical).name
+            if _is_macos_metadata(logical):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} (macOS metadata (AppleDouble), not a document)")
+                continue
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
                     or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
@@ -4344,7 +4428,8 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
-    tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
+    # The prefix is how the startup sweep finds a killed job's staging (#377).
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
     # a later one with the same name. Dropping them without a word makes a ZIP
     # of 8 files silently report 6, with nothing saying which two or why.
@@ -4501,11 +4586,17 @@ SYNTHESIS_ENGINEER_SYSTEM = (
 
 
 class ServiceUnavailable(Exception):
-    """Ollama or Weaviate failed during a query; `service` names which (#373)."""
+    """Ollama or Weaviate failed during a query; `service` names which (#373).
 
-    def __init__(self, service: str):
+    `embedder` names the service that embeds the question for `service`, when it
+    does so itself: in hybrid and semantic modes Weaviate embeds through Ollama,
+    so an Ollama failure there comes back as a Weaviate error (#411).
+    """
+
+    def __init__(self, service: str, embedder: str | None = None):
         super().__init__(f"{service} failed during the query")
         self.service = service
+        self.embedder = embedder
 
 
 async def _from_ollama(call):
@@ -4516,12 +4607,12 @@ async def _from_ollama(call):
         raise ServiceUnavailable("Ollama") from exc
 
 
-async def _from_weaviate(call):
+async def _from_weaviate(call, embedder: str | None = None):
     """Await a Weaviate query; any error from it is ServiceUnavailable."""
     try:
         return await call
     except Exception as exc:                          # noqa: BLE001
-        raise ServiceUnavailable("Weaviate") from exc
+        raise ServiceUnavailable("Weaviate", embedder) from exc
 
 
 def _build_context_end_user(chunks: list[dict]) -> str:
@@ -4564,9 +4655,11 @@ async def run_query(
             vector = await _from_ollama(ollama.embed(reformulated))
             chunks = await _from_weaviate(wc.near_vector_query(collection, vector, top_k))
         elif retrieval_mode == "hybrid":
-            chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k))
+            chunks = await _from_weaviate(wc.hybrid_query(collection, reformulated, alpha, top_k),
+                                          embedder="Ollama")
         elif retrieval_mode == "semantic":
-            chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k))
+            chunks = await _from_weaviate(wc.near_text_query(collection, reformulated, top_k),
+                                          embedder="Ollama")
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
@@ -4587,7 +4680,7 @@ async def run_query(
             {
                 "source_file": c["source_file"],
                 "chunk_index": c["chunk_index"],
-                "score": round(c["score"], 4),
+                "score": None if c["score"] is None else round(c["score"], 4),
                 "excerpt": c["content"][:200],
             }
             for c in chunks
@@ -5592,21 +5685,33 @@ async def start_generation(
     }
 
 
+def _session_not_found(session_id: str) -> GoldStandardError:
+    return GoldStandardError("SESSION_NOT_FOUND", f"Session '{session_id}' not found.", 404)
+
+
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
+    """The updated pair, or None for an unknown pair. An unknown session raises
+    SESSION_NOT_FOUND, so the two 404s stay apart (#381)."""
     def change(current):
         for pair in current["pairs"]:
             if pair["pair_id"] == pair_id:
                 pair.update({key: value for key, value in updates.items() if value is not None})
                 return pair
         return None
-    return await asyncio.to_thread(_update_session_sync, session_id, change)
+
+    def apply():
+        with _state_lock:
+            if session_id not in _sessions:
+                raise _session_not_found(session_id)
+            return _update_session_sync(session_id, change)
+    return await asyncio.to_thread(apply)
 
 
 @telemetry.traced("rag.regenerate")
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
-        return None
+        raise _session_not_found(session_id)
     if session.get("status") == "generating":
         # The generation loop is appending to session["pairs"] and saving it;
         # regenerating underneath that races with it and can lose a pair.
@@ -5778,11 +5883,14 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 from __future__ import annotations
 from services import telemetry
 
+import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -5815,6 +5923,65 @@ def exports_dir() -> Path:
     p = Path(settings.exports_dir)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ── Leftovers of a killed job (#377) ─────────────────────────────────────────
+# A build removes its staging directory and temporary archive in a `finally`,
+# which a hard kill skips: each killed export left them in ./exports for good,
+# hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
+# and by kind, never by age; anything else in the folder is left alone.
+_BUILD_DIR = ".build-*"
+_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+
+
+def remove_leftover(entry: Path, *, directory: bool = False,
+                    regular_file: bool = False) -> int | None:
+    """Remove one thing a killed job left behind and return the bytes it held.
+
+    `directory` and `regular_file` say what its name promises. Anything else,
+    a symlink included, is kept, and no link is followed: not to check it, size
+    it or remove it. None when it was kept or could not be removed (logged).
+    """
+    try:
+        info = entry.lstat()
+        if directory and stat.S_ISDIR(info.st_mode):
+            size = 0
+            for parent, _dirs, files in os.walk(entry):     # does not follow links
+                for name in files:
+                    found = os.lstat(os.path.join(parent, name))
+                    if stat.S_ISREG(found.st_mode):
+                        size += found.st_size
+            # Removes links inside without following them, and refuses a link.
+            shutil.rmtree(entry)
+            return size
+        if regular_file and stat.S_ISREG(info.st_mode):
+            entry.unlink()
+            return info.st_size
+        return None
+    except OSError:
+        _log.exception("Could not remove %s", entry)
+        return None
+
+
+def sweep_build_leftovers() -> list[str]:
+    """Remove the staging directories and temporary archives of killed exports.
+
+    Startup only, before this process can have an export of its own running.
+    A missing exports folder is not created.
+    """
+    root = Path(settings.exports_dir)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for entry in sorted(root.iterdir()):
+        as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
+        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        if not (as_dir or as_file):
+            continue
+        size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+    return removed
 
 
 # ── Naming (spec §4.1) ────────────────────────────────────────────────────────
@@ -5908,6 +6075,20 @@ class _Builder:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
 
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
     """Expand `@@INCLUDE:name@@` from templates/partials/<name>.md.
@@ -5973,9 +6154,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -6029,6 +6210,21 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"Baked-in defaults for this package: collection `{collection}`, mode "
             f"`{cfg['retrieval_mode']}`, top-k {cfg['top_k']}, alpha {cfg['alpha']}, "
             f"answer style `{cfg['response_format']}`.")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+    """Archive the staged package as `<stem>/`, with manifest.json first (#383).
+
+    The directory entry, then the manifest, then everything else in the sorted
+    order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
+    at the manifest instead of decompressing chunks.jsonl to reach it.
+    """
+    with tarfile.open(dest, "w:gz") as tar:
+        tar.add(stage, arcname=stem, recursive=False)
+        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+        for entry in sorted(os.listdir(stage)):
+            if entry != "manifest.json":
+                tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
 @telemetry.traced("rag.package")
@@ -6129,22 +6325,38 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # Models are compared by name and tag, so `x` and `x:latest` are one
+            # model, copied once (#494). Each copy then has its own
+            # models/<name>/<tag>/ folder (#487), so removing a failed copy
+            # never removes another model's files.
+            wanted: dict[str, str] = {}
+            for model in (settings.embed_model, settings.llm_model):
+                try:
+                    key = model_bundle.model_ref(model)
+                except ValueError:
+                    key = model  # no path in the store; export_model refuses it below
+                wanted.setdefault(key, model)
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
-                for model in wanted:
+                for model in wanted.values():
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model_bundle.model_ref(model))
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -6190,9 +6402,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -6206,18 +6418,6 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -6241,14 +6441,12 @@ def build(
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(stage, arcname=stem)
+        _write_archive(stage, stem, tmp_archive)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -6282,16 +6480,67 @@ class PackageError(Exception):
         self.detail = detail
 
 
+# The listing reads only the manifest (#383). It holds one `files` entry per file
+# in the package, so 16 MiB is far more than any real package needs; a larger
+# manifest is refused unread and the package is listed as unreadable.
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _is_top_manifest(name: str) -> bool:
+    """True for `<top-level directory>/manifest.json`, not one deeper down."""
+    parts = PurePosixPath(name).parts
+    return len(parts) == 2 and parts[1] == "manifest.json"
+
+
 def read_manifest(archive: Path) -> dict:
-    """Read manifest.json out of a package without extracting the whole archive."""
+    """Read the top-level manifest.json out of a package, for the listing.
+
+    Members are read one at a time and nothing after the manifest is touched,
+    so a package is not decompressed in full (#383). New packages put the
+    manifest first; in older ones chunks.jsonl comes before it and is read past.
+    Raises when the package has no readable manifest, or one larger than
+    MANIFEST_MAX_BYTES or not a JSON object.
+    """
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if Path(member.name).name == "manifest.json" and member.isfile():
-                fh = tar.extractfile(member)
-                if fh is None:
-                    break
-                return json.loads(fh.read().decode("utf-8"))
+        while (member := tar.next()) is not None:
+            if not (_is_top_manifest(member.name) and member.isfile()):
+                continue
+            if member.size > MANIFEST_MAX_BYTES:
+                raise ValueError(f"manifest.json is {member.size} bytes, over the "
+                                 f"{MANIFEST_MAX_BYTES}-byte limit")
+            fh = tar.extractfile(member)
+            if fh is None:
+                break
+            manifest = json.loads(fh.read(member.size).decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            return manifest
     raise ValueError("no manifest.json in package")
+
+
+def listing_fields(manifest: dict) -> dict:
+    """The four values the listing shows, from a manifest read_manifest returned.
+
+    An absent or null value is listed as None. A value of the wrong JSON type
+    (spec §4.4) raises instead of being coerced, so the package is listed as
+    unreadable rather than the whole listing failing (#451).
+    """
+    collection = manifest.get("collection")
+    if collection is None:
+        collection = {}
+    elif not isinstance(collection, dict):
+        raise ValueError("manifest collection is not a JSON object")
+    fields = {"collection": collection.get("name"),
+              "chunk_count": collection.get("chunk_count"),
+              "fidelity": manifest.get("fidelity"),
+              "created_at": manifest.get("created_at")}
+    for key in ("collection", "fidelity", "created_at"):
+        if fields[key] is not None and not isinstance(fields[key], str):
+            raise ValueError(f"manifest {key} is not a string")
+    count = fields["chunk_count"]
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+        raise ValueError("manifest chunk_count is not an integer")
+    return fields
 
 
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
@@ -7074,7 +7323,13 @@ ON_CONFLICT = ("abort", "rename", "replace")
 
 # Job records survive an API restart (#23); see jobstore.py.
 _jobs = jobstore.JobStore("import")
+# Package names being imported: the file the worker opens, whatever the path
+# spelling sent (#391).
 _active: set[str] = set()
+# Target collections claimed by an import job, canonical name -> job id. A second
+# import into the same target is refused whatever its conflict mode, so two
+# imports never build, mark or clean up one collection at once (#391).
+_targets: dict[str, str] = {}
 _lock = threading.Lock()
 
 # Weaviate capitalises the first character of a collection name and rejects
@@ -7172,29 +7427,26 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk. Both remove their
-# own directory in a `finally`, which a hard kill skips -- twelve of these were
-# found holding 152 MB after the kill tests, and a with-models package would
-# leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
+# Extraction workspaces created by an import or a re-chunk, and an ingest's
+# upload staging (#377). Each removes its own directory in a `finally`, which a
+# hard kill skips -- twelve of these were found holding 152 MB after the kill
+# tests, a with-models package would leave 2.3 GB behind each time, and an
+# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-")
 
 
 def sweep_stale_workdirs() -> list[str]:
-    """Remove extraction directories abandoned by a killed job."""
+    """Remove work directories abandoned by a killed job; never follows a link."""
     root = Path(settings.upload_dir)
     removed: list[str] = []
     if not root.is_dir():
         return removed
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or not entry.name.startswith(_WORKDIR_PREFIXES):
+        if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        try:
-            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
-            shutil.rmtree(entry, ignore_errors=True)
-        except OSError:
-            _log.exception("Could not remove stale work directory %s", entry)
-            continue
-        removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+        size = packager.remove_leftover(entry, directory=True)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
 
 
@@ -7284,6 +7536,38 @@ def canonical(name: str) -> str:
     return name[:1].upper() + name[1:] if name else name
 
 
+def _package_key(filename: str) -> str:
+    """The package the worker opens, so every spelling of one file is one key."""
+    return Path(filename).name
+
+
+def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
+    """Claim `target` for this import, or refuse while another import holds it.
+
+    `instead_of`, a name this job claimed earlier, is released in the same step:
+    a `rename` no longer writes the name it moved away from.
+    """
+    name = canonical(target)
+    with _lock:
+        owner = _targets.get(name)
+        if owner is not None and owner != job_id:
+            raise PackageError(
+                "IMPORT_IN_PROGRESS",
+                f"Another import into '{name}' is running. Start this import again "
+                "once it finishes.",
+                {"collection": name})
+        if instead_of is not None and _targets.get(canonical(instead_of)) == job_id:
+            del _targets[canonical(instead_of)]
+        _targets[name] = job_id
+    return name
+
+
+def _release_targets(job_id: str) -> None:
+    with _lock:
+        for name in [name for name, owner in _targets.items() if owner == job_id]:
+            del _targets[name]
+
+
 def _safe_file(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
@@ -7317,20 +7601,23 @@ def _check_embedding(manifest: dict) -> None:
 
     if pkg_model != our_model:
         fidelity = manifest.get("fidelity")
-        remedy = ("This package is `with-sources`, so it can be re-embedded after "
-                  "import once that is supported."
+        # Nothing re-embeds a refused package, whatever its fidelity (#390).
+        remedy = (f"Use an instance running '{pkg_model}', or re-export from one."
                   if fidelity == "with-sources" else
                   "This package is `chunks-only`, so it cannot be re-embedded from "
                   "the original documents. Use an instance running "
                   f"'{pkg_model}', or re-export from one.")
+        actual = _probe_dimensions()
+        ours = (f"{actual} dimensions" if actual is not None else
+                "whose dimension count couldn't be read from Ollama")
         raise PackageError(
             "EMBEDDING_MISMATCH",
             f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
-            f"but this instance uses '{our_model}'. Vectors from a different model "
-            f"are meaningless here, not merely different, so the import is refused. "
-            + remedy,
+            f"but this instance uses '{our_model}' ({ours}). Vectors from a different "
+            f"model are meaningless here, not merely different, so the import is "
+            f"refused. " + remedy,
             {"package_model": pkg_model, "package_dimensions": pkg_dims,
-             "instance_model": our_model})
+             "instance_model": our_model, "instance_dimensions": actual})
 
     # Same model name but a different width means one side is not what it claims.
     if pkg_dims is not None:
@@ -7394,7 +7681,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
     embed_model = settings.embed_model
     llm_model = settings.llm_model
-    bundled = model_bundle.bundled_models(pkg)
+    # `name:tag`; a folder counts only for the tag it holds (#487).
+    bundled = model_bundle.bundled_models(pkg, manifest)
 
     for model, required in ((embed_model, True), (llm_model, False)):
         if not model_bundle.supports_name(model):
@@ -7447,7 +7735,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {name}`, then import again.",
                 {"model": name})
-        if name not in bundled:
+        if model_bundle.model_ref(model) not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -7462,13 +7750,22 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
-            model_bundle.install_model(pkg, model)
+            model_bundle.install_model(pkg, model, manifest)
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Could not install bundled model '{name}': {exc}",
                 {"model": name}) from exc
-        if not model_bundle.is_installed(model):
+        # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
+        reported = _ollama_reports(model)
+        if reported is None:
+            raise PackageError(
+                "IMPORT_FAILED",
+                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"confirm it is there. Check that the ollama service is running, "
+                f"then import again.",
+                {"model": name})
+        if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
@@ -7749,6 +8046,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
+        # One import per target, whatever its conflict mode, claimed before the
+        # existence check and held until the job ends (#391).
+        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
@@ -7765,7 +8065,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     {"collection": target})
 
             if exists and on_conflict == "rename":
-                target = _rename_target(original, id8)
+                target = _claim_target(job_id, _rename_target(original, id8), instead_of=target)
 
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
@@ -7859,15 +8159,17 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         shutil.rmtree(work, ignore_errors=True)
         collection_writes.end_job("import", job_id)
         with _lock:
-            _active.discard(filename)
+            _active.discard(_package_key(filename))
+        _release_targets(job_id)
 
 
 async def start_import_job(filename: str, on_conflict: str) -> str:
     job_id = str(uuid.uuid4())[:8]
+    key = _package_key(filename)
     with _lock:
-        if filename in _active:
+        if key in _active:
             raise RuntimeError(filename)
-        _active.add(filename)
+        _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -7890,7 +8192,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         })
     except BaseException:
         with _lock:
-            _active.discard(filename)
+            _active.discard(key)
         raise
     asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
     return job_id
@@ -7910,6 +8212,11 @@ The manifest names every blob the model needs, so bundling resolves blobs
 *through the manifest* rather than copying the blob store. The store here holds
 2.3 GB across 9 blobs for two models; a naive copy would sweep up unrelated
 weights, and on a machine with other models pulled it would be far worse.
+
+In a package each model gets its own folder, `models/<name>/<tag>/`, so two
+tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+files. Packages built before #487 used `models/<name>/`; such a folder is used
+only for the one tag the package manifest gives that name.
 
 Copying the files verbatim is deliberate. Offline there is no registry to pull
 from, and rebuilding a model through Ollama's HTTP API would mean reconstructing
@@ -7949,6 +8256,12 @@ def split_ref(model: str) -> tuple[str, str]:
     if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
         raise ValueError("Model name and tag must be simple path components")
     return name, tag
+
+
+def model_ref(model: str) -> str:
+    """'phi3.5' -> 'phi3.5:latest': the name and tag a package folder holds."""
+    name, tag = split_ref(model)
+    return f"{name}:{tag}"
 
 
 def manifest_path(model: str) -> Path:
@@ -8056,9 +8369,10 @@ def is_installed(model: str) -> bool:
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
-    """Files to place under `models/<model>/`, as (relative path, source).
+    """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
-    Returns them rather than copying so the caller can digest each file into the
+    Each tag has its own folder, so two tags of one name never overwrite each
+    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
     package manifest as it is written.
     """
     mp = manifest_path(model)
@@ -8066,22 +8380,66 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
         raise FileNotFoundError(f"Ollama has no manifest for '{model}' at {mp}")
     manifest = json.loads(mp.read_text())
 
-    name, _ = split_ref(model)
-    files: list[tuple[str, Path]] = [(f"models/{name}/manifest.json", mp)]
+    name, tag = split_ref(model)
+    files: list[tuple[str, Path]] = [(f"models/{name}/{tag}/manifest.json", mp)]
     for digest in _digests(manifest):
         blob = blob_path(digest)
         if not blob.is_file():
             raise FileNotFoundError(
                 f"Model '{model}' references blob {digest} which is not in the store")
-        files.append((f"models/{name}/blobs/{digest.replace(':', '-')}", blob))
+        files.append((f"models/{name}/{tag}/blobs/{digest.replace(':', '-')}", blob))
     return files
 
 
-def bundled_models(pkg: Path) -> list[str]:
+def _legacy_tag(name: str, package_manifest) -> str | None:
+    """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
+
+    Those packages didn't record it. The package manifest names the embedding
+    model and the LLM; when exactly one tag of `name` is among them, the folder
+    holds that tag. Two tags of one name shared the folder, the last copy
+    overwriting the first's manifest, so the folder can't be trusted for either.
+    """
+    if not isinstance(package_manifest, dict):
+        return None
+    tags = set()
+    for section in ("embedding", "llm"):
+        entry = package_manifest.get(section)
+        model = entry.get("model") if isinstance(entry, dict) else None
+        if isinstance(model, str) and supports_name(model):
+            model_name, tag = split_ref(model)
+            if model_name == name:
+                tags.add(tag)
+    return tags.pop() if len(tags) == 1 else None
+
+
+def bundled_source(pkg: Path, model: str, package_manifest=None) -> Path | None:
+    """The package folder holding exactly this name and tag, or None."""
+    name, tag = split_ref(model)
+    folder = _contained(pkg, "models", name, tag)
+    if _contained(folder, "manifest.json").is_file():
+        return folder
+    legacy = _contained(pkg, "models", name)
+    if _contained(legacy, "manifest.json").is_file() and _legacy_tag(name, package_manifest) == tag:
+        return legacy
+    return None
+
+
+def bundled_models(pkg: Path, package_manifest=None) -> list[str]:
+    """`name:tag` of each model the package bundles, by the rules of `bundled_source`."""
     d = pkg / "models"
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
+    refs = set()
+    for folder in d.iterdir():
+        if not folder.is_dir():
+            continue
+        if (folder / "manifest.json").is_file():
+            tag = _legacy_tag(folder.name, package_manifest)
+            if tag is not None:
+                refs.add(f"{folder.name}:{tag}")
+        refs.update(f"{folder.name}:{sub.name}" for sub in folder.iterdir()
+                    if sub.is_dir() and (sub / "manifest.json").is_file())
+    return sorted(refs)
 
 
 def _publish(path: Path, write, *, replace: bool = True) -> None:
@@ -8110,19 +8468,20 @@ def _publish(path: Path, write, *, replace: bool = True) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def install_model(pkg: Path, model: str) -> None:
+def install_model(pkg: Path, model: str, package_manifest=None) -> None:
     """Verify all referenced bytes before publishing the captured manifest.
 
     Existing content is checked and reused unchanged. A corrupt existing blob
     is refused rather than replacing shared content behind other model names.
     An interrupted install can leave valid unreferenced blobs, never a newly
-    published manifest whose bytes were not checked.
+    published manifest whose bytes were not checked. Only a folder holding this
+    exact name and tag is installed (#487); `package_manifest` tells which tag
+    a pre-#487 folder holds.
     """
-    name, _ = split_ref(model)
-    src = _contained(pkg, "models", name)
-    src_manifest = _contained(src, "manifest.json")
-    if not src_manifest.is_file():
+    src = bundled_source(pkg, model, package_manifest)
+    if src is None:
         raise FileNotFoundError(f"Package does not bundle '{model}'")
+    src_manifest = _contained(src, "manifest.json")
     manifest_bytes = src_manifest.read_bytes()
     digests = _digests(json.loads(manifest_bytes))
     destination = manifest_path(model)
@@ -8335,6 +8694,18 @@ def _nothing_to_rebuild(collection: str) -> PackageError:
         {"collection": collection})
 
 
+# An invalid retained source index (sources.load_index raises ValueError) is
+# refused before a job is created too, as the tuning options already report it
+# (#389). Re-embedding from stored chunks and re-indexing never read it.
+def _source_index_invalid(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCE_INDEX_INVALID",
+        f"Cannot re-chunk '{collection}': its retained source index is invalid. "
+        "Repair it before re-chunking; re-embedding from stored chunks and "
+        "re-indexing remain available.",
+        {"collection": collection})
+
+
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
@@ -8345,16 +8716,17 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
 
 
 def _refuse_nothing_to_rebuild(collection: str) -> None:
-    """The one re-chunk refusal made before a job is created (#328).
+    """The re-chunk refusals made before a job is created: an invalid
+    retained source index (#389) and nothing to rebuild (#328).
 
-    The other refusals, and an invalid index, are still reported by the job.
-    A Weaviate failure during the walk raises ServiceUnavailableError, which
-    the router answers with 503 rather than a bare 500 (#340).
+    The other refusals are still reported by the job. A Weaviate failure
+    during the walk raises ServiceUnavailableError, which the router answers
+    with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
-    except ValueError:
-        return
+    except ValueError as exc:
+        raise _source_index_invalid(collection) from exc
     if not documents:
         return
     try:
@@ -8718,8 +9090,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guards; the store removes the record.
     try:
-        # A re-chunk with nothing to rebuild is refused here, before any job
-        # exists (#328); the walk runs off the event loop too.
+        # A re-chunk with an invalid source index (#389) or nothing to rebuild
+        # (#328) is refused here, before any job exists; the walk runs off the
+        # event loop too.
         if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
             await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
         await _jobs.create(job_id, {
@@ -8933,6 +9306,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8942,6 +9317,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from models.schemas import (
     CollectionInfo,
+    CollectionName,
     CollectionsResponse,
     CreateCollectionRequest,
 )
@@ -8963,20 +9339,76 @@ def _registry_path() -> Path:
     return _REGISTRY_FILE
 
 
+class _RegistryUnreadable(Exception):
+    """The registry file exists but can't be read as a JSON object (#388)."""
+
+
 def _load_registry() -> dict:
+    """The registry, or {} when the file doesn't exist yet. A file that exists but
+    can't be read, isn't JSON or isn't an object raises _RegistryUnreadable, so it
+    is never taken for an empty registry and overwritten by the next save (#388)."""
     p = _registry_path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return {}
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _RegistryUnreadable(f"{p} can't be read: {exc}") from exc
+    try:
+        reg = json.loads(text)
+    except ValueError as exc:
+        raise _RegistryUnreadable(f"{p} isn't valid JSON: {exc}") from exc
+    if not isinstance(reg, dict):
+        raise _RegistryUnreadable(f"{p} isn't a JSON object")
+    return reg
+
+
+def _sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _save_registry(reg: dict) -> None:
+    """Publish the whole registry atomically (#388): a uniquely named temporary file
+    in the same folder, fsynced, then os.replace, then the folder fsynced (#445). A
+    failure before the replace leaves the old file whole and no temporary file, and
+    raises; a failed folder fsync raises with the new file in place. Callers hold
+    _registry_lock."""
     p = _registry_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(reg, indent=2))
+    payload = json.dumps(reg, indent=2)
+    # mkstemp creates the file 0600, like the job and session files.
+    fd, tmp = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _sync_folder(p.parent)
+
+
+def remove_interrupted_saves() -> None:
+    """Remove the temporary files of registry saves a crash interrupted (#445).
+    The registry itself is whole: a save replaces it only once its temporary file
+    is complete. Called once at startup, before any request, so no save is in
+    progress. A leftover that can't be removed is logged and kept."""
+    p = _registry_path()
+    for leftover in p.parent.glob(f".{p.name}.*.tmp"):
+        try:
+            leftover.unlink()
+        except OSError:
+            _log.exception("Could not remove interrupted registry write %s", leftover)
 
 
 @router.get("", response_model=CollectionsResponse)
@@ -8989,7 +9421,13 @@ async def list_collections():
         return api_error(503, "SERVICE_UNAVAILABLE",
                          "Cannot list the collections: Weaviate could not be read. "
                          "Try again when Weaviate is available.")
-    registry = await asyncio.to_thread(_load_registry)
+    try:
+        registry = await asyncio.to_thread(_load_registry)
+    except _RegistryUnreadable as exc:
+        # Listed without created_at; the file is left for someone to fix (#388).
+        _log.warning("The collection registry can't be read, so created_at is null "
+                     "for every collection: %s", exc)
+        registry = {}
     items = [
         CollectionInfo(
             name=c["name"],
@@ -9028,9 +9466,16 @@ async def create_collection(body: CreateCollectionRequest):
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        registry[body.name] = datetime.now(timezone.utc).isoformat()
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten with this one entry (#388).
+            _log.exception("Collection %r was created, but its created_at was not recorded: "
+                           "the collection registry can't be read and is left unchanged",
+                           body.name)
+        else:
+            registry[body.name] = datetime.now(timezone.utc).isoformat()
+            await asyncio.to_thread(_save_registry, registry)
 
     return JSONResponse(status_code=201, content={"name": body.name, "status": "created"})
 
@@ -9057,7 +9502,7 @@ def _busy_error(name: str, jobs: list[tuple[str, str]]):
 
 
 @router.delete("/{name}", status_code=200)
-async def delete_collection(name: str, confirm: str | None = None):
+async def delete_collection(name: CollectionName, confirm: str | None = None):
     # Checked first, before the collection is even looked up, and as text, so a
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":
@@ -9084,10 +9529,17 @@ async def delete_collection(name: str, confirm: str | None = None):
         return api_error(500, "DELETE_FAILED", "Failed to delete collection.")
 
     async with _registry_lock:
-        registry = await asyncio.to_thread(_load_registry)
-        for spelling in aliases(name):
-            registry.pop(spelling, None)
-        await asyncio.to_thread(_save_registry, registry)
+        try:
+            registry = await asyncio.to_thread(_load_registry)
+        except _RegistryUnreadable:
+            # Kept as it is, never overwritten without its other entries (#388).
+            _log.exception("Collection %r was deleted, but its created_at was not removed: "
+                           "the collection registry can't be read and is left unchanged",
+                           name)
+        else:
+            for spelling in aliases(name):
+                registry.pop(spelling, None)
+            await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
 ```
@@ -9105,18 +9557,19 @@ from fastapi import APIRouter, Form, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
+                            IngestUploadResponse, JobStatusResponse)
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
-from services.collection_writes import CollectionDeletingError
+from services.collection_writes import CollectionDeletingError, canonical
 from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
-    collection: str
+    collection: CollectionName
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -9131,6 +9584,9 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    # A form field's default is not validated through CollectionName, so the
+    # stored-name rule is applied here (#372).
+    collection = canonical(collection)
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files)
@@ -9197,7 +9653,7 @@ async def job_status(job_id: str):
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: str):
+async def get_ingest_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 
@@ -9228,6 +9684,22 @@ router = APIRouter(prefix="/query")
 _log = logging.getLogger(__name__)
 
 
+def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
+    """The 503 for a dependency failure, naming the embedder too when there is one (#411)."""
+    service, embedder = exc.service, exc.embedder
+    if embedder is None:
+        _log.exception("Query on %r failed: %s did not answer", collection, service)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error. Try again when {service} is available.")
+    else:
+        _log.exception("Query on %r failed: %s (or %s, embedding the question for it) "
+                       "did not answer", collection, service, embedder)
+        message = (f"The question was not answered: {service} could not be reached, "
+                   f"timed out or returned an error, or {embedder} could not embed the "
+                   f"question for it. Try again when {service} and {embedder} are available.")
+    return api_error(503, "SERVICE_UNAVAILABLE", message, detail={"collection": collection})
+
+
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
     try:
@@ -9251,12 +9723,7 @@ async def run_query(body: QueryRequest):
         )
     except rag_pipeline.ServiceUnavailable as exc:
         # The cause is logged, not sent (#373).
-        _log.exception("Query on %r failed: %s did not answer", body.collection, exc.service)
-        return api_error(503, "SERVICE_UNAVAILABLE",
-                         f"The question was not answered: {exc.service} could not be reached, "
-                         f"timed out or returned an error. Try again when {exc.service} "
-                         f"is available.",
-                         detail={"collection": body.collection})
+        return _unavailable(body.collection, exc)
 
     await metrics.record(
         collection=body.collection,
@@ -9283,14 +9750,14 @@ import asyncio
 
 from fastapi import APIRouter
 
-from models.schemas import RetrievalConfigResponse, SaveRetrievalConfigBody
+from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
 from services import retrieval_config
 
 router = APIRouter(prefix="/retrieval")
 
 
 @router.get("/config/{collection}", response_model=RetrievalConfigResponse)
-async def get_retrieval_config(collection: str):
+async def get_retrieval_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(retrieval_config.resolve, collection)
     return RetrievalConfigResponse(is_default=is_default, **cfg)
 
@@ -9402,10 +9869,11 @@ def _list_packages_sync() -> list[dict]:
     out = []
     for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
         try:
-            manifest = packager.read_manifest(p)
+            fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:
-            # A file that is not a readable package still belongs in the listing;
-            # import will report precisely why it cannot be used.
+            # A file that is not a readable package, or whose manifest has a
+            # wrongly typed field (#451), still belongs in the listing; import
+            # will report precisely why it cannot be used.
             out.append({"filename": p.name, "size_bytes": p.stat().st_size,
                         "collection": None, "chunk_count": None,
                         "fidelity": None, "created_at": None, "readable": False})
@@ -9413,10 +9881,7 @@ def _list_packages_sync() -> list[dict]:
         out.append({
             "filename": p.name,
             "size_bytes": p.stat().st_size,
-            "collection": manifest.get("collection", {}).get("name"),
-            "chunk_count": manifest.get("collection", {}).get("chunk_count"),
-            "fidelity": manifest.get("fidelity"),
-            "created_at": manifest.get("created_at"),
+            **fields,
             "readable": True,
         })
     return out
@@ -9445,6 +9910,7 @@ import logging
 from fastapi import APIRouter
 
 from models.schemas import (
+    CollectionName,
     ReembedRequest,
     ReindexRequest,
     RechunkRequest,
@@ -9538,7 +10004,7 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: str):
+async def tune_options(collection: CollectionName):
     """What this collection can be tuned with, given its fidelity."""
     try:
         exists = await wc.collection_exists(collection)
@@ -9729,7 +10195,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from models.schemas import MetricsResponse
+from models.schemas import CollectionName, MetricsResponse
 from services import metrics
 
 router = APIRouter(prefix="/metrics")
@@ -9737,7 +10203,7 @@ router = APIRouter(prefix="/metrics")
 
 @router.get("/latency", response_model=MetricsResponse)
 async def latency_summary(
-    collection: str | None = Query(default=None),
+    collection: CollectionName | None = Query(default=None),
     retrieval_mode: str | None = Query(default=None),
     history_limit: int = Query(default=100, ge=0, le=500),
 ):
@@ -9792,6 +10258,11 @@ def _metrics_path() -> Path:
         p.mkdir(parents=True, exist_ok=True)
         _METRICS_FILE = p / "metrics.jsonl"
     return _METRICS_FILE
+
+
+def _metrics_file_name() -> Path:
+    """The metrics file's path for log messages, known even when creating its folder failed."""
+    return _METRICS_FILE or Path(settings.upload_dir) / "metrics.jsonl"
 
 
 def _read_tail(path: Path) -> tuple[list[str], bool]:
@@ -9855,7 +10326,7 @@ def load_from_disk() -> None:
                 return
             lines, whole = _read_tail(p)
         except Exception:                                 # noqa: BLE001
-            _log.exception("Could not load the query metrics from %s", _METRICS_FILE)
+            _log.exception("Could not load the query metrics from %s", _metrics_file_name())
             return
         for line in lines:
             _ring.append(json.loads(line))
@@ -9910,7 +10381,8 @@ async def record(
         await asyncio.to_thread(_append_sync, json.dumps(entry))
     except Exception:                                     # noqa: BLE001
         _log.warning("Could not write the query metrics record for %r to %s; "
-                     "the answer is still returned", collection, _METRICS_FILE, exc_info=True)
+                     "the answer is still returned", collection, _metrics_file_name(),
+                     exc_info=True)
 
 
 def _percentile(data: list[float], p: int) -> float:
@@ -10111,7 +10583,9 @@ curl -X POST http://localhost:8080/api/import \
 
 `on_conflict` is required and has no default. It is one of `abort` (fail if the
 name is taken), `rename` (import under a free name) or `replace` (overwrite,
-but only after this package has been proven to import cleanly).
+but only after this package has been proven to import cleanly; a failure while the
+final copy is being built can leave the name unavailable, with the data kept in a
+recovery collection named in the error).
 
 ## The filename is a label, not an input
 
@@ -10394,7 +10868,7 @@ choice can delete a collection.
 |---|---|
 | `abort` | Fail if a collection of that name already exists. |
 | `rename` | Import alongside it as `<name>_imported_<id8>`. |
-| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact. |
+| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`). |
 
 Replacing a collection keeps its gold-standard sessions and marks them orphaned,
 and the import result reports how many. They are never deleted silently.
@@ -10411,8 +10885,10 @@ and the import result reports how many. They are never deleted silently.
 
 `GET /api/tune/<collection>` reports which of these a given collection can do.
 
-Every rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failed tune leaves the collection as it was.
+Every rebuild is staged into a temporary collection and verified before the
+original is touched, so a failure before cutover leaves the collection as it was.
+A failure during the final replacement can leave its name missing or partial, with
+the data kept in a recovery collection named in the error (`recovered_as`).
 
 **Gold-standard sessions are flagged, never deleted or remapped.** Re-chunking or
 re-embedding changes which chunks exist, so evaluation pairs built against the
@@ -10461,6 +10937,11 @@ async def lifespan(app: FastAPI):
         # unowned marker-like names must survive startup.
         log = logging.getLogger(__name__)
         try:
+            from routers import collections as collection_routes
+            await asyncio.to_thread(collection_routes.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted collection registry writes failed")
+        try:
             abandoned = await wc.sweep_staging()
             if abandoned:
                 log.warning("Removed %d staging collection(s) left by a previous run: %s. "
@@ -10481,6 +10962,14 @@ async def lifespan(app: FastAPI):
                             len(stale_dirs), ", ".join(stale_dirs))
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted imports failed")
+        try:
+            from services import packager
+            leftovers = await asyncio.to_thread(packager.sweep_build_leftovers)
+            if leftovers:
+                log.warning("Removed %d leftover(s) of an interrupted export from the "
+                            "exports folder: %s", len(leftovers), ", ".join(leftovers))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted exports failed")
         # Job records survive a restart (#23). After the sweeps, so a job interrupted
         # mid-import is reported failed and its half-built collection already swept.
         # No worker from the previous process is alive, so any job still queued or
@@ -11088,8 +11577,9 @@ function isHealthResult(data: any): data is HealthResult {
 
 // GET /health answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
-// service failed and could not show it red (#375). This call accepts a 503
-// that carries that body; every other error is thrown as request() would.
+// service failed and could not show it red (#375). This call accepts a 200 or
+// a 503 that carries that body; every other error is thrown as request() would,
+// and a 200 without it is unreadable (#415).
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
@@ -11105,13 +11595,15 @@ async function getHealthResult(): Promise<HealthResult> {
   if (!res.ok) {
     throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
   }
-  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
-  return data as HealthResult
+  // Another JSON shape, text or an empty body: the page would throw while
+  // rendering the cards, or show nothing at all (#415).
+  throw new Error('The server sent a response the UI could not read.')
 }
 
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
-  createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
+  // Answers with the name as stored, first letter capitalised (#372).
+  createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
@@ -11183,7 +11675,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -11227,7 +11719,7 @@ export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface ImportBody { filename: string; on_conflict: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
@@ -11346,7 +11838,7 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
           <div key={i} className="text-xs bg-gray-50 border rounded p-2">
             <div className="flex justify-between mb-1">
               <span className="font-medium">{c.source_file}</span>
-              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score.toFixed(3)}</span>
+              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score === null ? 'n/a' : c.score.toFixed(3)}</span>
             </div>
             <p className="text-gray-700 italic">{c.excerpt}</p>
           </div>
@@ -11563,12 +12055,15 @@ export default function QAPage() {
   const [showCitations, setShowCitations] = useState(false)
   const [latency, setLatency] = useState<{ ret: number; llm: number } | null>(null)
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
 
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
     // Runs once; a collection already chosen on the Retrieval page is kept.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -11620,6 +12115,7 @@ export default function QAPage() {
           </select>
         )}
       </div>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-3">{listError}</p>}
       <textarea
         value={question}
         onChange={e => setQuestion(e.target.value)}
@@ -11683,6 +12179,9 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The status the upload was accepted with, shown with the job ID until the
+  // first poll answers, so the page responds at once rather than 3 s later (#394).
+  const [queuedStatus, setQueuedStatus] = useState('')
   const [error, setError] = useState('')
   // A failed status poll, shown instead of ignored (#290). Polling carries on,
   // and the next successful poll clears it.
@@ -11690,15 +12189,33 @@ export default function ImportPage() {
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
+  // A refused create is shown inside the "+ New" modal, where the page-level
+  // line was hidden behind its overlay, and a failed list is shown, not
+  // swallowed (#379).
+  const [newColError, setNewColError] = useState('')
+  const [listError, setListError] = useState('')
 
   const showOverlap = strategy !== 'semantic' && strategy !== 'context_aware'
   const showSimilarity = strategy === 'semantic' && role === 'engineer'
 
-  useEffect(() => {
-    api.getCollections().then(r => {
+  // Resolves to the list, or null when it could not be read; a failure keeps
+  // the options already shown.
+  async function loadCollections(): Promise<CollectionInfo[] | null> {
+    try {
+      const r = await api.getCollections()
       setCollections(r.collections)
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      setListError('')
+      return r.collections
+    } catch (e: unknown) {
+      setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadCollections().then(list => {
+      if (list && list.length > 0) setCollection(list[0].name)
+    })
   }, [])
 
   useEffect(() => {
@@ -11723,27 +12240,48 @@ export default function ImportPage() {
 
   async function createCollection() {
     if (!newColName.trim()) return
+    // The name as the API stored it, which is the one the list shows: a typed
+    // lowercase first letter matched no option (#372).
+    let created: string
     try {
-      await api.createCollection({
+      created = (await api.createCollection({
         name: newColName,
         index_type: newColIndexType,
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
-      })
-      const r = await api.getCollections()
-      setCollections(r.collections)
-      setCollection(newColName)
-      setShowNewColModal(false)
-      setNewColName('')
+      })).name
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setNewColError(e instanceof Error ? e.message : String(e))
+      return
     }
+    // The create succeeded, so a failed reload is a list error, not a refusal.
+    setShowNewColModal(false)
+    setNewColName('')
+    setNewColError('')
+    await loadCollections()
+    setCollection(created)
+  }
+
+  function openNewCol() {
+    setNewColError('')
+    setShowNewColModal(true)
+  }
+
+  function closeNewCol() {
+    setShowNewColModal(false)
+    setNewColError('')
   }
 
   async function startIngest() {
-    if (!files.length || !collection) return
+    if (!files.length) return
     setError('')
     setPollError('')
+    // With no collection selected (none exist, or the list failed to load),
+    // say so instead of doing nothing (#394).
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -11764,6 +12302,7 @@ export default function ImportPage() {
     try {
       const res = await api.uploadFiles(form)
       setJobId(res.job_id)
+      setQueuedStatus(res.status)
       setJob(null)
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
@@ -11803,8 +12342,9 @@ export default function ImportPage() {
           <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
             {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
           </select>
-          <button onClick={() => setShowNewColModal(true)} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
+          <button onClick={openNewCol} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-2">{listError}</p>}
       </div>
 
       <div className="mb-2">
@@ -11842,6 +12382,13 @@ export default function ImportPage() {
         Start Ingest
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {jobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{jobId}</span></p>}
+      {jobId && !job && (
+        <div className="mt-4 p-4 border rounded bg-gray-50 flex justify-between text-sm">
+          <span>Waiting for the first progress update</span>
+          <span className="text-blue-600">{queuedStatus}</span>
+        </div>
+      )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
 
@@ -11854,8 +12401,9 @@ export default function ImportPage() {
               <option value="hnsw">HNSW (Approximate)</option>
               <option value="flat">Flat (Exact KNN)</option>
             </select>
+            {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowNewColModal(false)} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+              <button onClick={closeNewCol} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
               <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -12209,6 +12757,41 @@ export default function RetrievalPage() {
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, Session, GoldPair } from '../api/client'
 
+// The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
+// UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
+// 0-9 and '_' dropped, and the collection part shortened to keep 128 characters.
+function defaultExportName(collection: string, now = new Date()): string {
+  const iso = now.toISOString()
+  const ts = `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}_${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}`
+  const safe = collection.replace(/ /g, '_').replace(/[^A-Za-z0-9_]/g, '')
+  const suffix = `_${ts}.json`
+  return safe.slice(0, 128 - suffix.length) + suffix
+}
+
+type Outcome = { tone: 'ok' | 'warn' | 'error'; lines: string[]; reasons: string[] }
+
+// What a settled session ended as (#380): its status, the pairs that failed and
+// why. null while it is still generating.
+function outcomeOf(s: Session): Outcome | null {
+  if (s.status === 'generating') return null
+  const failed = s.pairs_failed ?? 0
+  const failedLine = `${failed} of ${s.pairs_total} pairs failed.`
+  const counts = new Map<string, number>()
+  for (const reason of s.errors ?? []) counts.set(reason, (counts.get(reason) ?? 0) + 1)
+  const all = [...counts].map(([reason, n]) => n > 1 ? `${reason} (x${n})` : reason)
+  const reasons = all.slice(0, 5)
+  if (all.length > 5) reasons.push(`and ${all.length - 5} more reasons`)
+  if (s.status === 'completed') {
+    if (s.pairs_total === 0) return { tone: 'warn', lines: ['No pairs were generated: the collection has no chunks.'], reasons }
+    const lines = [`Generation completed: ${s.pairs_completed} of ${s.pairs_total} pairs generated.`]
+    if (failed > 0) lines.push(`${failed} pairs failed and are missing from the review list.`)
+    return { tone: failed > 0 ? 'warn' : 'ok', lines, reasons }
+  }
+  if (s.status === 'failed') return { tone: 'error', lines: ['Generation failed.', ...(failed > 0 ? [failedLine] : [])], reasons }
+  if (s.status === 'cancelled') return { tone: 'warn', lines: ['Generation was cancelled.', ...(failed > 0 ? [failedLine] : [])], reasons }
+  return { tone: 'warn', lines: [`Generation ended with status ${s.status}.`], reasons }
+}
+
 export default function GoldStandardPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -12222,19 +12805,29 @@ export default function GoldStandardPage() {
   const exportPendingRef = useRef(false)
   const activeSessionRef = useRef('')
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
   const [editingPair, setEditingPair] = useState<GoldPair | null>(null)
   const [editQuestion, setEditQuestion] = useState('')
   const [editAnswer, setEditAnswer] = useState('')
   const [editGroundTruth, setEditGroundTruth] = useState('')
+  // A poll that failed stops polling and says so (#380).
+  const [pollError, setPollError] = useState('')
+  // Pairs whose regenerate request is running, as `sessionId/pairId` (#380).
+  const [regenerating, setRegenerating] = useState<string[]>([])
+  const regeneratingRef = useRef(new Set<string>())
+  // A failed edit keeps the modal open and says why (#380).
+  const [editError, setEditError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }, [])
 
   useEffect(() => {
@@ -12248,7 +12841,11 @@ export default function GoldStandardPage() {
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
-      } catch { /* ignore */ }
+      } catch (e: unknown) {
+        if (!active || activeSessionRef.current !== sessionId) return
+        clearInterval(pollRef.current!)
+        setPollError(`Could not read the generation's progress: ${e instanceof Error ? e.message : String(e)}. Polling stopped; use Load / refresh session to check again.`)
+      }
     }, 2000)
     return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
@@ -12262,20 +12859,22 @@ export default function GoldStandardPage() {
     if (!id || exportPendingRef.current) return
     activeSessionRef.current = ''
     setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
-    setError(''); setSaveResult(''); setLoading(true)
+    setError(''); setPollError(''); setSaveResult(''); setLoading(true)
     try {
       const loaded = await api.getSession(id)
       activeSessionRef.current = loaded.session_id
       setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
-      setFilename('')
+      setFilename(defaultExportName(loaded.collection ?? 'export'))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { setLoading(false) }
   }
 
   async function generate() {
+    if (!sampleSizeValid || loading || running) return
     if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
+    setPollError('')
     setLoading(true)
     setSaveResult('')
     try {
@@ -12284,8 +12883,7 @@ export default function GoldStandardPage() {
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
       setSession(null)
-      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
-      setFilename(`${collection}_${ts}.json`)
+      setFilename(defaultExportName(collection))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -12293,12 +12891,14 @@ export default function GoldStandardPage() {
     }
   }
 
-  async function patchPair(pairId: string, status: string, updates?: { question?: string; answer?: string; ground_truth?: string }) {
+  function applyPair(pairId: string, updated: GoldPair) {
+    setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+  }
+
+  async function patchPair(pairId: string, status: string) {
     if (!sessionId) return
-    const body = { status, ...updates }
     try {
-      const updated = await api.patchPair(sessionId, pairId, body)
-      setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+      applyPair(pairId, await api.patchPair(sessionId, pairId, { status }))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -12306,11 +12906,15 @@ export default function GoldStandardPage() {
 
   async function regenerate(pairId: string) {
     if (!sessionId) return
+    const key = `${sessionId}/${pairId}`
+    if (regeneratingRef.current.has(key)) return
+    regeneratingRef.current.add(key); setRegenerating(Array.from(regeneratingRef.current))
     try {
-      const updated = await api.regeneratePair({ session_id: sessionId, pair_id: pairId })
-      setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+      applyPair(pairId, await api.regeneratePair({ session_id: sessionId, pair_id: pairId }))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      regeneratingRef.current.delete(key); setRegenerating(Array.from(regeneratingRef.current))
     }
   }
 
@@ -12320,7 +12924,8 @@ export default function GoldStandardPage() {
     try {
       const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
       setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
-      window.open(api.downloadUrl(res.filename), '_blank')
+      // downloadUrl puts the name into the path as given, so encode it here (#393).
+      window.open(api.downloadUrl(encodeURIComponent(res.filename)), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { exportPendingRef.current = false; setExportPending(false) }
@@ -12331,23 +12936,35 @@ export default function GoldStandardPage() {
     setEditQuestion(pair.question)
     setEditAnswer(pair.answer)
     setEditGroundTruth(pair.ground_truth)
+    setEditError('')
   }
 
+  // Only the fields that changed are sent; a refused edit keeps the modal open
+  // with what was typed (#380).
   async function submitEdit() {
-    if (!editingPair) return
-    await patchPair(editingPair.pair_id, 'edited', {
-      question: editQuestion,
-      answer: editAnswer,
-      ground_truth: editGroundTruth,
-    })
-    setEditingPair(null)
+    if (!editingPair || !sessionId) return
+    const updates: { question?: string; answer?: string; ground_truth?: string } = {}
+    if (editQuestion !== editingPair.question) updates.question = editQuestion
+    if (editAnswer !== editingPair.answer) updates.answer = editAnswer
+    if (editGroundTruth !== editingPair.ground_truth) updates.ground_truth = editGroundTruth
+    try {
+      applyPair(editingPair.pair_id, await api.patchPair(sessionId, editingPair.pair_id, { status: 'edited', ...updates }))
+      setEditingPair(null)
+    } catch (e: unknown) {
+      setEditError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const approved = session?.pairs.filter(p => p.status === 'approved').length ?? 0
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
+  // An empty field reads as 0, so it is refused too (#393).
+  const sampleSizeValid = Number.isInteger(sampleSize) && sampleSize >= 1 && sampleSize <= 100
   const historical = Boolean(session?.stale || session?.orphaned)
+  // A start or generation is running until the session settles, unless polling stopped on an error (#380).
+  const running = !pollError && Boolean(sessionId) && (session === null || session.status === 'generating')
+  const outcome = session ? outcomeOf(session) : null
   const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
@@ -12364,20 +12981,33 @@ export default function GoldStandardPage() {
             </select>
           </div>
           <div>
-            <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
-            <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
+            <label htmlFor="sample-size" className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
+            <input id="sample-size" type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || running || exportPending || !sampleSizeValid} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
+        {!sampleSizeValid && <p role="alert" className="text-red-600 text-sm mt-3">Sample size must be a whole number from 1 to 100.</p>}
+        {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
-        {session && session.status === 'generating' && (
+        {session && session.status === 'generating' && !pollError && (
           <div className="mt-3">
             <p className="text-sm text-blue-600">Generating… {session.pairs_attempted ?? session.pairs_completed}/{session.pairs_total} pairs</p>
             <div className="w-full bg-gray-200 rounded h-2 mt-1">
               <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${session.pairs_total > 0 ? ((session.pairs_attempted ?? session.pairs_completed) / session.pairs_total) * 100 : 0}%` }} />
             </div>
+          </div>
+        )}
+        {pollError && <p role="alert" className="text-red-600 text-sm mt-3">{pollError}</p>}
+        {outcome && (
+          <div role={outcome.tone === 'ok' ? 'status' : 'alert'} className={`mt-3 border rounded p-3 text-sm ${outcome.tone === 'ok' ? 'border-green-300 bg-green-50 text-green-800' : outcome.tone === 'warn' ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-red-300 bg-red-50 text-red-800'}`}>
+            {outcome.lines.map(line => <p key={line}>{line}</p>)}
+            {outcome.reasons.length > 0 && (
+              <ul className="list-disc ml-5 mt-1 text-xs">
+                {outcome.reasons.map(reason => <li key={reason}>{reason}</li>)}
+              </ul>
+            )}
           </div>
         )}
       </div>
@@ -12423,7 +13053,7 @@ export default function GoldStandardPage() {
                   <button onClick={e => { e.preventDefault(); patchPair(pair.pair_id, 'approved') }} className="text-green-600 hover:text-green-800 text-lg leading-none" title="Approve">✓</button>
                   <button onClick={e => { e.preventDefault(); openEdit(pair) }} className="text-blue-500 hover:text-blue-700 text-sm" title="Edit">✎</button>
                   <button onClick={e => { e.preventDefault(); patchPair(pair.pair_id, 'rejected') }} className="text-red-500 hover:text-red-700 text-sm" title="Reject">✕</button>
-                  <button onClick={e => { e.preventDefault(); regenerate(pair.pair_id) }} className="text-gray-400 hover:text-gray-600 text-sm" title="Regenerate">↺</button>
+                  <button onClick={e => { e.preventDefault(); regenerate(pair.pair_id) }} disabled={regenerating.includes(`${sessionId}/${pair.pair_id}`)} className="text-gray-400 hover:text-gray-600 text-sm disabled:opacity-50" title={regenerating.includes(`${sessionId}/${pair.pair_id}`) ? 'Regenerating...' : 'Regenerate'}>↺</button>
                 </summary>
                 <div className="px-3 pb-3 space-y-2 text-xs text-gray-600">
                   <div><strong>Answer:</strong> {pair.answer}</div>
@@ -12464,6 +13094,7 @@ export default function GoldStandardPage() {
             <textarea value={editAnswer} onChange={e => setEditAnswer(e.target.value)} rows={2} className="w-full border rounded px-2 py-1 text-sm mb-3" />
             <label className="block text-xs text-gray-600 mb-1">Ground Truth</label>
             <textarea value={editGroundTruth} onChange={e => setEditGroundTruth(e.target.value)} rows={2} className="w-full border rounded px-2 py-1 text-sm mb-4" />
+            {editError && <p role="alert" className="text-red-600 text-sm mb-3">{editError}</p>}
             <div className="flex justify-end gap-2">
               <button onClick={() => setEditingPair(null)} className="text-sm text-gray-500">Cancel</button>
               <button onClick={submitEdit} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Save</button>
@@ -12484,7 +13115,10 @@ import { api, CollectionInfo } from '../api/client'
 
 export default function CollectionsPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [error, setError] = useState('')
+  // A refused create is shown inside the New Collection modal, and a failed
+  // list on the page; both were hidden or swallowed before (#379).
+  const [createError, setCreateError] = useState('')
+  const [listError, setListError] = useState('')
   const [showModal, setShowModal] = useState(false)
   const [name, setName] = useState('')
   const [indexType, setIndexType] = useState('hnsw')
@@ -12499,7 +13133,10 @@ export default function CollectionsPage() {
   const [deleteError, setDeleteError] = useState('')
 
   async function load() {
-    api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
+    api.getCollections().then(r => {
+      setCollections(r.collections)
+      setListError('')
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }
 
   useEffect(() => { load() }, [])
@@ -12509,10 +13146,21 @@ export default function CollectionsPage() {
       await api.createCollection({ name, index_type: indexType, distance_metric: distanceMetric, hnsw_config: { efConstruction, maxConnections, ef } })
       setShowModal(false)
       setName('')
+      setCreateError('')
       load()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setCreateError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  function openCreate() {
+    setCreateError('')
+    setShowModal(true)
+  }
+
+  function closeCreate() {
+    setShowModal(false)
+    setCreateError('')
   }
 
   async function deleteCollection() {
@@ -12538,9 +13186,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={() => setShowModal(true)} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
       </div>
-      {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
         <thead>
           <tr className="border-b text-left text-gray-500">
@@ -12606,8 +13254,9 @@ export default function CollectionsPage() {
                 </div>
               </div>
             )}
+            {createError && <p role="alert" className="text-red-600 text-sm mb-4">{createError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowModal(false)} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={closeCreate} className="text-sm text-gray-500">Cancel</button>
               <button onClick={create} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -12653,95 +13302,169 @@ function sizeLabel(bytes: number | null): string {
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
   { id: 'rename', label: 'Rename', description: 'Import alongside the existing one, under a new name the API reports back.' },
-  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
+  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly. A failure while the final copy is built can leave the name missing; the data is then kept in a recovery collection the error names.' },
 ]
+
+// Both halves poll their job every 2 s. A failed poll is shown and retried;
+// after POLL_ATTEMPTS failures in a row (about a minute, long enough for an API
+// restart) the page stops watching that job and enables its button again, so
+// one transient 502 can no longer leave it stuck until a reload (#382).
+const POLL_MS = 2000
+const POLL_ATTEMPTS = 30
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
 
 export default function TransferPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
+  const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
+  const [exportWatching, setExportWatching] = useState(false)
+  const [exportPollError, setExportPollError] = useState('')
 
   const [packages, setPackages] = useState<PackageSummary[]>([])
+  const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
+  const [importWatching, setImportWatching] = useState(false)
+  const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching.
+  // does not leave a timer running against a job nobody is watching. The job
+  // id being polled is kept too: a poll that answers after the page unmounted,
+  // or after it stopped watching that job, schedules nothing and changes nothing.
+  const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
+  const exportPoll = useRef<string | null>(null)
+  const importPoll = useRef<string | null>(null)
 
   const loadPackages = useCallback(() => {
-    api.getPackages().then(r => setPackages(r.packages)).catch(() => {})
+    api.getPackages().then(r => {
+      setPackages(r.packages)
+      setPackagesError('')
+    }, (e: unknown) => setPackagesError(`Could not list the packages in ./exports: ${message(e)}`))
   }, [])
 
   useEffect(() => {
+    alive.current = true
     api.getCollections().then(r => {
       setCollections(r.collections)
       if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch(() => {})
     loadPackages()
     return () => {
+      alive.current = false
+      exportPoll.current = null
+      importPoll.current = null
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
   }, [loadPackages])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
-  // than discovered afterwards in the manifest.
+  // than discovered afterwards in the manifest. A lookup that fails says so
+  // instead of hiding the line, and an answer for a collection that is no
+  // longer selected is ignored.
   useEffect(() => {
-    if (!collection) { setTune(null); return }
-    api.getTuneOptions(collection).then(setTune).catch(() => setTune(null))
+    setTune(null); setTuneError('')
+    if (!collection) return
+    let current = true
+    api.getTuneOptions(collection).then(t => {
+      if (current) setTune(t)
+    }, (e: unknown) => {
+      if (current) setTuneError(message(e))
+    })
+    return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string) {
+  function pollExport(jobId: string, failures = 0) {
     api.getExportJob(jobId).then(job => {
+      if (exportPoll.current !== jobId) return
       setExportJob(job)
+      setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
+        exportPoll.current = null
+        setExportWatching(false)
         loadPackages()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), 2000)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
-    }).catch((e: unknown) => setExportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (exportPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        exportPoll.current = null
+        setExportWatching(false)
+        setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
+      } else {
+        setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
-  function pollImport(jobId: string) {
+  function pollImport(jobId: string, failures = 0) {
     api.getImportJob(jobId).then(job => {
+      if (importPoll.current !== jobId) return
       setImportJob(job)
+      setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), 2000)
-      } else if (job.status === 'completed') {
+        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        return
+      }
+      importPoll.current = null
+      setImportWatching(false)
+      if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
-    }).catch((e: unknown) => setImportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (importPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        importPoll.current = null
+        setImportWatching(false)
+        setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
+      } else {
+        setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
   async function startExport() {
-    setExportError(''); setExportJob(null)
+    setExportError(''); setExportPollError(''); setExportJob(null)
     try {
       const r = await api.startExport({ collection, include_models: includeModels })
+      if (!alive.current) return
+      exportPoll.current = r.job_id
+      setExportWatching(true)
       pollExport(r.job_id)
     } catch (e: unknown) {
-      setExportError(e instanceof Error ? e.message : String(e))
+      setExportError(message(e))
     }
   }
 
   async function startImport() {
-    setImportError(''); setImportJob(null)
+    setImportError(''); setImportPollError(''); setImportJob(null)
     try {
       const r = await api.startImport({ filename, on_conflict: onConflict })
+      if (!alive.current) return
+      importPoll.current = r.job_id
+      setImportWatching(true)
       pollImport(r.job_id)
     } catch (e: unknown) {
-      setImportError(e instanceof Error ? e.message : String(e))
+      setImportError(message(e))
     }
   }
 
-  const exportBusy = exportJob !== null && exportJob.status !== 'completed' && exportJob.status !== 'failed'
-  const importBusy = importJob !== null && importJob.status !== 'completed' && importJob.status !== 'failed'
+  const exportBusy = exportWatching
+  const importBusy = importWatching
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -12771,7 +13494,7 @@ export default function TransferPage() {
           ))}
         </select>
 
-        {tune && (
+        {tune ? (
           <p className="text-xs mb-3">
             <span className={tune.fidelity === 'with-sources' ? 'text-green-700' : 'text-amber-700'}>
               Fidelity: <strong>{tune.fidelity}</strong>
@@ -12781,7 +13504,13 @@ export default function TransferPage() {
               ? `${tune.source_document_count} original document(s) will travel with the package.`
               : 'No original documents were retained, so the package cannot be re-chunked after import.'}
           </p>
-        )}
+        ) : tuneError ? (
+          <p className="text-xs mb-3 text-red-600">
+            Fidelity: <strong>unknown</strong> — it could not be read: {tuneError}
+          </p>
+        ) : collection ? (
+          <p className="text-xs mb-3 text-gray-500">Fidelity: reading…</p>
+        ) : null}
 
         <label className="flex items-start gap-2 text-sm mb-3">
           <input type="checkbox" checked={includeModels} onChange={e => setIncludeModels(e.target.checked)} className="mt-1" />
@@ -12803,6 +13532,7 @@ export default function TransferPage() {
         </button>
 
         {exportError && <p className="text-red-600 text-sm mt-3">{exportError}</p>}
+        {exportPollError && <p className="text-red-600 text-sm mt-3">{exportPollError}</p>}
         {exportJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -12820,7 +13550,12 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
-            {exportJob.status === 'failed' && <p className="text-red-600">{exportJob.error}</p>}
+            {exportJob.status === 'failed' && (
+              <p className="text-red-600">
+                {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
+                {exportJob.error}
+              </p>
+            )}
             {exportJob.warnings.map((w, i) => (
               <p key={i} className="text-amber-700 text-xs mt-1">{w}</p>
             ))}
@@ -12851,7 +13586,8 @@ export default function TransferPage() {
             </option>
           ))}
         </select>
-        {packages.length === 0 && (
+        {packagesError && <p className="text-red-600 text-xs mb-3">{packagesError}</p>}
+        {packages.length === 0 && !packagesError && (
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
@@ -12880,6 +13616,7 @@ export default function TransferPage() {
         </button>
 
         {importError && <p className="text-red-600 text-sm mt-3">{importError}</p>}
+        {importPollError && <p className="text-red-600 text-sm mt-3">{importPollError}</p>}
         {importJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -12973,6 +13710,11 @@ export default function HealthPage() {
 
   const [diagnosticPending, setDiagnosticPending] = useState(true)
   const diagnosticTicket = useRef(0)
+  // Each load is numbered; a result is shown only if no later load's result
+  // already is, so a slow older response can't replace a newer one (#415).
+  const loadCount = useRef(0)
+  const healthShown = useRef(0)
+  const metricsShown = useRef(0)
 
   function load() {
     const ticket = ++diagnosticTicket.current
@@ -12988,12 +13730,18 @@ export default function HealthPage() {
     })
     // Health and metrics load separately: a degraded or unreachable API must not
     // stop the latency charts, and no stale green cards stay up (#375).
+    const n = ++loadCount.current
     api.getHealth().then(h => {
-      setHealth(h); setHealthError(null)
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(h); setHealthError(null)
     }).catch(e => {
-      setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
     })
-    api.getMetrics().then(setMetrics).catch(() => { /* keep the last metrics shown */ })
+    api.getMetrics().then(m => {
+      if (n < metricsShown.current) return
+      metricsShown.current = n; setMetrics(m)
+    }).catch(() => { /* keep the last metrics shown */ })
   }
 
   useEffect(() => {
@@ -13110,8 +13858,8 @@ with tempfile.TemporaryDirectory(prefix='model-integrity-', dir=settings.upload_
         models.install_model(pkg, model)
         assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
         print('PASS already-present real blobs reused unchanged', flush=True)
-        name, _ = models.split_ref(model)
-        damaged = pkg / 'models' / name / 'blobs' / digests[-1].replace(':', '-')
+        name, tag = models.split_ref(model)
+        damaged = pkg / 'models' / name / tag / 'blobs' / digests[-1].replace(':', '-')
         damaged.write_bytes(b'ordinary mismatched review bytes')
         try:
             models.install_model(pkg, model)
@@ -13244,8 +13992,13 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`02_ingest.sh`, `04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `03_query.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -13257,7 +14010,9 @@ needs no stack.
 With API dependencies installed, run
 `python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
 retrieval save contention, unique temporary paths, first-save directory races,
-and failed serialization/create/write/close/replace preservation. The test also
+failed serialization/create/write/close/replace preservation, and the folder
+fsync after the replacement, including import publication and a failed folder
+fsync (#445). The test also
 checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
 directories and does not connect to Weaviate or Ollama.
 
@@ -13275,7 +14030,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the four controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the seven controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13319,6 +14074,79 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
+had no check. It runs four controlled tests, then live checks on a collection of its own.
+`scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
+missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
+a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
+top-level directories, and a package with no manifest, a manifest that isn't JSON or a newer
+`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). Through `importer._run`, with Weaviate and the
+model checks mocked, a digest-valid package naming a collection Weaviate can't use is
+`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
+above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
+`abort` and `rename`. `scripts/tests/test_transfer_paths.py` (API container, through the app)
+checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
+import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
+`JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,
+`GET /packages` with a readable and an unreadable package, the help page's "its own number of"
+fallback when the embedding probe fails and `HELP_RENDER_FAILED` for a missing partial or an
+unsubstituted placeholder, 409 `TUNE_IN_PROGRESS` for a second tune start under either
+spelling, and a re-chunk that produces no chunks failing `SOURCES_REQUIRED` before any rebuild.
+`scripts/tests/test_retrieve_script.py` (API container) renders `retrieve.py` with the exporter
+and runs it with `python -I -S` against a stub API: standard-library imports only, the baked
+defaults sent, every flag overriding its default, and the exit codes of
+`RAG_EXPORT_SPECIFICATIONS.md` section 5.1 (2 bad usage; 3 refused connection, 502/503/504 and
+timeout; 4 enveloped `COLLECTION_NOT_FOUND`; 5 bare 404, other errors and non-JSON), each
+failure one `error:` sentence and a hint. `scripts/tests/test_distribution.py` (host, standard
+library) builds `package.sh`'s zip and `package-offline.sh`'s bundle from a copy of the tracked
+tree with excluded files planted and reads them back, runs `package-offline.sh` and
+`install-offline.sh` with `docker` and `sleep` replaced by logging stubs (nothing is saved,
+loaded or started), and checks the bundled image list against
+`docker compose config --images`. The copy is a real git repository with the tracked files
+committed (git ignoring the user's and the system's configuration), because both scripts
+archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
+real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
+such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+
+The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
+`ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
+`transfer_packages.py` (one per refusal above) and a missing file, each refused with its code
+and no collection created, a malformed copy refused by `replace` with the collection intact,
+the package's bytes, size and mtime unchanged by a `rename` import, the same chunks and scores
+from the original and the import for vector, hybrid and near-text retrieval (E11; `/query`
+rewrites the question with the LLM first, so answers are not compared), an export with models
+requested and the model store setting pointed at a missing folder (warning,
+`models_bundled: false`, no `models/`), the packaged `retrieve.py` exiting 3 against a closed
+port (E10) and, unless `RAG_SKIP_SLOW=1`, answering with the baked top-k and with `--top-k 2`
+(E8, E9) and from the import, and a re-chunk after the retained original is replaced with blank
+text failing `SOURCES_REQUIRED`. `sweep_stale_workdirs` (TR:C30) is covered by
+`test_startup_sweep.py`.
+
+`scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
+an import job of a digest-valid package embedded with another model is refused
+`EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
+and both dimension counts (or saying this instance's count couldn't be read), with
+no promise of re-embedding; a same-name package of another width is refused too.
+It also checks that a model installed from a package is confirmed through Ollama's
+model list: reported, not reported, and Ollama unreachable. Only Ollama is
+replaced. `05_transfer.sh` runs it in the verify project's API container.
+
+`scripts/tests/test_import_guard.py` (#391) runs concurrent import jobs with
+Weaviate mocked: two spellings of one package file (`./x.tar.gz`, `a/../x.tar.gz`)
+answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
+building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
+`on_conflict`, never builds, and leaves the first job's in-progress marker in place;
+imports into different targets run side by side; a `rename` claims its new name and
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
+
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
 wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
@@ -13334,6 +14162,10 @@ in the verify project's API container, then checks a truncated ZIP and a ZIP of
 `.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
 (suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
 failing status poll, and that a new ingest and the next successful poll clear that error.
+Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
+queued panel show as soon as an upload is accepted, before the first poll, and stay through a
+failed poll; that the first answered poll replaces the panel while the job ID stays; and that
+"Start Ingest" with no collection selected says so and sends nothing.
 
 `scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
 upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
@@ -13472,12 +14304,37 @@ collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of tha
 interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
 operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
 
+`scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
+leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
+`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+names, and only a real directory or regular file as the name says: completed packages,
+`ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
+anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
+removed directory, and sizes don't count what links point at. A failed removal is logged and
+not reported as removed, and a missing exports folder is not created. A real lifespan run in a
+child process removes both kinds and logs them by name and size. A second one, whose export
+sweep fails, logs the error and still starts, with the ingest staging removed (#423).
+`02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
+that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+directory and temporary archive are gone, without removing anything itself, and that the
+completed package from the top of the suite is still there.
+
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
 repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
 keep the last and list each earlier one in `skipped`; members in different folders stay
 separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
-names, paths leaving the archive are dropped, and labels keep the archive's own spelling. The
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling.
+macOS metadata in a ZIP (#378): a Finder-style ZIP queues its file and lists the
+`__MACOSX/` AppleDouble member in `skipped`, a `._*` file beside its file and any other
+`__MACOSX/` member are skipped the same way, names that only look like them are queued, and a
+ZIP of nothing else is refused with `NO_SUPPORTED_FILES`. These members are still validated
+(#455): a damaged `__MACOSX/` member refuses the ZIP with `ARCHIVE_UNREADABLE` and their bytes
+count toward the expansion cap; `./__MACOSX/._r.txt`, `x/../__MACOSX/notes.txt` and
+`d/./._e.txt` are matched by their normalised names and listed under the archive's spelling;
+and a direct upload named `._notes.txt` is still queued. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
 marking failure fails only that file and changes nothing; a failed lookup of the later files
@@ -13505,12 +14362,13 @@ sent, and nothing run, created or saved; a collection Weaviate reports missing i
 `COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
 create (#366).
 Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
-the JSON 503 reaches the client (#369).
+the JSON 503 reaches the client (#369), also the tune starts' re-chunk check one (#409).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
-names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, and two parts
-with one filename. With a real gold-standard session planted for the collection, it checks
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, a Finder-style
+ZIP (it completes with no errors, stores only its file and lists the AppleDouble member in
+`skipped`, #378), and two parts with one filename. With a real gold-standard session planted for the collection, it checks
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
@@ -13526,9 +14384,11 @@ note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields ans
 `SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
-refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
-(on the verify project, with the exports from `stack.sh up`, as above):
+refused before backend, model or staging work, with every backend mocked.
+`07_settings.sh` runs it in the API image with the repository mounted read-only
+and no network (#386). Its embedded-source check reads `IMPLEMENTATION.md`, so
+to run it by hand mount the whole repository (on the verify project, with the
+exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -13613,34 +14473,56 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate (#375), registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
+| `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
+| `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema, export name refusals (#370) |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E34; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types |
+| `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
+| `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
+| `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
+| `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
+| `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
+| `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
-| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
+| `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
 | `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 `10_validity.sh` is called by suite05 (and thus all.sh). It runs
@@ -13660,7 +14542,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -13693,8 +14575,11 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On the verify project (`bash scripts/verify/stack.sh up`, then paste the
-`export` lines it prints), whose model copy holds the embedding model, run:
+`05_transfer.sh` runs `model_integrity.py` in the verify project's API
+container, and `test_model_bundle.py` in the API image with the repository
+mounted (#386). To run them by hand, on the verify project
+(`bash scripts/verify/stack.sh up`, then paste the `export` lines it prints),
+whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
@@ -13773,6 +14658,107 @@ returned for another collection, and a failed collections list. Each affected sa
 its actual collection and chunk-size payload. These fixtures make no backend
 writes and complement the live settings suite.
 
+## Health page refresh checks
+
+`browser/health_page.js` (#415), registered in `06_ui.sh` through `ui_criteria.js`,
+stubs every API call the Health page makes and holds each health and metrics answer
+until the check releases it, driving each refresh through the captured 30 s timer. Ten
+cases cover a failed metrics call (an API error, and no answer) keeping the charts last
+shown; a 200 without a health body (JSON of another shape, an empty body, text) and a 503
+carrying the API's error envelope, each shown as "Service health could not be read:" with
+no cards; and late responses from an older refresh, which never replace a newer health
+result (success or failure) or newer charts, while a late metrics result after a newer
+failed one is still shown. Every case also fails on a React page error. These fixtures
+make no backend calls; like the other modules, the file runs standalone with
+`RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
+
+## Gold Standard page details
+
+`browser/goldstandard_page.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+answers every `/api/` call from the Gold Standard page by request interception
+(#393). It checks that the export filename is pre-filled as
+`{collection}_{YYYYMMDD_HHMMSS}.json` after a generation and after a lookup, made
+safe and shortened to 128 characters as the API's default is; that Export opens the
+download URL with the filename encoded; that a review row expands to the first 300
+characters of the context followed by `…`, then its answer and its ground truth (a
+fixture pair whose two differ, so one cannot stand in for the other); that a session with
+no collection pre-fills `export_{YYYYMMDD_HHMMSS}.json` and a collection with no safe
+characters pre-fills `_{YYYYMMDD_HHMMSS}.json`, as the API names them; and that a sample
+size of 0, 101, 2.5 or an empty field disables Generate with a message and sends no
+request, while 1 and 100 enable it. Its #380 half
+checks how a generation ends and the guards on actions in flight: the outcome shown for a
+completed, partially failed, failed, cancelled and empty-collection session (headline, failed
+pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
+the message, enables Generate and is cleared by Load / refresh; a second Generate click in the
+window before the first poll sends no request and asks no confirm; Regenerate is disabled for
+the running pair only and repeated clicks send one request; and a refused edit (422) keeps the
+modal open with the typed values and the message, and each edit sends only the changed fields.
+A second
+Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
+real: a save answered in 1 s opens the download tab, and a control opens none. The
+control holds its save answer until the page reports
+`navigator.userActivation.isActive` is false (polled every 100 ms, at most 15 s), so it
+follows Chromium's user-activation window, not a fixed delay, and it fails unless the
+activation was still active when the save request arrived. That tab sends one
+read-only download request for the fixture name to the stack under test, which
+refuses it as an invalid export name. It runs on its own too, like
+`query_config.js`:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/goldstandard_page.js
+```
+
+## UI control browser checks
+
+`browser/ui_controls.js` and `browser/ui_pages.js`, registered in `06_ui.sh` through
+`ui_criteria.js` (#400), check the page controls that had no browser check. They share
+`browser/stub.js`, which opens the built UI in a fresh browser context and answers every
+`/api/` request itself; a request a case did not stub is answered 599 and fails the case, so
+nothing reaches the backend or a model. 67 cases:
+
+- `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
+  modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
+  queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
+  form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
+  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
+  the latency and error lines and the End User view with `response_format`; the Retrieval page's
+  saved and default texts, alpha slider and Save while loading; and the client's handling of
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+- `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
+  (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
+  export controls (collection selector, fidelity line, include-models payload, progress and
+  result), the package list, the empty hint, Refresh, conflict choice and import failure display;
+  the Help page error state and its links to and from Transfer; and the Health latency stat row,
+  chart and empty state.
+
+The Transfer polling and `/tune` failure labels stay with `transfer_page.js` (#382). Like
+`query_config.js`, each module can run on its own against a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_controls.js
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_pages.js
+```
+
 Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
@@ -13786,31 +14772,130 @@ error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` an
 error, timeout or error status) or a Weaviate query fails after the existence check, with no
 metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+It also checks (#411) that other HTTP errors keep FastAPI's own answer (a malformed
+multipart upload is FastAPI's 400 with `detail`, not the envelope), that the engineer-format
+synthesis failing is the Ollama 503, that a Weaviate failure in `hybrid` and `semantic`
+modes names Ollama too (Weaviate embeds the question through it there), and that a help
+template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+checks the envelope through the proxy on the running stack: an unknown route answers 404
+`NOT_FOUND` and `PUT /query` answers `METHOD_NOT_ALLOWED`.
+
+Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
+and the job workers mocked, it sends each route that takes a collection name a lowercase-first
+spelling (`myDocs`) and checks that the registry, the 201 and 202 answers, the ingest and
+retrieval settings files, the query metric and the metrics filter, retained originals found by
+`GET /tune`, and the export, tune, ingest and generation workers all get the stored name
+(`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
+ingests under a lowercase-first name, reads the tuning options and exports under the stored
+name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
+metrics under both spellings.
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
-`error`), Weaviate not ready or unreachable (Weaviate `error`), each with its latency, model
-names and `resources`; and 200 `ok` when everything is up. `browser/ui_criteria.js` (suite 06)
+`error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
+together (all three `error`), each with its latency, model names and `resources`; and 200
+`ok` when everything is up, also with memory below the recommendation or unreadable
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
 stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
 refresh whatever health answers.
 
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`. It also checks (#445) that a save
+fsyncs the registry's folder after the replace and closes it, that a failed folder fsync fails
+the save with the new file in place and no temporary file, and that API startup (the lifespan,
+in a child process with the backend sweeps mocked) removes `.collection_registry.json.*.tmp`
+leftovers while keeping the registry, other files, files in subfolders and what a link points
+to, logging a leftover it can't remove.
+
+Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
+runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
+temporary folder: an upload with no supported file answers 400 `NO_SUPPORTED_FILES` with the
+exact message listing a direct file and a ZIP member it skipped, and leaves no job, staging
+folder or registration; an unknown ingest job answers 404 `JOB_NOT_FOUND`; a `/query` body
+with only `question` and `collection` reaches the pipeline with the defaults (`hnsw`, `top_k`
+5, `alpha` 0.75, no citations, `end_user`), and through the real pipeline runs a top-5 vector
+search with the end-user prompt; the reformulation, end-user and engineer prompts and their
+`[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
+successful query records one metric; a saved retrieval config missing newer keys is filled
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type (also a fractional
+or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
+and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
+and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
+finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
+checked for its statistics against hand-worked percentiles, its exact-match `collection` and
+`retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
+Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
+`/proc/meminfo` reports memory `unknown` with a note while `/health` stays 200. On the host,
+`scripts/tests/test_ollama_entrypoint.py` runs `ollama/entrypoint.sh` with stub `ollama`,
+`timeout` and `sleep` commands: models already listed are not pulled, a missing one is pulled
+as `timeout 7200 ollama pull`, a failed or timed-out pull is retried after 15 s, and the fifth
+failure exits 1 with its error. Then, on the verify stack: the upload and job errors through
+the proxy; a new collection's schema has BM25 off for `source_file`, `source_type` and
+`chunk_strategy` and refuses an insert with an undeclared property; the running proxy's
+loaded configuration (`nginx -T`) reads `/api/` for 300 s and connects for 10 s; the metrics
+route's shape, `history_limit=0` and the 422. Unless `RAG_SKIP_SLOW=1`, a query with the
+defaults on a text of more than five chunks retrieves 5 chunks without citations and records
+one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
+and that metric read back unchanged after the API restarts, and then a first start: `down -v`
+(the model copy is external and kept) and `up -d --wait` must bring every service healthy
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
+
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
 It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
 app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
-record can't be written (an unusable file, a full volume), with the failure logged; that a
-line left unfinished by a failed write doesn't cost the next record; that `metrics.jsonl`
-never holds more than 1,000 lines and keeps the newest records; that a compaction whose
-temporary write or replace fails leaves the old file whole and no temporary file, and is
-tried again; that 1,100 concurrent records all land; and that a restart restores the last 500
-records, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, removes temporary
-files a crash left, and starts when the file can't be read or compacted. It also checks the
-`IMPLEMENTATION.md` copy of `api/services/metrics.py`.
+record can't be written (an unusable file, a full volume, an `UPLOAD_DIR` that can't be
+created), with the failure logged naming the metrics file and the record still counted by
+`GET /metrics/latency`; that a line left unfinished by a failed write doesn't cost the next
+record; that an append bringing `metrics.jsonl` to 1,000 lines compacts it and the newest
+records are kept; that a compaction whose temporary write or replace fails leaves the old file
+whole and no temporary file, and is tried again; that 1,100 concurrent records all land; and
+that a restart restores the last 500 records, loads a file within the bound without rewriting
+it, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, loads nothing from a
+last 1 MiB with no line break, removes temporary files a crash left, and starts when the file
+can't be read or compacted or `UPLOAD_DIR` can't be created. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`. With `RAG_ALLOW_RESTART=1`, suite 03
+also restarts the API after its LLM queries and checks that `GET /metrics/latency` reports
+the same records afterwards (#374); a `RAG_SKIP_SLOW=1` run has no queries to reload and
+doesn't reach it.
+
+Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
+`scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
+the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
+`1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
+first; a missing distance, a missing hybrid score and a config with no metric or an unknown
+one give `null` (a distance of 0 is a real value); the metric is read again on every query; a
+failed metric read answers 503 `SERVICE_UNAVAILABLE` in each distance mode; the pipeline
+rounds numbers and passes `null` through, and `/query` returns it. It also checks the
+`IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
+project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
+vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled, and checks the
+scores against the expected similarities; then it deletes the cosine collection, recreates it
+with l2-squared, and checks the next query uses the new metric. With models, the suite checks
+that in each of the four modes the citation scores are numbers, highest first.
+`browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
+`n/a` for a `null` score.
 
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
@@ -14677,6 +15762,30 @@ restart_refusal_reason() {
   fi
 }
 
+# Prints why removing the project's volumes (`docker compose down -v`) must not
+# run here, or nothing (#465). Only the verify project as stack.sh sets it up:
+# COMPOSE_PROJECT_NAME rag-verify and a COMPOSE_FILE that includes the overlay
+# docker-compose.verify.yml, whose model volume is external and so kept. Any
+# other project would lose all its volumes, models included.
+volume_removal_refusal_reason() {
+  local reason sep="${COMPOSE_PATH_SEPARATOR:-:}" rest entry
+  reason=$(restart_refusal_reason)
+  if [ -n "$reason" ]; then printf '%s' "$reason"; return 0; fi
+  if [ "$COMPOSE_PROJECT_NAME" != rag-verify ]; then
+    printf "volumes are removed only on the verify project rag-verify, not '%s'; run it through scripts/verify/stack.sh" "$COMPOSE_PROJECT_NAME"
+    return 0
+  fi
+  # Split as compose splits COMPOSE_FILE; only that exact file name counts.
+  rest="${COMPOSE_FILE:-}"
+  while [ -n "$rest" ]; do
+    entry="${rest%%"$sep"*}"
+    [ "${entry##*/}" = docker-compose.verify.yml ] && return 0
+    [ "$entry" = "$rest" ] && break
+    rest="${rest#*"$sep"}"
+  done
+  printf 'COMPOSE_FILE does not include docker-compose.verify.yml, whose model volume is kept; run it through scripts/verify/stack.sh'
+}
+
 # Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
 # docker-compose.yml plus 60s for `down` and the api's own start.
 RESTART_LIMIT_DEFAULT_S=240
@@ -15267,6 +16376,9 @@ with tempfile.TemporaryDirectory() as td:
     check("archive expands to a single directory", len(tops) == 1, str(tops))
     check("that directory is the filename minus .tar.gz",
           tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    # §4.2 — the manifest comes right after the directory entry (#383)
+    check("§4.2 manifest.json is the archive's first file",
+          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
     pkg = root / archive.name[:-len(".tar.gz")]
 
     manifest = json.loads((pkg / "manifest.json").read_text())
@@ -15413,13 +16525,28 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
+# Both distribution scripts in a scratch git repository, docker stubbed (#384).
+python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
+check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# The same envelope through the proxy on the running stack (#373).
+check_eq "an unknown API route answers 404 through the proxy (#373)" \
+  "$(api_code "$API/no-such-route-373")" "404"
+check_eq "  ... in the envelope, code NOT_FOUND" \
+  "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
+check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
+  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
 check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -15726,8 +16853,235 @@ finally:
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
 
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
+
 drop_collection "$C"
 cleanup_prefixed
+summary
+```
+
+### scripts/verify/16_api_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Ingest, query, metrics and health API paths no other check covers (#399).
+#
+# Run by 01_infrastructure.sh, after its own checks: the opt-in first-start check
+# at the end removes the verify project's volumes. The query checks need an LLM
+# (skipped with RAG_SKIP_SLOW=1); the restart and first-start checks are opt-in
+# (RAG_ALLOW_RESTART=1) and never reach the live rag-docker project.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+C="${PREFIX}ApiPaths"
+
+RAG_PATHS_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-paths.XXXXXX") || exit 2
+export RAG_PATHS_TMP
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$RAG_PATHS_TMP"; _rag_lock_release 2>/dev/null || true' EXIT
+
+section "API paths: controlled (#399)"
+# Through the app with Weaviate and Ollama mocked, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_api_paths.py)
+check "ingest, query, retrieval-config, metrics and health paths through the app" $?
+python3 "$REPO_ROOT/scripts/tests/test_ollama_entrypoint.py"
+check "the Ollama entrypoint skips present models, pulls under a timeout and retries" $?
+
+section "API paths: ingest errors and schema rules"
+drop_collection "$C"; make_collection "$C"
+printf 'not a supported type\n' > "$RAG_PATHS_TMP/notes.xyz"
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/unsupported.json" -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "files=@$RAG_PATHS_TMP/notes.xyz")
+check_eq "an upload with no supported file answers 400" "$code" "400"
+check_eq "it carries NO_SUPPORTED_FILES" "$(jfield "['error']['code']" < "$RAG_PATHS_TMP/unsupported.json")" "NO_SUPPORTED_FILES"
+check_eq "its message lists what was skipped" "$(jfield "['error']['message']" < "$RAG_PATHS_TMP/unsupported.json")" \
+  "No supported files found in upload. Skipped: notes.xyz (unsupported type '.xyz')"
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/nojob.json" -w '%{http_code}' "$API/ingest/job/vfy-no-such-job")
+check_eq "an unknown ingest job answers 404" "$code" "404"
+check_eq "it carries JOB_NOT_FOUND and names the job" \
+  "$(jfield "['error']['code'] + ' ' + d['error']['message']" < "$RAG_PATHS_TMP/nojob.json")" \
+  "JOB_NOT_FOUND Job 'vfy-no-such-job' not found."
+
+# The schema as Weaviate holds it, and an insert carrying a property it doesn't declare.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+client = wc.get_client()
+try:
+    collection = client.collections.get(name)
+    properties = {p.name: p for p in collection.config.get().properties}
+    out = {"searchable": {n: properties[n].index_searchable
+                          for n in ("content", "source_file", "source_type", "chunk_strategy")}}
+    try:
+        collection.data.insert(properties={"content": "undeclared property check",
+                                           "undeclared_prop": "x"},
+                               vector=[0.01] * 768)
+        out["insert"] = "accepted"
+    except Exception as exc:                          # noqa: BLE001
+        out["insert"] = "refused"
+    out["declared"] = "undeclared_prop" in {p.name for p in collection.config.get().properties}
+    out["objects"] = collection.aggregate.over_all(total_count=True).total_count
+    print(json.dumps(out))
+finally:
+    wc.close_client()
+ENDPY
+) > "$RAG_PATHS_TMP/schema.json"
+check_eq "BM25 is off for source_file, source_type and chunk_strategy, on for content" \
+  "$(jfield "['searchable']" < "$RAG_PATHS_TMP/schema.json")" \
+  "{'content': True, 'source_file': False, 'source_type': False, 'chunk_strategy': False}"
+check_eq "an insert with an undeclared property is refused, adding no property or object" \
+  "$(jfield "['insert'] + ' ' + str(d['declared']) + ' ' + str(d['objects'])" < "$RAG_PATHS_TMP/schema.json")" \
+  "refused False 0"
+
+section "API paths: proxy timeout and metrics route"
+# The configuration the running proxy loaded, not only the file.
+(cd "$REPO_ROOT" && docker compose exec -T proxy nginx -T 2>/dev/null) > "$RAG_PATHS_TMP/nginx.txt"
+python3 - "$RAG_PATHS_TMP/nginx.txt" <<'ENDPY'
+import re, sys
+text = open(sys.argv[1]).read()
+start = text.index("location /api/ {")
+block = text[start:text.index("}", start)]
+ok = (re.search(r"^\s*proxy_read_timeout\s+300s;", block, re.M)
+      and re.search(r"^\s*proxy_connect_timeout\s+10s;", block, re.M))
+sys.exit(0 if ok else 1)
+ENDPY
+check "the proxy's /api/ location reads for 300 s and connects for 10 s" $?
+
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency.json" -w '%{http_code}' "$API/metrics/latency?history_limit=0")
+check_eq "GET /metrics/latency answers 200" "$code" "200"
+python3 - "$RAG_PATHS_TMP/latency.json" <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+stats = ("p50", "p95", "p99", "mean", "count")
+ok = (set(d) == {"total_records", "retrieval_latency", "llm_latency", "total_latency", "history"}
+      and all(set(d[k]) == set(stats) for k in ("retrieval_latency", "llm_latency", "total_latency"))
+      and d["history"] == [])
+sys.exit(0 if ok else 1)
+ENDPY
+check "it reports the three latency summaries, and history_limit=0 an empty history" $?
+_rag_require_lock_owner
+code=$(curl -s -m 120 -o "$RAG_PATHS_TMP/latency501.json" -w '%{http_code}' "$API/metrics/latency?history_limit=501")
+check_eq "history_limit above 500 answers 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < "$RAG_PATHS_TMP/latency501.json")" "422 INVALID_PARAMETER"
+
+section "API paths: a query with the defaults (LLM)"
+queried=0
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "a default query and its metric" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  python3 - "$RAG_PATHS_TMP/overtime.txt" <<'ENDPY'
+import sys
+topics = ["overtime approval", "holiday requests", "expense claims", "travel booking",
+          "remote work", "sick leave", "training budgets", "equipment loans",
+          "parking permits", "visitor badges", "parental leave", "jury duty"]
+with open(sys.argv[1], "w") as f:
+    for t in topics:
+        f.write(f"The policy on {t} says a manager must approve every request about {t} "
+                f"before the end of the month, and the HR team records the decision.\n\n")
+ENDPY
+  _rag_require_lock_owner
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$RAG_PATHS_TMP/overtime.txt" > "$RAG_PATHS_TMP/ingest.json"
+  job=$(jfield "['job_id']" < "$RAG_PATHS_TMP/ingest.json")
+  check_eq "a text of more than five chunks is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+  api_post "/query" "{\"question\":\"who approves overtime?\",\"collection\":\"$C\"}" > "$RAG_PATHS_TMP/answer.json"
+  check_eq "a query with only question and collection retrieves the default 5 chunks, without citations" \
+    "$(jfield "['chunks_retrieved'], d['citations'], bool(d['answer'].strip())" < "$RAG_PATHS_TMP/answer.json")" \
+    "5 None True"
+  api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/latency_c.json"
+  python3 - "$RAG_PATHS_TMP/latency_c.json" "$RAG_PATHS_TMP/answer.json" <<'ENDPY'
+import json, sys
+d, a = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+h = d["history"]
+ok = (d["total_records"] == 1 and len(h) == 1 and h[0]["retrieval_mode"] == "hnsw"
+      and h[0]["retrieval_ms"] == a["retrieval_latency_ms"] and h[0]["llm_ms"] == a["llm_latency_ms"]
+      and h[0]["total_ms"] == a["retrieval_latency_ms"] + a["llm_latency_ms"])
+sys.exit(0 if ok else 1)
+ENDPY
+  check "the query recorded one hnsw metric with its latencies" $? "$(cat "$RAG_PATHS_TMP/latency_c.json")"
+  queried=1
+fi
+
+section "API paths: restart and first start (opt-in)"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "retrieval settings and metrics across a restart, and the first start" "set RAG_ALLOW_RESTART=1 to include them"
+elif [ -n "$restart_refusal" ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_refusal"
+elif [ "$restart_limit_ok" != 0 ]; then
+  check "retrieval settings and metrics across a restart, and the first start" 1 "$restart_limit"
+else
+  project="$COMPOSE_PROJECT_NAME"
+  saved="{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.3,\"ef\":null,\"response_format\":\"engineer\"}"
+  api_post "/retrieval/config" "$saved" > /dev/null
+  api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_before.json"
+  [ "$queried" = 1 ] && api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_before.json"
+  started=$(python3 -c "import time;print(time.time())")
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  if [ -z "$elapsed" ]; then
+    check "the API is healthy again after the restart" 1 "not healthy after $((restart_limit * 2))s"
+  else
+    api_get "/retrieval/config/$C" > "$RAG_PATHS_TMP/retrieval_after.json"
+    python3 - "$RAG_PATHS_TMP/retrieval_before.json" "$RAG_PATHS_TMP/retrieval_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+want = {"retrieval_mode": "hybrid", "top_k": 7, "alpha": 0.3, "ef": None,
+        "response_format": "engineer", "is_default": False}
+ok = all(before.get(k) == v for k, v in want.items()) and after == before
+sys.exit(0 if ok else 1)
+ENDPY
+    check "saved retrieval settings survive an API restart" $? "$(cat "$RAG_PATHS_TMP/retrieval_after.json")"
+    if [ "$queried" = 1 ]; then
+      api_get "/metrics/latency?collection=$C" > "$RAG_PATHS_TMP/metrics_after.json"
+      python3 - "$RAG_PATHS_TMP/metrics_before.json" "$RAG_PATHS_TMP/metrics_after.json" <<'ENDPY'
+import json, sys
+before, after = (json.load(open(p)) for p in sys.argv[1:3])
+sys.exit(0 if before["total_records"] == 1 and after["history"] == before["history"] else 1)
+ENDPY
+      check "the query's metric survives an API restart" $? "$(cat "$RAG_PATHS_TMP/metrics_after.json")"
+    else
+      skip "the query's metric across a restart" "set RAG_SKIP_SLOW=0 to include model calls"
+    fi
+
+    # First start: no volumes but the model copy, which is external and kept by
+    # `down -v`, so the models are already present, as SPECIFICATIONS.md's
+    # criterion says; the pull from empty is a recorded manual measurement (#465).
+    # Only on the verify project: elsewhere `down -v` would remove every volume.
+    removal_refusal=$(volume_removal_refusal_reason)
+    if [ -n "$removal_refusal" ]; then
+      check "a first start from empty volumes brings every service healthy within 300s" 1 "$removal_refusal"
+    else
+      (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+      started=$(python3 -c "import time;print(time.time())")
+      (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+      up_ok=$?
+      took=$(python3 -c "import time;print(int(time.time()-$started))")
+      [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+      check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+        "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+      wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # It started from nothing: the collection made above is gone with its volume.
+      check_eq "that first start began with no collections" \
+        "$(api_get "/collections" | jfield "['collections']")" "[]"
+    fi
+  fi
+fi
+
+drop_collection "$C"
 summary
 ```
 
@@ -16083,6 +17437,13 @@ import json; d=json.load(open('/tmp/vfy_job.json')); import sys
 sys.exit(0 if d['chunks_stored'] == 1 else 1)"
 check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
 
+# Chunker limits and insert batching (#386), with the backends mocked, in an
+# isolated container with the repository mounted.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_chunk_limits.py)
+check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
+check "chunk inserts are batched and retried while the index isn't ready" $?
+
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
@@ -16188,6 +17549,40 @@ print(sorted(names))
 sys.exit(0 if ok else 1)
 ENDPY
 check "ZIP members with one basename in two folders stay two documents, named by path" $?
+
+# A Finder "Compress" ZIP (#378): __MACOSX/finder/._report.txt is the file's
+# AppleDouble resource fork with the same suffix, and was queued as a document.
+python3 - "$RIFIX/finder.zip" <<'ENDPY'
+import sys, zipfile
+double = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for name, data in [("finder/", b""), ("finder/report.txt",
+                        b"Finder report. The pool closes at eight on Sundays."),
+                       ("__MACOSX/", b""), ("__MACOSX/finder/", b""),
+                       ("__MACOSX/finder/._report.txt", double)]:
+        z.writestr(zipfile.ZipInfo(name), data)
+ENDPY
+ingest "$RI" fixed 200 40 "$RIFIX/finder.zip"
+cp /tmp/vfy_job.json /tmp/vfy_ri_finder.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_finder.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+checks = {
+    "completed": job["status"] == "completed",
+    "no errors": job["errors"] == [],
+    "one file": job["files_total"] == 1,
+    "skipped names the AppleDouble member": job["skipped"] == [
+        "finder.zip:__MACOSX/finder/._report.txt (macOS metadata (AppleDouble), not a document)"],
+    "real file stored": "Finder report" in names.get("finder/report.txt", ""),
+    "no metadata stored": not any("__MACOSX" in n or "/._" in n for n in names),
+}
+print({k: v for k, v in checks.items() if not v} or "ok", sorted(names))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a Finder ZIP stores its file, not the __MACOSX AppleDouble member, which is listed in skipped" $? \
+  "$(head -c 300 /tmp/vfy_ri_finder.json)"
 
 # Two parts with one filename: the second's bytes are stored, the first reported.
 ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
@@ -16310,6 +17705,10 @@ check "delete-while-busy: job kinds, request orderings and the job's report" $?
 check "ingest jobs count submitted, accepted and stored chunks apart" $?
 python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
 check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+# One spelling for per-collection state (#372): every route takes a collection
+# name as Weaviate stores it, so a lowercase first letter keys nothing apart.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_spelling.py)
+check "routes key per-collection state by the stored collection name (#372)" $?
 
 # DELETE needs ?confirm=true, checked before the collection is looked up (#302).
 CC="${PREFIX}Confirm"
@@ -16382,6 +17781,10 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
+# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
+check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
@@ -16467,9 +17870,17 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     none_job=$(jfield "['job_id']" < /tmp/vfy_restart_none_start.json)
     sleep 2
     api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
+    # The running jobs' upload staging, which the restart kills in place (#377).
+    staged=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/ingest-* 2>/dev/null' | sort)
+    check "the interrupted ingests have ingest-* staging for the restart to sweep" \
+      "$([ -n "$staged" ] && echo 0 || echo 1)" "no /app/uploads/ingest-* while the jobs ran"
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@"; do if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi; done; echo checked' sh $staged)
+    check "the restart removes the interrupted ingests' upload staging" \
+      "$([ -n "$staged" ] && [ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
     api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done_after.json
     python3 -c "
 import json,sys
@@ -16555,6 +17966,9 @@ cd "$(dirname "$0")" && . ./lib.sh
 proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
+section "Collection list rows and retrieval-mode dispatch, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_retrieval_controls.py)
+check "test_retrieval_controls.py registered regression checks" $?
 section "Physical index and effective query controls"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
 check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
@@ -16686,6 +18100,13 @@ section "§10.2 Query"
 # controlled, in the API image with no network.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
 check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
+# Citation scores are higher-is-better in every mode, and null when missing (#376):
+# controlled in the API image with no network, then on the real Weaviate with each
+# distance metric (models controlled, no LLM work).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_citation_score.py)
+check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
+check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -16720,7 +18141,7 @@ import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
 c = d.get('citations') or []
 ok = bool(c) and all(
     isinstance(x.get('source_file'), str) and x['source_file']
-    and isinstance(x.get('score'), (int, float))
+    and (x.get('score') is None or isinstance(x.get('score'), (int, float)))
     and isinstance(x.get('chunk_index'), int)
     and isinstance(x.get('excerpt'), str) for x in c)
 sys.exit(0 if ok else 1)"
@@ -16741,6 +18162,14 @@ try: d=json.load(open('/tmp/vfy_ans.json'))
 except Exception: sys.exit(1)
 sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
   check "retrieval mode '$mode' returns results" $?
+  python3 -c "
+import json,sys
+try: c=json.load(open('/tmp/vfy_ans.json')).get('citations') or []
+except Exception: sys.exit(1)
+s=[x.get('score') for x in c]
+sys.exit(0 if s and all(isinstance(v,(int,float)) for v in s) and s==sorted(s,reverse=True) else 1)"
+  check "retrieval mode '$mode' citation scores are numbers, best (highest) first (#376)" $? \
+    "$(python3 -c "import json;print([x.get('score') for x in json.load(open('/tmp/vfy_ans.json')).get('citations') or []])" 2>/dev/null)"
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
@@ -16759,9 +18188,146 @@ done
 check "end_user answers are shorter than engineer on average" $? \
   "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
 
+# ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
+# The queries above wrote metrics records; a restart goes through the
+# lifespan's load_from_disk, so GET /metrics/latency must report the same records.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "query metrics reload after an API restart (#374)" 1 "$restart_refusal"
+  else
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_before.json
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_after.json
+    python3 -c "
+import json,sys
+b=json.load(open('/tmp/vfy_metrics_before.json')); a=json.load(open('/tmp/vfy_metrics_after.json'))
+sys.exit(0 if b['total_records'] > 0 and a['history'] == b['history'] else 1)"
+    check "query metrics reload after an API restart (#374)" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "query metrics reload after an API restart (#374)" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/citation_score.py
+
+```python
+"""Citation scores on a real Weaviate: higher is better, by the collection's metric (#376).
+
+Inside the disposable API container (`03_query.sh`):
+
+    docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py
+
+Creates owned collections with each distance metric through `POST /collections`,
+inserts known vectors, and asks `/query` in the `hnsw` and `flat` modes with
+Ollama's reformulation, embedding and answer controlled. Weaviate's distances
+are real. Then deletes one collection, recreates it under the same name with
+another metric, and checks the next query converts by the new metric. Its
+collections are deleted at the end, pass or fail.
+"""
+import math
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from services import weaviate_client as wc
+
+prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
+QUERY = [1.0, 0.0, 0.0, 0.0]
+
+
+def unit(cos):
+    return [cos, math.sqrt(1 - cos * cos), 0.0, 0.0]
+
+
+# metric -> (vectors, expected score of each against QUERY), best match first.
+CASES = {
+    "cosine": ([unit(c) for c in (0.95, 0.6, 0.1, -0.5)], [0.95, 0.6, 0.1, -0.5]),
+    "dot": ([[a, 0.0, 0.0, 0.0] for a in (3.0, 1.5, -0.5, -2.0)], [3.0, 1.5, -0.5, -2.0]),
+    "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
+}
+
+client = TestClient(app)
+created = []
+failures = []
+
+
+def create(name, metric, index_type):
+    response = client.post("/collections", json={"name": name, "index_type": index_type,
+                                                  "distance_metric": metric})
+    assert response.status_code == 201, response.text
+    if name not in created:
+        created.append(name)
+    coll = wc.get_client().collections.get(name)
+    for i, vector in enumerate(CASES[metric][0]):
+        coll.data.insert(properties={"content": f"Score chunk {i}", "source_file": "score.txt",
+                                     "chunk_index": i}, vector=vector)
+
+
+def check(name, metric):
+    expected = CASES[metric][1]
+    for mode in ("hnsw", "flat"):
+        with patch("services.rag_pipeline.ollama.chat", new=AsyncMock(return_value="Controlled")), \
+                patch("services.rag_pipeline.ollama.embed", new=AsyncMock(return_value=QUERY)):
+            response = client.post("/query", json={"collection": name, "question": "score",
+                                                   "retrieval_mode": mode, "top_k": 4,
+                                                   "include_citations": True})
+        label = f"{metric} collection, {mode} mode"
+        if response.status_code != 200:
+            failures.append(f"{label}: {response.status_code} {response.text}")
+            continue
+        got = [c["score"] for c in response.json()["citations"]]
+        ok = (len(got) == len(expected)
+              and all(isinstance(g, (int, float)) and abs(g - e) < 1e-3 for g, e in zip(got, expected))
+              and got == sorted(got, reverse=True))
+        print(("PASS " if ok else "FAIL ") + f"{label}: scores {got}, expected {expected}", flush=True)
+        if not ok:
+            failures.append(f"{label}: scores {got}, expected {expected}")
+
+
+with tempfile.TemporaryDirectory(prefix="citation-score-") as directory, \
+        patch.object(settings, "upload_dir", directory):
+    try:
+        for metric, index_type in (("cosine", "hnsw"), ("dot", "flat"), ("l2-squared", "flat")):
+            name = prefix + metric.replace("-", "").capitalize()
+            create(name, metric, index_type)
+            check(name, metric)
+        # Same name, another metric: the next query must use the new metric.
+        name = prefix + "Cosine"
+        response = client.delete("/collections/" + name + "?confirm=true")
+        assert response.status_code == 200, response.text
+        create(name, "l2-squared", "hnsw")
+        print("recreated " + name + " with l2-squared", flush=True)
+        check(name, "l2-squared")
+    finally:
+        for name in created:
+            try:
+                if wc._collection_exists_sync(name):
+                    response = client.delete("/collections/" + name + "?confirm=true")
+                    if response.status_code != 200:
+                        failures.append(f"cleanup {name}: {response.status_code} {response.text}")
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"cleanup {name}: {error!r}")
+        wc.close_client()
+
+if failures:
+    print("FAIL " + "; ".join(failures), flush=True)
+    sys.exit(1)
+print("PASS citation scores convert by each collection's metric, best first", flush=True)
 ```
 
 ### scripts/verify/12_persistence.sh
@@ -16907,6 +18473,9 @@ do
   code=$(api_post_code /goldstandard/generate "$body")
   check_eq "invalid sampling request rejected with 422: $body" "$code" "422"
 done
+section "Gold-standard API paths without a model (#398)"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_api_paths.py)
+check "empty-collection outcome, reply parser, 409 GENERATION_IN_PROGRESS, 502 PAIR_GENERATION_FAILED" $?
 summary
 ```
 
@@ -16988,6 +18557,21 @@ section "§10.3 Gold Standard"
 # Selection needs the backend but no LLM work; include it even in slow-skip runs.
 bash ./09_sampling.sh
 check "UUID sampling acceptance" $?
+
+# Review errors need no model: an unknown session is SESSION_NOT_FOUND, an
+# unknown pair PAIR_NOT_FOUND, and an empty edit is refused with 422 (#381).
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_review.py)
+check "review 404 codes and empty-edit refusal" $?
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/gs_00000000/pair/p_1" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X POST \
+  "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+  -d '{"session_id":"gs_00000000","pair_id":"p_1"}')
+check_eq "regenerate on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
 
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
@@ -17071,6 +18655,16 @@ code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
 check_eq "a status-only change is accepted" "$code" "200"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"status":"edited","question":""}')
+check_eq "an empty question is refused with 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "422 INVALID_PARAMETER"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/p_unknown" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown pair returns 404 PAIR_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 PAIR_NOT_FOUND"
 
 # ── regenerate replaces exactly one pair ─────────────────────────────────────
 if [ "$actual" -ge 2 ]; then
@@ -17269,7 +18863,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E33)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E34)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -17291,10 +18885,23 @@ check "evaluation import and generated-session regressions" $?
 check "retained-source index boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
+check "E12 embedding mismatch and post-install Ollama check regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_guard.py)
+check "concurrent imports of one package or one target refused (#391)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# Bundled models (#386): install safety, E21 and E22 with a temporary store,
+# then the real pulled embedding model copied through a temporary package.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_model_bundle.py)
+check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
+check "real embedding model exported, installed and refused when mismatched" $?
+# The package listing reads each manifest without decompressing the package (#383).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
+check "the package listing reads only up to each manifest (#383)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -17329,6 +18936,17 @@ check_eq "a tuned collection ships retrieve.py" "$script" "True"
 
 python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
 check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+# A real export, archived manifest first, lists as readable with its metadata (#383).
+api_get "/packages" > /tmp/vfy_pkglist.json
+python3 - "$PKG" "$C" "$chunks_before" > /tmp/vfy_pkglist.txt 2>&1 <<'ENDPY'
+import json, sys
+pkg, coll, chunks = sys.argv[1], sys.argv[2], int(sys.argv[3])
+entry = next((p for p in json.load(open("/tmp/vfy_pkglist.json"))["packages"] if p["filename"] == pkg), None)
+print(entry)
+sys.exit(0 if entry and entry["readable"] is True and entry["collection"] == coll
+         and entry["chunk_count"] == chunks and entry["fidelity"] == "with-sources" and entry["created_at"] else 1)
+ENDPY
+check "GET /packages lists the new export as readable with its manifest metadata (#383)" $? "$(tail -1 /tmp/vfy_pkglist.txt)"
 
 # ── E30: vectors are attributed to the collection's stored model (#196) ──────
 EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
@@ -17822,9 +19440,23 @@ for mode in abs link; do
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
-  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
-  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
-    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  RECHUNK="{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation refuses the source-dependent starts with
+    # the typed 409, before any job is created (#389).
+    for route in rechunk reembed; do
+      check_eq "E29: $route with chunking on an on-disk abs entry is HTTP 409" \
+        "$(api_post_code "/tune/$route" "$RECHUNK")" "409"
+      api_post "/tune/$route" "$RECHUNK" > /tmp/vfy_tj.json
+      check_eq "E29: ... with error code SOURCE_INDEX_INVALID and no job ($route)" \
+        "$(jfield "['error']['code']" < /tmp/vfy_tj.json) $(jfield ".get('job_id')" < /tmp/vfy_tj.json)" \
+        "SOURCE_INDEX_INVALID None"
+    done
+  else
+    api_post "/tune/rechunk" "$RECHUNK" > /tmp/vfy_tj.json
+    check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
   if [ "$mode" = abs ]; then
     # An index that fails validation is a typed 409, not a 500, and doesn't
@@ -18316,6 +19948,9 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
+    # The build directory this export is writing; the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -18337,12 +19972,20 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
-    # The killed build's leftovers are the container's (root, mode 0700): remove
-    # only the build directories that appeared during this export.
-    builds_after=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    stale=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_after") | grep '^/app/exports/\.build-' || true)
+    # The killed build's leftovers (root, mode 0700) are the startup sweep's to
+    # remove (#377): its build directory and any temporary archive must be gone,
+    # and the completed package from the top of this suite still there.
+    check "the interrupted export had a build directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
-    (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'rm -rf "$@"; rm -f /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial' sh $stale) >/dev/null 2>&1 || true
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
+        if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
+      done; echo checked' sh $killed)
+    check "the restart removes the interrupted export's build directory and temporary archive" \
+      "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
+    check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
+      "$EXPORTS/$PKG is gone"
   fi
 
   # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
@@ -18391,6 +20034,57 @@ ENDPY
   drop_collection "$XR"
 fi
 
+# ── one spelling for per-collection state (#372) ─────────────────────────────
+# Weaviate stores a collection with its first letter capitalised. Everything
+# below is sent under the lowercase-first spelling; the registry, the retained
+# originals, the package and the metrics must all land under the stored name.
+SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
+SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+drop_collection "$SC"
+api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
+check_eq "#372: creating '$SL' answers the stored name" \
+  "$(jfield "['name']" < /tmp/vfy_sp_create.json)" "$SC"
+check "#372: the list gives '$SC' its created_at" "$(api_get "/collections" | python3 -c "
+import json,sys
+c=[c for c in json.load(sys.stdin)['collections'] if c['name']=='$SC']
+print(0 if c and c[0]['created_at'] else 1)")"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SL" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_sp_up.json
+check_eq "#372: an upload to '$SL' answers the stored name" \
+  "$(jfield "['collection']" < /tmp/vfy_sp_up.json)" "$SC"
+check_eq "#372: the upload completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_sp_up.json)" 900)" "completed"
+# Read back under the stored name: an upload under the typed spelling used to
+# file its originals where the stored name never looked.
+api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
+check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
+api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
+check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
+api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
+check_eq "#372: the export of '$SC' carries the originals uploaded as '$SL'" \
+  "$(jfield "['fidelity']" < /tmp/vfy_sp_expjob.json)" "with-sources"
+sppkg=$(jfield "['filename']" < /tmp/vfy_sp_expjob.json)
+api_post "/tune/rechunk" "{\"collection\":\"$SL\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_sp_tj.json
+check_eq "#372: a re-chunk of '$SL' completes" \
+  "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_sp_tj.json)" 1800)" "completed"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#372: a query's metrics under both spellings" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  # The body goes through a variable: inside "$(...)" its braces would be
+  # brace-expanded into three requests.
+  spq="{\"question\":\"who approves overtime?\",\"collection\":\"$SL\",\"top_k\":3}"
+  spcode=$(api_post_code "/query" "$spq")
+  check_eq "#372: a query on '$SL' answers" "$spcode" "200"
+  spl=$(api_get "/metrics/latency?collection=$SL&history_limit=0" | jfield "['total_records']")
+  spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
+  check "#372: the metrics filter finds the query under both spellings" \
+    "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+fi
+[ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
+drop_collection "$SC"
+
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
@@ -18423,7 +20117,443 @@ drop_collection "$C"
 cleanup_prefixed
 bash ./10_validity.sh
 check "retained-session validity acceptance suite" $?
+
+# -- transfer and tuning paths with no check before (#387) --------------------
+# Import refusals, on_conflict, unknown job ids, /packages, export without the
+# model store, retrieve.py (E8-E10), E11 and the distribution scripts; its own
+# collection and packages, removed again.
+bash ./15_transfer_paths.sh
+check "transfer and tuning paths suite (#387)" $?
 summary
+```
+
+### scripts/verify/15_transfer_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Transfer and tuning paths with no check before (#387): import refusals, on_conflict,
+# unknown job ids, /packages, the package file left alone, export without the model store,
+# retrieve.py (E8-E10), equivalent retrieval after import (E11) and a re-chunk that produces
+# no chunks. Run by 05_transfer.sh.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}Paths"
+SLUG=$(printf '%s' "$C" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g')
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
+QUESTION="who approves overtime?"
+
+section "Transfer and tuning paths (#387)"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_package_refusals.py)
+check "package refusal regressions (checks 1 and 2, collection name, chunk records)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_transfer_paths.py)
+check "transfer and tuning route regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieve_script.py)
+check "retrieve.py flag and exit-code regressions (E8-E10)" $?
+python3 "$REPO_ROOT/scripts/tests/test_distribution.py"
+check "package.sh, package-offline.sh and install-offline.sh regressions" $?
+
+count_of() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p_job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_p_imp.json
+  local j; j=$(jfield "['job_id']" < /tmp/vfy_p_imp.json)
+  # No job (a refused request): record that instead of polling a job that isn't there.
+  if [ -z "$j" ] || [ "$j" = None ]; then cp /tmp/vfy_p_imp.json /tmp/vfy_p_job.json; return; fi
+  wait_for_job "/import/job/$j" 900 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_p_job.json
+}
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
+check_eq "the suite's collection is ingested" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_p_ing.json)" 900)" "completed"
+chunks=$(count_of "$C")
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
+check_eq "... and exported" \
+  "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" 1800)" "completed"
+PKG=$(api_get "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" | jfield "['filename']")
+
+# -- unknown job ids (TR:A10, TR:C5, TU:34) -----------------------------------
+for kind in export import tune; do
+  code=$(api_code "$API/$kind/job/vfy-no-such-job")
+  ecode=$(api_get "/$kind/job/vfy-no-such-job" | jfield "['error']['code']")
+  [ "$code" = 404 ] && [ "$ecode" = JOB_NOT_FOUND ]
+  check "an unknown $kind job id is 404 JOB_NOT_FOUND" $? "HTTP $code, code '$ecode'"
+done
+
+# -- on_conflict is required and checked (TR:C2) ------------------------------
+for body in "{\"filename\":\"$PKG\"}" "{\"filename\":\"$PKG\",\"on_conflict\":null}" \
+            "{\"filename\":\"$PKG\",\"on_conflict\":\"merge\"}"; do
+  code=$(api_post_code "/import" "$body")
+  ecode=$(api_post "/import" "$body" | jfield "['error']['code']")
+  [ "$code" = 422 ] && [ "$ecode" = INVALID_PARAMETER ]
+  check "POST /import $body is 422 INVALID_PARAMETER" $? "HTTP $code, code '$ecode'"
+done
+
+# -- GET /packages, readable and not (TR:D1) ----------------------------------
+JUNK="ragpkg-$SLUG-junk.tar.gz"
+printf 'not a package\n' > "$EXPORTS/.$JUNK.part" && mv "$EXPORTS/.$JUNK.part" "$EXPORTS/$JUNK"
+api_get "/packages" > /tmp/vfy_p_list.json
+python3 - "$EXPORTS" "$PKG" "$JUNK" "$C" "$chunks" <<'ENDPY'
+import json, os, sys
+exports, pkg, junk, coll, chunks = sys.argv[1:6]
+listed = {p["filename"]: p for p in json.load(open("/tmp/vfy_p_list.json"))["packages"]}
+want = {pkg: {"filename": pkg, "size_bytes": os.path.getsize(os.path.join(exports, pkg)),
+              "collection": coll, "chunk_count": int(chunks), "fidelity": "with-sources",
+              "readable": True},
+        junk: {"filename": junk, "size_bytes": os.path.getsize(os.path.join(exports, junk)),
+               "collection": None, "chunk_count": None, "fidelity": None, "created_at": None,
+               "readable": False}}
+bad = [name for name, fields in want.items()
+       if name not in listed or any(listed[name].get(k) != v for k, v in fields.items())]
+bad += [] if (listed.get(pkg) or {}).get("created_at") else [pkg + " has no created_at"]
+print("    listed:", json.dumps({k: listed.get(k) for k in want}))
+sys.exit(1 if bad else 0)
+ENDPY
+check "GET /packages lists the package readable, with its fields, and junk as readable: false" $?
+rm -f "$EXPORTS/$JUNK"
+
+# -- import refusals (TR:C7-C10, C16, C34) ------------------------------------
+# Each crafted copy of the package is refused with its code, and no collection appears.
+names_before=$(collection_names)
+run_import "ragpkg-$SLUG-absent.tar.gz" rename
+check_eq "a package that does not exist is refused as PACKAGE_UNREADABLE" \
+  "$(jfield "['error_code']" < /tmp/vfy_p_job.json)" "PACKAGE_UNREADABLE"
+for spec in nongzip:PACKAGE_UNREADABLE truncated:PACKAGE_UNREADABLE symlink:PACKAGE_UNREADABLE \
+            hardlink:PACKAGE_UNREADABLE dotdot:PACKAGE_UNREADABLE twodirs:PACKAGE_UNREADABLE \
+            nomanifest:PACKAGE_FORMAT_UNSUPPORTED badmanifest:PACKAGE_FORMAT_UNSUPPORTED \
+            newformat:PACKAGE_FORMAT_UNSUPPORTED badname:PACKAGE_FORMAT_UNSUPPORTED \
+            badline:PACKAGE_CORRUPT baduuid:PACKAGE_CORRUPT badprops:PACKAGE_CORRUPT \
+            novector:PACKAGE_CORRUPT wrongwidth:PACKAGE_CORRUPT countup:PACKAGE_CORRUPT \
+            countdown:PACKAGE_CORRUPT; do
+  kind=${spec%%:*}; want=${spec#*:}
+  P=$(python3 ./transfer_packages.py "$EXPORTS/$PKG" "$kind")
+  run_import "$P" rename
+  got=$(jfield "['error_code']" < /tmp/vfy_p_job.json)
+  names_after=$(collection_names)
+  [ "$got" = "$want" ] && [ "$names_after" = "$names_before" ]
+  check "a $kind package is refused as $want and creates no collection" $? \
+    "code '$got': $(jfield "['error']" < /tmp/vfy_p_job.json | cut -c1-120)"
+  rm -f "$EXPORTS/$P"
+done
+P=$(python3 ./transfer_packages.py "$EXPORTS/$PKG" badline -replace)
+run_import "$P" replace
+check_eq "replace with a malformed chunk record is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_p_job.json)" "PACKAGE_CORRUPT"
+check_eq "... and leaves the existing collection's chunks alone" "$(count_of "$C")" "$chunks"
+rm -f "$EXPORTS/$P"
+
+# -- the package file is left unchanged (TR:C28) ------------------------------
+package_state() { python3 - "$EXPORTS/$PKG" <<'ENDPY'
+import hashlib, os, sys
+st = os.stat(sys.argv[1])
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), st.st_size, st.st_mtime_ns)
+ENDPY
+}
+state_before=$(package_state)
+run_import "$PKG" rename
+read -r istat IMP <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_p_job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "the package imports under a new name" "$istat" "completed"
+check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
+
+# -- E11: the import retrieves what the original does -------------------------
+# /query rewrites each question with the LLM first, so two answers can differ even for
+# identical collections; retrieval is compared directly, for each path /query uses.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
+import asyncio, sys
+from services import ollama_client
+from services import weaviate_client as wc
+original, imported, question = sys.argv[1:4]
+
+async def retrieve(name, vector):
+    return {"vector": await wc.near_vector_query(name, vector, 6),
+            "hybrid": await wc.hybrid_query(name, question, 0.5, 6),
+            "near-text": await wc.near_text_query(name, question, 6)}
+
+async def main():
+    vector = await ollama_client.embed(question)
+    return await retrieve(original, vector), await retrieve(imported, vector)
+
+try:
+    a, b = asyncio.run(main())
+finally:
+    wc.close_client()
+ok = True
+for path in a:
+    key = lambda rows: sorted((r["source_file"], r["chunk_index"], r["score"]) for r in rows)
+    x, y = key(a[path]), key(b[path])
+    same = len(x) == len(y) > 0 and all(
+        p[:2] == q[:2] and abs(p[2] - q[2]) < 1e-4 for p, q in zip(x, y))
+    print(f"    {path}: {len(x)} and {len(y)} chunk(s), {'the same' if same else 'DIFFERENT'}")
+    ok = ok and same
+sys.exit(0 if ok else 1)
+ENDPY
+check "E11: the imported collection retrieves the same chunks and scores as the original" $?
+
+# -- export without the model store (TR:A19) ----------------------------------
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_p_models.json 2>/tmp/vfy_p_models.err <<'ENDPY'
+import json, sys, tarfile
+from unittest.mock import patch
+from config import settings
+from services import packager
+from services import weaviate_client as wc
+try:
+    with patch.object(settings, "ollama_models_dir", "/nonexistent-ollama-store-387"):
+        result = packager.build(sys.argv[1], include_models=True)
+finally:
+    wc.close_client()
+with tarfile.open(packager.exports_dir() / result["filename"]) as tar:
+    names = tar.getnames()
+    manifest = json.load(tar.extractfile(next(n for n in names if n.endswith("/manifest.json"))))
+print(json.dumps({"filename": result["filename"], "models_bundled": result["models_bundled"],
+                  "warnings": result["warnings"], "manifest": [manifest["models_bundled"],
+                                                               manifest["bundled_models"]],
+                  "models": [n for n in names if "/models" in n]}))
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_models.json"))
+except ValueError:
+    print("    " + open("/tmp/vfy_p_models.err").read()[-300:]); sys.exit(1)
+ok = (d["models_bundled"] is False and d["manifest"] == [False, []] and d["models"] == []
+      and "models were requested but the Ollama model store is not mounted; the package was "
+          "built without them" in d["warnings"])
+print("    " + json.dumps(d))
+sys.exit(0 if ok else 1)
+ENDPY
+check "export with models but no model store warns, bundles nothing and says so in the manifest" $?
+NOSTORE=$(jfield "['filename']" < /tmp/vfy_p_models.json)
+[ -n "$NOSTORE" ] && [ "$NOSTORE" != "None" ] && rm -f "$EXPORTS/$NOSTORE"
+
+# -- retrieve.py from the package (E8-E10) ------------------------------------
+RTMP=$(mktemp -d)
+python3 - "$EXPORTS/$PKG" "$RTMP" <<'ENDPY'
+import pathlib, sys, tarfile
+with tarfile.open(sys.argv[1]) as tar:
+    member = next(m for m in tar.getmembers() if m.isfile() and m.name.endswith("/retrieve.py"))
+    pathlib.Path(sys.argv[2], "retrieve.py").write_bytes(tar.extractfile(member).read())
+ENDPY
+check "the package carries retrieve.py" $?
+python3 -I -S "$RTMP/retrieve.py" --api-url "http://127.0.0.1:9/api" "$QUESTION" \
+  > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+rc=$?
+[ "$rc" = 3 ] && grep -q '^error: Cannot reach the API at http://127.0.0.1:9/api' /tmp/vfy_p_r.err \
+  && ! grep -q Traceback /tmp/vfy_p_r.err
+check "E10: retrieve.py exits 3 with one sentence when nothing answers" $? \
+  "exit $rc: $(head -1 /tmp/vfy_p_r.err)"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "E8/E9/E11: retrieve.py answers from the original and the import" "RAG_SKIP_SLOW=1"
+else
+  want_citations=$(( chunks < 6 ? chunks : 6 ))
+  for run in "default:$want_citations" "top2:2"; do
+    name=${run%%:*}; want=${run#*:}
+    args=(--api-url "$API" --json --citations)
+    [ "$name" = top2 ] && args+=(--top-k 2)
+    python3 -I -S "$RTMP/retrieve.py" "${args[@]}" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - "$want" <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+ENDPY
+    answered=$?
+    [ "$rc" = 0 ] && [ "$answered" = 0 ]
+    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+      "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  done
+  python3 -I -S "$RTMP/retrieve.py" --api-url "$API" --collection "$IMP" "$QUESTION" \
+    > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+  rc=$?
+  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
+  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+fi
+rm -rf "$RTMP"
+
+# -- a re-chunk that produces no chunks (TU:16) -------------------------------
+# The retained original is replaced with blank text; its stored chunks stay.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+sources.store(c, "policies.txt", b"   \n\n   \n", replace=True)
+docs = sources.load_index(c)["documents"]
+sys.exit(0 if [e["filenames"] for e in docs.values()] == [["policies.txt"]] else 1)
+ENDPY
+check "the retained policies.txt is replaced with blank text" $?
+api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_p_tune.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_p_tune.json)
+if [ -n "$tjob" ] && [ "$tjob" != None ]; then
+  tstatus=$(wait_for_job "/tune/job/$tjob" 900)
+  api_get "/tune/job/$tjob" > /tmp/vfy_p_tjob.json
+else
+  tstatus="not started: $(head -c 200 /tmp/vfy_p_tune.json)"; echo '{}' > /tmp/vfy_p_tjob.json
+fi
+[ "$tstatus" = failed ] && [ "$(jfield "['error_code']" < /tmp/vfy_p_tjob.json)" = SOURCES_REQUIRED ] \
+  && jfield "['error']" < /tmp/vfy_p_tjob.json | grep -q "produced no chunks"
+check "a re-chunk that produces no chunks fails SOURCES_REQUIRED" $? \
+  "status '$tstatus': $(jfield "['error']" < /tmp/vfy_p_tjob.json)"
+check_eq "... and leaves the collection's chunks alone" "$(count_of "$C")" "$chunks"
+
+[ "$IMP" != "-" ] && [ "$IMP" != "$C" ] && drop_collection "$IMP"
+drop_collection "$C"
+rm -f "$EXPORTS/$PKG"
+summary
+```
+
+### scripts/verify/transfer_packages.py
+
+```python
+#!/usr/bin/env python3
+"""Write one damaged copy of an export package, for the import refusal checks (#387).
+
+    python3 transfer_packages.py <package.tar.gz> <kind> [suffix]
+
+Writes `<stem>-<kind><suffix>.tar.gz` beside the package and prints its name. The copy is
+written under a `.part` name and renamed into place: on Docker Desktop the API can read a
+freshly written bind-mounted file as empty (#184). Standard library only; run on the host by
+`15_transfer_paths.sh`.
+
+Kinds, by the import check that refuses them:
+  check 1, PACKAGE_UNREADABLE:  nongzip truncated symlink hardlink dotdot twodirs
+  check 2, PACKAGE_FORMAT_UNSUPPORTED:  nomanifest badmanifest newformat badname
+  records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
+The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
+the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+"""
+import hashlib
+import io
+import json
+import pathlib
+import sys
+import tarfile
+import tempfile
+
+KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "nomanifest",
+         "badmanifest", "newformat", "badname", "badline", "baduuid", "badprops", "novector",
+         "wrongwidth", "countup", "countdown")
+
+
+def extract(src, work):
+    with tarfile.open(src) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(work, filter="data")
+        else:                                   # the suite's own package, before 3.9.17
+            tar.extractall(work)
+    return next(p for p in work.iterdir() if p.is_dir())
+
+
+def edit_records(root, change):
+    path = root / "chunks.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    lines = [json.dumps(row) for row in rows]
+    change(rows, lines)
+    path.write_text("\n".join(lines) + "\n")
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"]["chunks.jsonl"] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def edit_manifest(root, change):
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text())
+    change(manifest)
+    path.write_text(json.dumps(manifest, indent=2))
+
+
+def record(index, change):
+    def apply(rows, lines):
+        row = rows[index]
+        change(row)
+        lines[index] = json.dumps(row)
+    return apply
+
+
+def member(tar, name, **fields):
+    info = tarfile.TarInfo(name)
+    data = b"" if fields else b"written outside the package\n"
+    info.size = len(data)
+    for key, value in fields.items():
+        setattr(info, key, value)
+    tar.addfile(info, io.BytesIO(data))
+
+
+def write(src, kind, out):
+    if kind == "nongzip":
+        out.write_text("this is not a gzip archive\n")
+        return
+    if kind == "truncated":
+        data = src.read_bytes()
+        out.write_bytes(data[: len(data) // 2])
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = extract(src, pathlib.Path(td))
+        if kind == "nomanifest":
+            (root / "manifest.json").unlink()
+        elif kind == "badmanifest":
+            (root / "manifest.json").write_text("{not json")
+        elif kind == "newformat":
+            edit_manifest(root, lambda m: m.update(package_format=m["package_format"] + 1))
+        elif kind == "badname":
+            edit_manifest(root, lambda m: m["collection"].update(name="1bad-name"))
+        elif kind == "countup":
+            edit_manifest(root, lambda m: m["collection"].update(chunk_count=m["collection"]["chunk_count"] + 1))
+        elif kind == "countdown":
+            edit_manifest(root, lambda m: m["collection"].update(chunk_count=m["collection"]["chunk_count"] - 1))
+        elif kind == "badline":
+            edit_records(root, lambda rows, lines: lines.__setitem__(1, "{not json"))
+        elif kind == "baduuid":
+            edit_records(root, record(0, lambda r: r.update(id="not-a-uuid")))
+        elif kind == "badprops":
+            edit_records(root, record(0, lambda r: r.update(properties=["content"])))
+        elif kind == "novector":
+            edit_records(root, record(0, lambda r: r.pop("vector")))
+        elif kind == "wrongwidth":
+            edit_records(root, record(0, lambda r: r.update(vector=r["vector"][:-1])))
+        with tarfile.open(out, "w:gz") as tar:
+            tar.add(root, arcname=root.name)
+            if kind == "symlink":
+                member(tar, root.name + "/link", type=tarfile.SYMTYPE, linkname="/etc/passwd")
+            elif kind == "hardlink":
+                member(tar, root.name + "/hard", type=tarfile.LNKTYPE,
+                       linkname=root.name + "/manifest.json")
+            elif kind == "dotdot":
+                member(tar, "../escape-387.txt")
+            elif kind == "twodirs":
+                member(tar, "second/extra.txt")
+
+
+def main(argv):
+    if len(argv) not in (3, 4) or argv[2] not in KINDS:
+        sys.exit(__doc__)
+    src, kind = pathlib.Path(argv[1]), argv[2]
+    suffix = argv[3] if len(argv) == 4 else ""
+    out = src.parent / (src.name[: -len(".tar.gz")] + f"-{kind}{suffix}.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        write(src, kind, part)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
 ```
 
 ### scripts/verify/batch_recovery.py
@@ -19095,7 +21225,7 @@ async function fixture(browser, base) {
       }
       if (path === '/api/query') {
         entry.done = true;
-        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+        return Promise.resolve(response(window.queryConfigFixture.queryResult || { answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
       }
       if (path.startsWith('/api/retrieval/config')) {
         return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
@@ -19311,6 +21441,31 @@ async function runQueryConfigTests(browser, base, reporter) {
     await assertSettings(page, { ...A, top_k: 19 });
     assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
   }]);
+  // #376: a citation's score is a number (higher is better) or null when Weaviate gave none.
+  cases.push(['citations show a numeric score and n/a for a null score', async page => {
+    await page.evaluate(() => {
+      window.queryConfigFixture.queryResult = {
+        answer: 'Fixture answer', retrieval_latency_ms: 1, llm_latency_ms: 1, chunks_retrieved: 2,
+        citations: [
+          { source_file: 'scored.txt', chunk_index: 3, score: 0.9123, excerpt: 'Scored excerpt' },
+          { source_file: 'unscored.txt', chunk_index: 4, score: null, excerpt: 'Unscored excerpt' },
+        ],
+      };
+    });
+    assert.equal(await clickByText(page, 'Q&A'), true);
+    await page.waitForSelector('textarea');
+    await page.evaluate(() => {
+      const box = [...document.querySelectorAll('label')].find(l => l.innerText.includes('Show source citations')).querySelector('input');
+      if (!box.checked) box.click();
+    });
+    await setValue(page, '() => document.querySelector("textarea")', 'Which sources?');
+    assert.equal(await clickByText(page, 'Ask'), true);
+    await page.waitForFunction(() => document.body.innerText.includes('Unscored excerpt') || document.body.innerText.includes('Fixture answer'));
+    await sleep(200);
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /chunk 3 \S score 0\.912\b/, 'the numeric score is not shown with 3 decimals');
+    assert.match(text, /chunk 4 \S score n\/a/, 'the null score is not shown as n/a');
+  }]);
   for (const [name, test] of cases) {
     let s;
     try {
@@ -19352,7 +21507,7 @@ if (require.main === module) {
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -19363,6 +21518,15 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
+
+  await require('./health_page').runHealthPageTests(browser, BASE, r);
+  await require('./transfer_page').runTransferPageTests(browser, BASE, r);
+
+  await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
+
+  await require('./ui_controls').runUiControlTests(browser, BASE, r);
+
+  await require('./ui_pages').runUiPageTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -19693,6 +21857,161 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── refused creates and failed collection lists (#379) ───────────────────
+  // A refused create went to the page-level error line behind the modal's
+  // overlay, so it looked like nothing happened, and a failed GET /collections
+  // was swallowed, so an outage looked like "no collections". The POSTs and the
+  // failing lists are answered here, so no collection is created.
+  r.section('refused creates and failed collection lists (#379)');
+  {
+    const LIST_FAIL = 'Synthetic list failure (#379).';
+    const LIST_MESSAGE = 'Could not load the collections: ' + LIST_FAIL;
+    const EXISTS = "Collection 'VfyRefused379' already exists.";
+    const listFailure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: LIST_FAIL, detail: null } }) };
+    const refusal = { status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_EXISTS', message: EXISTS, detail: null } }) };
+    const accepted = { status: 201, contentType: 'application/json', body: JSON.stringify({ name: 'VfyRefused379', status: 'created' }) };
+    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => a.textContent.trim()));
+    // The New Collection modal, and the alert inside it, if any.
+    const modal = page => page.evaluate(() => {
+      const h = [...document.querySelectorAll('h2')].find(x => x.textContent.trim() === 'New Collection');
+      const box = h && h.parentElement;
+      const alert = box && box.querySelector('[role=alert]');
+      return { open: !!h, alert: alert ? alert.textContent.trim() : null };
+    });
+    // Answers GET and POST /api/collections as the test's current modes say.
+    async function stub(s) {
+      const mode = { list: 'pass', post: 'refuse' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'GET' && mode.list === 'fail') return request.respond(listFailure);
+        if (request.method() === 'POST') return request.respond(mode.post === 'refuse' ? refusal : accepted);
+        return request.continue();
+      });
+      return mode;
+    }
+    const posts = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/collections').length;
+
+    // A failed list on each page that loads one.
+    for (const path of ['/collections', '/import', '/qa', '/goldstandard']) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const shown = await alerts(s.page);
+        r.check(`${path}: a failed collection list is shown as an alert`, shown.includes(LIST_MESSAGE), JSON.stringify(shown));
+        r.check(`${path}: a failed collection list causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Collections page: a refused create, then a successful one, which also
+    // reloads the list and clears the failed-list message.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=Name]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Collections: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Collections: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Collections: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'pass';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        r.check('Collections: a successful create closes the modal', !done.open, JSON.stringify(done));
+        const after = await alerts(s.page);
+        r.check('Collections: the next successful list clears the failed-list message', !after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Collections: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Collections create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Import page "+ New": a refused create, then a successful one whose list
+    // reload fails, which is a list error, not a refused create.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Import: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Import: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Import: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'fail';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        const after = await alerts(s.page);
+        r.check('Import: a successful create closes the modal even when the list reload fails', !done.open, JSON.stringify(done));
+        r.check('Import: a failed reload after a create is shown as a failed list', after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+  }
+
+  // ── the created name as stored (#372) ──────────────────────────────────────
+  // Weaviate capitalises a collection's first letter, and the list shows that
+  // name. The Import page selected the typed name, which matched no option, so
+  // React showed the first option instead while uploads went to the typed name.
+  // /api/collections is answered here, the list with a decoy first, so that
+  // fallback can't pass the check; nothing is created on the stack.
+  r.section('the created name as stored (#372)');
+  {
+    const TYPED = 'vfySpelling372', STORED = 'VfySpelling372', DECOY = 'VfyDecoy372';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const s = await session(browser, BASE, 'engineer');
+    try {
+      await s.page.setRequestInterception(true);
+      let created = false;
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'POST') {
+          created = true;
+          return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ name: STORED, status: 'created' }) });
+        }
+        const list = created ? [info(DECOY), info(STORED)] : [info(DECOY)];
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+      });
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      await clickByText(s.page, '+ New'); await sleep(300);
+      await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", TYPED);
+      await clickByText(s.page, 'Create'); await sleep(1500);
+      const selected = await s.page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        const select = label && label.parentElement.querySelector('select');
+        return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+      });
+      r.check('Import: after "+ New", the selector holds the created collection as stored',
+              !!selected && selected.value === STORED, JSON.stringify(selected));
+      r.check('Import stored-name fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── upload size limit ──────────────────────────────────────────────────────
   // The Import page refuses a selection over the proxy's limit before sending.
   // The file is sparse: it reports 513 MB but occupies no disk, and the check
@@ -19855,6 +22174,92 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();
+    }
+  }
+
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
     }
   }
 
@@ -20352,7 +22757,7 @@ Dockerfile
 
 ### package.sh
 
-Source-only archive (~150 KB). The target machine rebuilds the images and
+Source-only archive (~1.3 MB). The target machine rebuilds the images and
 re-downloads the models, so it needs internet.
 
 ```bash
@@ -20365,9 +22770,13 @@ re-downloads the models, so it needs internet.
 # Invoke with `bash package.sh` rather than `./package.sh` so the script does
 # not depend on its own executable bit surviving a file transfer.
 #
-# What the archive contains: source, Dockerfiles, compose file, both lock files
+# What the archive contains: the files git tracks in the current commit (HEAD),
+# built with `git archive`: source, Dockerfiles, compose file, both lock files
 # (ui/package-lock.json and api/requirements.txt) and the docs. That is
-# everything needed to rebuild the stack from scratch.
+# everything needed to rebuild the stack from scratch. Untracked and ignored
+# files never go in -- offline tars, .env files, node_modules/, previous
+# archives, the contents of ingest-inbox/ and exports/ -- and neither do
+# uncommitted changes, so commit first. Run it in a git checkout (#384).
 #
 # What it deliberately does NOT contain: Docker images, the Weaviate index, and
 # the Ollama model weights. Those are rebuilt or re-downloaded on the target
@@ -20382,39 +22791,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. In an extracted archive there is no repository, and in a
+# subdirectory of another one git archive would take only that subtree.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
+
 OUT="${1:-rag-docker.zip}"
 rm -f "$OUT"
 
-zip -r -q "$OUT" . \
-  -x '*.DS_Store' \
-  -x '__MACOSX/*' \
-  -x '*/node_modules/*' \
-  -x '*/__pycache__/*' \
-  -x '*.pyc' \
-  -x '*.pyo' \
-  -x '*/dist/*' \
-  -x '*/.venv/*' \
-  -x '*/venv/*' \
-  -x '*/.pytest_cache/*' \
-  -x '*/.mypy_cache/*' \
-  -x '*/.ruff_cache/*' \
-  -x '*/uploads/*' \
-  -x 'ingest-inbox/*' \
-  -x 'exports/*' \
-  -x '.env' \
-  -x '*/.env' \
-  -x '*/.env.*' \
-  -x '.git/*' \
-  -x '*.zip'
-
-# The blanket ingest-inbox exclusion also drops the directory itself. Add the
-# placeholder back so the bind-mount target exists on the target machine; without
-# it Docker creates the directory as root and the user cannot drop files in.
-zip -q "$OUT" ingest-inbox/.gitkeep
-# Same for ./exports: it is the bind mount export packages are written to.
-# Its contents are somebody's corpus and never belong in a source archive,
-# but the directory itself must exist or Docker creates it as root.
-zip -q "$OUT" exports/.gitkeep
+# Tracked files only. ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so
+# both bind-mount targets exist on the target machine; without them Docker
+# creates the directories as root and the user cannot drop files in.
+git archive --format=zip -o "$OUT" HEAD
 
 echo "Created $OUT ($(du -h "$OUT" | cut -f1))"
 echo
@@ -20441,10 +22833,12 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #
 #   bash package-offline.sh [output.tar]
 #
-# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
-#   * the source tree
+#   * the source tree: the files git tracks in the current commit (HEAD),
+#     built with `git archive`, exactly as package.sh does. Untracked and
+#     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
 #   * the Ollama model weights (phi3.5 + nomic-embed-text)
 #
@@ -20454,6 +22848,14 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. Checked first, before any image or volume is touched.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package-offline.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
 
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
@@ -20487,26 +22889,11 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/rag-docker/offline"
 
-echo "==> Copying source"
-tar cf - \
-  --exclude='./.DS_Store' --exclude='*/.DS_Store' \
-  --exclude='*/node_modules/*' --exclude='*/__pycache__/*' \
-  --exclude='*.pyc' --exclude='*/dist/*' \
-  --exclude='*/.venv/*' --exclude='*/venv/*' \
-  --exclude='./.env' --exclude='*/.env' --exclude='*/.env.*' \
-  --exclude='./.git/*' --exclude='*.tar' --exclude='*.zip' \
-  --exclude='./offline/*' \
-  --exclude='./ingest-inbox/*' \
-  --exclude='./exports/*' \
-  . | ( cd "$STAGE/rag-docker" && tar xf - )
-
-# Both zip and tar drop a directory once all its contents are excluded, so the
-# mount target is recreated explicitly. Without it Docker creates ./ingest-inbox
-# as root on the target machine and the user cannot drop files into it.
-mkdir -p "$STAGE/rag-docker/ingest-inbox"
-touch "$STAGE/rag-docker/ingest-inbox/.gitkeep"
-mkdir -p "$STAGE/rag-docker/exports"
-touch "$STAGE/rag-docker/exports/.gitkeep"
+echo "==> Copying source (tracked files of the current commit)"
+# ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so both mount targets
+# exist on the target machine; without them Docker creates the directories as
+# root and the user cannot drop files into ./ingest-inbox.
+git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
@@ -20589,6 +22976,209 @@ echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
 
+### scripts/tests/test_package_archives.py
+
+Host-side check that both distribution scripts hold exactly the tracked files
+of `HEAD` (#384), run in a scratch git repository with `docker` stubbed.
+
+```python
+"""Distribution archives hold only the tracked files of HEAD (#384).
+
+Host-side, no stack: each script runs in a scratch git repository, and
+package-offline.sh talks to a stub `docker` first on PATH, never to a daemon.
+
+Run: python3 scripts/tests/test_package_archives.py
+"""
+import os
+import shutil
+import stat
+import subprocess
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ('package.sh', 'package-offline.sh')
+REFUSAL = 'not the top level of a git checkout'
+COMMITTED_README = 'Scratch project.\n'
+GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
+       '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+# The scratch repository and both scripts read no system or global (or XDG) git
+# config, so a user's core.hooksPath or attributes can't change the result (#447).
+GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
+
+# Answers what package-offline.sh asks of docker, and logs each call.
+STUB_DOCKER = r'''#!/usr/bin/env bash
+echo "$*" >> "$STUB_DOCKER_LOG"
+case "$1 $2" in
+  "compose config") echo '{"name":"scratch"}' ;;
+  "image inspect"|"volume inspect") ;;
+  save*) printf 'stub image layers' ;;
+  run*)
+    while [ $# -gt 0 ]; do
+      case "$1" in -v) case "$2" in *:/out) touch "${2%:/out}/ollama_models.tar.gz" ;; esac; shift ;; esac
+      shift
+    done ;;
+  *) echo "stub docker: unexpected call: $*" >&2; exit 1 ;;
+esac
+'''
+
+# Untracked or ignored content that must never reach an archive.
+UNTRACKED = (
+    '.env', '.env.local', 'tools/.env.production', 'rag-docker-offline.tar', 'old.zip',
+    'offline/images.tar.gz', '.claude/worktrees/fix-1/README.md', 'dev-docs/issue-1/analysis.md',
+    '0', '.DS_Store', 'notes.txt', 'ingest-inbox/doc.pdf', 'exports/pkg.tar.gz',
+)
+EXECUTABLE = ('install-offline.sh', 'tools/run.sh')
+
+
+def write(path, text, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(mode)
+
+
+class PackageArchiveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name).resolve()
+        self.git_env = dict(os.environ, **GIT_ISOLATION)
+        self.repo = self.tmp / 'project'
+        self.repo.mkdir()
+        for name in SCRIPTS + ('.gitignore',):
+            shutil.copy(ROOT / name, self.repo / name)
+        write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
+        write(self.repo / 'README.md', COMMITTED_README)
+        write(self.repo / 'ingest-inbox' / '.gitkeep', '')
+        write(self.repo / 'exports' / '.gitkeep', '')
+        write(self.repo / 'tools' / 'run.sh', '#!/usr/bin/env bash\n', 0o755)
+        write(self.repo / 'tools' / 'data.txt', 'data\n')
+        self.git('init', '-q')
+        self.git('add', '-A')
+        self.git('add', '-f', 'ingest-inbox/.gitkeep', 'exports/.gitkeep')
+        self.git('commit', '-q', '-m', 'scratch')
+        self.tracked = set(self.git('ls-files').split())
+        for name in UNTRACKED:
+            write(self.repo / name, 'must not ship\n')
+        with open(self.repo / 'README.md', 'a') as handle:
+            handle.write('UNCOMMITTED EDIT\n')
+        self.assertEqual(set(self.git('ls-files').split()), self.tracked)
+        bin_dir = self.tmp / 'bin'
+        write(bin_dir / 'docker', STUB_DOCKER, 0o755)
+        self.log = self.tmp / 'docker.log'
+        self.env = dict(self.git_env, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log))
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, env=self.git_env, check=True,
+                              capture_output=True, text=True).stdout
+
+    def run_script(self, directory, script, out):
+        return subprocess.run(['bash', str(directory / script), str(out)], cwd=self.tmp, env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def assert_ran(self, result):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def expected_bundle(self):
+        return ({'rag-docker/' + name for name in self.tracked}
+                | {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'})
+
+    def assert_archives_hold_the_tracked_files(self, directory):
+        zip_out, bundle_out = self.tmp / 'check.zip', self.tmp / 'check.tar'
+        self.assert_ran(self.run_script(directory, 'package.sh', zip_out))
+        self.assert_ran(self.run_script(directory, 'package-offline.sh', bundle_out))
+        with zipfile.ZipFile(zip_out) as archive:
+            self.assertEqual({i.filename for i in archive.infolist() if not i.filename.endswith('/')},
+                             self.tracked)
+        with tarfile.open(bundle_out) as archive:
+            self.assertEqual({m.name for m in archive.getmembers() if m.isfile()}, self.expected_bundle())
+
+    def test_zip_holds_exactly_the_tracked_files(self):
+        out = self.tmp / 'out.zip'
+        self.assert_ran(self.run_script(self.repo, 'package.sh', out))
+        with zipfile.ZipFile(out) as archive:
+            infos = {i.filename: i for i in archive.infolist() if not i.filename.endswith('/')}
+            self.assertEqual(set(infos), self.tracked)
+            self.assertEqual(archive.read('README.md').decode(), COMMITTED_README)
+        for name in EXECUTABLE:
+            with self.subTest(executable=name):
+                self.assertTrue((infos[name].external_attr >> 16) & stat.S_IXUSR)
+
+    def test_offline_bundle_holds_tracked_files_and_offline_payload(self):
+        out = self.tmp / 'bundle.tar'
+        self.assert_ran(self.run_script(self.repo, 'package-offline.sh', out))
+        expected = {'rag-docker/' + name for name in self.tracked}
+        expected |= {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'}
+        with tarfile.open(out) as archive:
+            files = {m.name: m for m in archive.getmembers() if m.isfile()}
+            self.assertEqual(set(files), expected)
+            self.assertEqual(archive.extractfile('rag-docker/README.md').read().decode(), COMMITTED_README)
+        for name in EXECUTABLE:
+            with self.subTest(executable=name):
+                self.assertTrue(files['rag-docker/' + name].mode & stat.S_IXUSR)
+
+    def test_refuses_outside_a_git_top_level(self):
+        plain = self.tmp / 'extracted'
+        nested = self.repo / 'tools' / 'copy'
+        for directory in (plain, nested):
+            directory.mkdir(parents=True)
+            for script in SCRIPTS:
+                shutil.copy(ROOT / script, directory / script)
+                out = self.tmp / f'{directory.name}-{script}.out'
+                with self.subTest(directory=directory.name, script=script):
+                    result = self.run_script(directory, script, out)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(REFUSAL, result.stderr)
+                    self.assertFalse(out.exists())
+        calls = self.log.read_text() if self.log.exists() else ''
+        self.assertEqual(calls, '', 'docker was called before the refusal')
+
+    def test_runs_in_a_checkout_reached_through_a_symlink(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.repo, target_is_directory=True)
+        self.assert_archives_hold_the_tracked_files(link)
+
+    def test_ignores_the_users_git_config(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        hostile = Path(temp.name).resolve()
+        marker = hostile / 'hook-ran'
+        write(hostile / 'hooks' / 'pre-commit', f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', 0o755)
+        write(hostile / 'attributes', 'README.md export-ignore\n')
+        write(hostile / 'gitconfig', f'[core]\n\thooksPath = {hostile / "hooks"}\n'
+                                     f'\tattributesFile = {hostile / "attributes"}\n')
+        with mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(hostile / 'gitconfig')):
+            # A fresh scratch repository, built while the caller's global config is hostile.
+            self.setUp()
+            self.assert_archives_hold_the_tracked_files(self.repo)
+        self.assertIn('README.md', self.tracked)
+        self.assertFalse(marker.exists(), 'the global pre-commit hook ran')
+
+
+class EmbeddedCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        text = (ROOT / 'IMPLEMENTATION.md').read_text()
+        for name in SCRIPTS + ('scripts/verify/01_infrastructure.sh', 'scripts/verify/README.md',
+                               'scripts/tests/test_package_archives.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n'
+                start = text.index(header) + len(header)
+                start = text.index(f'{fence}{language}\n', start) + len(fence + language) + 1
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (ROOT / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
 ### scripts/verify/session_persistence_cases.py
 
 ```python
@@ -20636,9 +23226,9 @@ from unittest.mock import patch, AsyncMock
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
-from services import goldstandard as gs, weaviate_client as wc, importer
+from services import goldstandard as gs, weaviate_client as wc, importer, packager
 async def run():
-    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]):
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
         async with lifespan(app):
             print(json.dumps(gs.get_session('gs_450abcde')))
 asyncio.run(run())
@@ -21397,6 +23987,9 @@ section "Concurrent settings publication and failed-write preservation"
 check "controlled retrieval/ingest concurrency and publication failures" $?
 (cd ../.. && python3 scripts/tests/test_settings_implementation.py)
 check "settings embedded implementation copies match runtime" $?
+section "Settings refused before work, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_settings_validation.py)
+check "test_settings_validation.py registered regression checks" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -22381,7 +24974,9 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     col=client.collections.get(collection)
     await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
     before=await asyncio.to_thread(tuning._existing_records,collection)
-    session={'session_id':sid,'collection':collection[:1].lower()+collection[1:],'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    # Sessions are stored under the collection's stored name (#372); the request below
+    # still uses the lowercase-first spelling, which the API resolves to it.
+    session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
     await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
     def create(target,*args,**kwargs):
         if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
@@ -22413,7 +25008,7 @@ async def proof():
 asyncio.run(proof())
 print('PASS independent API lifespan restores recovery, exact records and historical session')
 """
-    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources'),'EXPORTS_DIR':str(Path(temp)/'exports')}
     restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
     if restarted.returncode:print(restarted.stderr,flush=True)
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
@@ -22539,7 +25134,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
                     alias=name[:1].lower()+name[1:]
                     creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
-                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
+                    check(creation.status_code==201 and creation.json()['name']==name,'collection HTTP creation from a supported lowercase alias answers the stored name (#372)')
                     col=client.collections.get(name)
                     source=[]
                     for i in range(2):
@@ -23133,6 +25728,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -23144,12 +25740,23 @@ log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
 
 
+def _sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def publish(path: Path, config: dict) -> None:
     """Publish this request's complete value, preserving the old file on failure.
 
     Serialize the whole transaction within this API process. Exclusive temporary
     names ensure even independent processes cannot rename each other's payloads.
     A later successful save may supersede this value after atomic replacement.
+    The folder is fsynced after the replacement (#445); if that fails, the save
+    raises with the new value already in place.
     """
     with _write_lock:
         payload = json.dumps(config, indent=2, sort_keys=True)
@@ -23163,6 +25770,7 @@ def publish(path: Path, config: dict) -> None:
                 output.write(payload)
             temporary.replace(path)
             temporary = None
+            _sync_folder(path.parent)
         finally:
             if temporary is not None:
                 try:
@@ -23203,8 +25811,10 @@ if __name__ == '__main__':
 
 ```python
 """Deterministic settings publication regressions; no backend or model calls."""
+import errno
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -23397,6 +26007,89 @@ class SettingsPersistenceTests(unittest.TestCase):
             with self.subTest(service=service.__name__):
                 self.assert_failure_preserves_old_value(service,
                     patch.object(Path, 'replace', side_effect=OSError('injected replace fault')), OSError)
+
+    @contextmanager
+    def recorded(self, events, fail_folder_sync=False):
+        """Record replace and the folder sync's open, fsync and close (#445).
+        With fail_folder_sync, an fsync of a folder fails as on a broken volume."""
+        real_replace, real_open = Path.replace, os.open
+        real_fsync, real_close = os.fsync, os.close
+
+        def replace(source, target):
+            events.append(('replace', Path(target)))
+            return real_replace(source, target)
+
+        def open_(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            events.append(('open', fd, Path(path)))
+            return fd
+
+        def fsync(fd):
+            folder = stat.S_ISDIR(os.fstat(fd).st_mode)
+            events.append(('fsync folder' if folder else 'fsync file', fd))
+            if folder and fail_folder_sync:
+                raise OSError(errno.EIO, 'injected folder sync fault')
+            return real_fsync(fd)
+
+        def close(fd):
+            events.append(('close', fd))
+            return real_close(fd)
+
+        with patch.object(Path, 'replace', replace), \
+             patch.object(os, 'open', side_effect=open_), \
+             patch.object(os, 'fsync', side_effect=fsync), \
+             patch.object(os, 'close', side_effect=close):
+            yield
+
+    def after_replace(self, events):
+        names = [event[0] for event in events]
+        self.assertEqual(names.count('replace'), 1, events)
+        return events[names.index('replace') + 1:]
+
+    def test_the_folder_is_fsynced_after_the_replacement(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events):
+                    service.save(attempted)
+                after = self.after_replace(events)
+                self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+                fd, folder = after[0][1], after[0][2]
+                self.assertEqual(folder, service._dir())
+                self.assertEqual((after[1][1], after[2][1]), (fd, fd))
+                self.assertEqual(service.load(old['collection']), attempted)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_import_publication_fsyncs_the_folder_after_the_replacement(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            _, incoming, _ = self.values(ingest_config)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            events = []
+            with self.recorded(events):
+                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [])
+            after = self.after_replace(events)
+            self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+            self.assertEqual(after[0][2], ingest_config._path(incoming['collection']).parent)
+            self.assertEqual(ingest_config.load(incoming['collection']), incoming)
+
+    def test_a_failed_folder_sync_raises_with_the_new_value_in_place(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events, fail_folder_sync=True), self.assertRaises(OSError):
+                    service.save(attempted)
+                after = self.after_replace(events)
+                self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
+                self.assertEqual(after[2][1], after[0][1], "the folder's descriptor was left open")
+                self.assertEqual(service.load(old['collection']), attempted)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
 
     def test_serialization_failure_preserves_old_value(self):
         for service in SERVICES:
@@ -23829,8 +26522,10 @@ if __name__ == "__main__":
 ```python
 """Controlled package preflight and generated-script trust-boundary regressions."""
 import ast
+import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -23842,7 +26537,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from models.schemas import SaveRetrievalConfigBody
-from services import importer, packager, retrieval_config
+from services import importer, model_bundle, packager, retrieval_config
 
 
 INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
@@ -24113,6 +26808,231 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
 
+    def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
+                          store_available=True, broken_copy=(), fail_mid_write=(),
+                          embed_model='embed:v1'):
+        """Export with both models requested; models named in `failing` cannot bundle.
+
+        Models named in `broken_copy` resolve, but their second file's copy fails.
+        Models named in `fail_mid_write` resolve, but their second file's copy
+        fails after writing part of it. `self.exported` records each resolution."""
+        blob = self.root / 'model-blob'
+        blob.write_text('inert model bytes')
+        torn = self.root / 'torn-blob'
+        torn.write_text('bytes that never finish copying')
+        self.exported = []
+        copyfile = packager.shutil.copyfile
+
+        def export_model(model, stage):
+            self.exported.append(model)
+            if model in failing:
+                raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
+            folder = 'models/' + '/'.join(model_bundle.split_ref(model))
+            files = [(f"{folder}/manifest.json", blob)]
+            if model in broken_copy:
+                files.append((f"{folder}/blobs/sha256-gone",
+                              self.root / 'missing-blob'))
+            if model in fail_mid_write:
+                files.append((f"{folder}/blobs/sha256-torn", torn))
+            return files
+
+        def copy_or_tear(source, target):
+            if Path(source) == torn:
+                Path(target).write_text('bytes that')
+                raise OSError(28, 'No space left on device')
+            return copyfile(source, target)
+
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(settings, 'embed_model', embed_model))
+            mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed_model}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=store_available))
+            mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
+            mocks.enter_context(patch.object(packager.shutil, 'copyfile', side_effect=copy_or_tear))
+            result = packager.build('Corpus', include_models=include_models)
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
+                          and m.name.count('/') == 1)
+            manifest = json.load(archive.extractfile(member))
+        return result, manifest
+
+    def extracted(self, result):
+        """The package as import reads it: `open_package` into a fresh directory."""
+        dest = Path(tempfile.mkdtemp(dir=self.root))
+        return packager.open_package(self.exports / result['filename'], dest)
+
+    def test_a_failed_model_copy_leaves_no_part_of_that_model(self):
+        for broken in ({'broken_copy': {'chat:v2'}}, {'fail_mid_write': {'chat:v2'}}):
+            with self.subTest(**broken):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), **broken)
+                pkg, _ = self.extracted(result)
+                self.assertFalse((pkg / 'models' / 'chat').exists())
+                self.assertFalse(any(k.startswith('models/chat/') for k in manifest['files']))
+                self.assertIn('models/embed/v1/manifest.json', manifest['files'])
+                self.assertTrue((pkg / 'models' / 'embed' / 'v1' / 'manifest.json').is_file())
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed:v1'])
+                self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                                    for w in manifest['warnings']))
+
+    def test_a_failed_first_model_leaves_the_next_one_whole(self):
+        result, manifest = self.build_with_models(set(), fail_mid_write={'embed:v1'})
+        pkg, _ = self.extracted(result)
+        self.assertFalse((pkg / 'models' / 'embed').exists())
+        self.assertFalse(any(k.startswith('models/embed/') for k in manifest['files']))
+        self.assertEqual(model_bundle.bundled_models(pkg), ['chat:v2'])
+        self.assertEqual(manifest['bundled_models'], ['chat:v2'])
+
+    def test_every_model_failing_leaves_no_models_directory(self):
+        result, manifest = self.build_with_models(
+            set(), broken_copy={'embed:v1'}, fail_mid_write={'chat:v2'})
+        pkg, _ = self.extracted(result)
+        self.assertFalse((pkg / 'models').exists())
+        self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+        self.assertEqual(manifest['bundled_models'], [])
+        self.assertIs(manifest['models_bundled'], False)
+        self.assertEqual(sum(w.startswith('model ') and 'could not be bundled' in w
+                             for w in manifest['warnings']), 2)
+
+    def test_a_model_shared_by_embedding_and_llm_is_copied_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(self.exported, ['embed:v1'])
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+
+    def test_a_model_named_with_and_without_its_tag_is_one_model(self):
+        # `embed` and `embed:latest` share models/embed/latest/; a second copy
+        # failing used to delete the first's files while the manifest kept
+        # listing the model (#494).
+        # The second spelling failing is the case that lost the first's files.
+        for failing in (set(), {'embed:latest'}):
+            with self.subTest(fail_mid_write=sorted(failing)):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), embed_model='embed',
+                                                          llm_model='embed:latest',
+                                                          fail_mid_write=failing)
+                pkg, _ = self.extracted(result)
+                self.assertEqual(self.exported, ['embed'])
+                self.assertEqual(manifest['bundled_models'], ['embed:latest'])
+                self.assertIn('models/embed/latest/manifest.json', manifest['files'])
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed:latest'])
+                self.assertFalse(any('could not be bundled' in w for w in manifest['warnings']))
+        for leftover in self.exports.iterdir():
+            leftover.unlink()
+        with self.subTest(fail_mid_write=['embed']):
+            result, manifest = self.build_with_models(set(), embed_model='embed',
+                                                      llm_model='embed:latest',
+                                                      fail_mid_write={'embed'})
+            pkg, _ = self.extracted(result)
+            self.assertEqual(self.exported, ['embed'])
+            self.assertEqual(manifest['bundled_models'], [])
+            self.assertIs(manifest['models_bundled'], False)
+            self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+            self.assertFalse((pkg / 'models').exists())
+            failed = [w for w in manifest['warnings'] if 'could not be bundled' in w]
+            self.assertEqual(len(failed), 1, failed)
+            self.assertTrue(failed[0].startswith("model 'embed' could not be bundled"))
+
+    def test_manifest_lists_no_models_when_none_were_requested_or_the_store_is_missing(self):
+        for include, store in [(False, True), (True, False)]:
+            with self.subTest(include_models=include, store_available=store):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), include_models=include,
+                                                          store_available=store)
+                self.assertEqual(manifest['bundled_models'], [])
+                self.assertIs(manifest['models_bundled'], False)
+                self.assertIs(result['models_bundled'], False)
+                self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+
+    def test_manifest_lists_a_model_shared_by_embedding_and_llm_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+        self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
+        result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+        self.assertIs(manifest['models_bundled'], True)
+        self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                            for w in manifest['warnings']))
+
+    def test_manifest_lists_only_models_actually_bundled(self):
+        for failing, expected in [({'chat:v2'}, ['embed:v1']), ({'embed:v1'}, ['chat:v2']),
+                                  (set(), ['chat:v2', 'embed:v1']), ({'embed:v1', 'chat:v2'}, [])]:
+            with self.subTest(failing=sorted(failing)):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(failing)
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(manifest['models_bundled'], bool(expected))
+                self.assertEqual(result['models_bundled'], bool(expected))
+                for ref in ('embed:v1', 'chat:v2'):
+                    folder = ref.replace(':', '/')
+                    self.assertEqual(f'models/{folder}/manifest.json' in manifest['files'],
+                                     ref in expected)
+                for model in sorted(failing):
+                    self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
+                                        for w in manifest['warnings']))
+
+    def test_package_readme_contents_come_from_the_partial(self):
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        partial = (packager._TEMPLATE_DIR / 'partials' / 'contents.md').read_text().rstrip('\n')
+        self.assertTrue(readme.rstrip('\n').endswith('## Contents\n\n' + partial))
+        self.assertNotIn('@@', readme)
+
+    def test_failure_text_does_not_promise_an_intact_original(self):
+        # #385: a replace failure after the delete, or a tune failure during the
+        # final replacement, can leave the name missing; the data is in the
+        # recovery collection the error names (recovered_as).
+        help_page = packager.render_help(1024)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            member = next(m for m in archive.getmembers() if m.name.endswith('/README.md'))
+            readme = archive.extractfile(member).read().decode()
+        for name, text in (('help page', help_page), ('package README', readme)):
+            with self.subTest(name=name):
+                self.assertNotIn('leaves the original intact', text)
+                self.assertNotIn('leaves it intact', text)
+                self.assertNotIn('a failed tune leaves', text)
+                self.assertIn('recovery collection', text)
+        replace_row = next(line for line in help_page.splitlines() if line.startswith('| `replace`'))
+        self.assertIn('recovered_as', replace_row)
+        self.assertIn('missing or partial', replace_row)
+        tuning = help_page.split('## Tuning after import', 1)[1].split('**Gold-standard', 1)[0]
+        self.assertIn('before cutover', tuning)
+        self.assertIn('recovered_as', tuning)
+
+    def test_transfer_page_replace_description_names_the_recovery_collection(self):
+        root = Path(os.environ.get('RAG_TEST_API_DIR') or '.').resolve().parent  # repo root on the host
+        page = root / 'ui' / 'src' / 'pages' / 'TransferPage.tsx'
+        if not page.is_file():  # the api container has no ui/ tree
+            self.skipTest('ui source not mounted')
+        line = next(l for l in page.read_text(encoding='utf-8').splitlines() if "id: 'replace'" in l)
+        self.assertNotIn('leaves it intact', line)
+        self.assertIn('recovery collection', line)
+
     def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
         for value in INVALID:
             if value is None:  # None denotes no saved file, not an invalid saved config.
@@ -24147,6 +27067,135 @@ class RetrievalImportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
 
+
+class ModelTagFolderTests(unittest.TestCase):
+    """Two tags of one model name, and a folder used only for its own tag (#487).
+
+    Uses the real model_bundle export and install against temporary Ollama
+    stores holding inert bytes; only Ollama's own listing is stubbed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.store = self.root / 'store'
+        self.target = self.root / 'target'
+        (self.target / 'models').mkdir(parents=True)
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.root / 'uploads'), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.object(importer, '_log'))
+        self.manifests = {model: self.put_model(model) for model in ('foo:a', 'foo:b', 'bar:x')}
+
+    def put_model(self, model):
+        """An Ollama manifest and blobs with bytes of this model's own."""
+        name, tag = model.split(':')
+        blobs = self.store / 'models' / 'blobs'
+        blobs.mkdir(parents=True, exist_ok=True)
+        digests = []
+        for part in ('config', 'weights'):
+            data = f'{part} of {model}'.encode()
+            digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+            (blobs / digest.replace(':', '-')).write_bytes(data)
+            digests.append(digest)
+        manifest = json.dumps({'config': {'digest': digests[0]},
+                               'layers': [{'digest': digests[1]}]}).encode()
+        path = self.store / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(manifest)
+        return manifest
+
+    def export(self, embed, llm):
+        with ExitStack() as mocks:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+                mocks.enter_context(patch.object(settings, key, str(value)))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            result = packager.build('Corpus', include_models=True)
+        return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
+
+    def ensure(self, pkg, manifest, embed, llm):
+        with patch.object(settings, 'ollama_models_dir', str(self.target)), \
+             patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(importer, '_ollama_reports', lambda model: True):
+            return importer._ensure_models(pkg, manifest)
+
+    def installed(self, model):
+        name, tag = model.split(':')
+        path = self.target / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        return path.read_bytes() if path.is_file() else None
+
+    def legacy_package(self, folder_model, manifest_models):
+        """A package in the pre-#487 layout: `models/<name>/` holding `folder_model`."""
+        pkg = self.root / 'legacy'
+        name, tag = folder_model.split(':')
+        source = json.loads(self.manifests[folder_model])
+        (pkg / 'models' / name / 'blobs').mkdir(parents=True)
+        (pkg / 'models' / name / 'manifest.json').write_bytes(self.manifests[folder_model])
+        for digest in [source['config']['digest']] + [layer['digest'] for layer in source['layers']]:
+            blob = self.store / 'models' / 'blobs' / digest.replace(':', '-')
+            (pkg / 'models' / name / 'blobs' / blob.name).write_bytes(blob.read_bytes())
+        embed, llm = manifest_models
+        return pkg, {'embedding': {'model': embed}, 'llm': {'model': llm}}
+
+    # Each test checks the import outcome first, so on develop it fails on the
+    # wrong install itself rather than on the new layout or signature.
+    def test_two_tags_of_one_name_are_bundled_apart_and_each_installed_as_itself(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])  # develop: foo:b's
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+        for model in ('foo:a', 'foo:b'):
+            folder = 'models/' + model.replace(':', '/')
+            self.assertIn(f'{folder}/manifest.json', manifest['files'])
+            self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_bundled_tag_is_never_installed_under_another_tag(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
+
+    def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
+        pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
+
+    def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
+        # The pre-#487 export wrote both tags into models/foo/, the LLM's last.
+        pkg, manifest = self.legacy_package('foo:b', ('foo:a', 'foo:b'))
+        with self.assertRaises(packager.PackageError) as caught:  # develop: installs foo:b as foo:a
+            self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertIsNone(self.installed('foo:a'))
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), [])
+
+    def test_an_old_package_folder_is_not_installed_under_another_tag(self):
+        pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
 
 if __name__ == '__main__':
     unittest.main()
@@ -24412,6 +27461,1868 @@ if (require.main === module) (async () => {
   const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   const reporter = makeReporter();
   try { await runChunkingConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/health_page.js
+
+```javascript
+// Health page refreshes with every API call stubbed and held in the page (#415);
+// no backend state. Each load is driven by hand through the captured 30s refresh.
+const assert = require('node:assert/strict');
+const { makeReporter } = require('./lib');
+
+const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
+const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
+const healthBody = (embed = 'ok') => ({
+  status: embed === 'ok' ? 'ok' : 'degraded',
+  services: {
+    weaviate: service('ok', 11),
+    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+  },
+  resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
+});
+const metricsBody = n => ({
+  total_records: n,
+  retrieval_latency: { p50: 10, p95: 20, p99: 30 },
+  llm_latency: { p50: 100, p95: 200, p99: 300 },
+  total_latency: { p50: 110, p95: 220, p99: 330 },
+  history: Array.from({ length: n }, (_, i) => ({ timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString(), collection: 'OwnedFixture', retrieval_mode: 'hybrid', retrieval_ms: 10, llm_ms: 100, total_ms: 110 })),
+});
+const OK = { status: 200, body: healthBody() };
+const DEGRADED = { status: 503, body: healthBody('error') };
+const ERROR = message => ({ status: 500, body: { error: { code: 'INTERNAL_ERROR', message } } });
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.evaluateOnNewDocument((health, metrics) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const original = window.setInterval;
+    window.setInterval = (fn, delay, ...args) => {
+      if (delay === 30000) { window.__healthRefresh = fn; return 45003; }
+      return original(fn, delay, ...args);
+    };
+    const realFetch = window.fetch.bind(window);
+    window.healthFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      if (path === '/api/goldstandard/diagnostics') return Promise.resolve(new Response(JSON.stringify({ issues: [] }), { status: 200 }));
+      if (path === health || path === metrics) {
+        const entry = { path, done: false };
+        window.healthFixture.requests.push(entry);
+        return new Promise((resolve, reject) => {
+          entry.release = ({ status = 200, body, text, fail }) => {
+            entry.done = true;
+            if (fail) return reject(new TypeError('Failed to fetch'));
+            resolve(new Response(text !== undefined ? text : JSON.stringify(body), { status }));
+          };
+        });
+      }
+      return Promise.reject(new Error('Unexpected fixture request ' + path));
+    };
+  }, HEALTH, METRICS);
+  await page.goto(base + '/health', { waitUntil: 'domcontentloaded' });
+  await requested(page, 1);
+  return { ctx, page, errors };
+}
+// Wait until `n` loads have asked for both health and metrics.
+async function requested(page, n) {
+  await page.waitForFunction((h, m, count) => ['h', 'm'].every((_, i) =>
+    window.healthFixture.requests.filter(r => r.path === [h, m][i]).length >= count), { timeout: 5000 }, HEALTH, METRICS, n);
+}
+// Answer load `load` (1 = the first) for `path`, then let React render.
+async function release(page, path, load, answer) {
+  await page.evaluate(async (p, i, a) => {
+    const entry = window.healthFixture.requests.filter(r => r.path === p)[i - 1];
+    if (!entry || entry.done) throw new Error(`no pending ${p} for load ${i}`);
+    entry.release(a);
+    await new Promise(r => setTimeout(r, 50));
+    for (let k = 0; k < 2; k++) await new Promise(r => requestAnimationFrame(() => r()));
+  }, path, load, answer);
+}
+async function refresh(page, n) {
+  await page.evaluate(() => window.__healthRefresh());
+  await requested(page, n);
+}
+async function load(page, n, health, metrics) {
+  await release(page, HEALTH, n, health);
+  await release(page, METRICS, n, metrics);
+}
+const text = page => page.evaluate(() => (document.querySelector('#root')?.innerText || '').replace(/\s+/g, ' ').trim());
+// Each service card's label and dot colour; the latency tiles have no dot.
+const cards = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')].map(dot => ({
+  label: (dot.parentElement.textContent || '').trim(),
+  colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
+})).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
+const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
+const charts = n => `Latency Trends (${n} queries in ring buffer)`;
+const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
+
+async function assertCharts(page, n) {
+  const t = await text(page);
+  assert.ok(t.includes(charts(n)), `expected "${charts(n)}" in: ${t.slice(0, 300)}`);
+}
+async function assertUnreadable(page, message) {
+  const t = await text(page);
+  assert.ok(t.includes(message), `expected "${message}" in: ${t.slice(0, 300)}`);
+  assert.equal(await cards(page), '');
+}
+
+async function runHealthPageTests(browser, base, reporter) {
+  reporter.section('Health page refreshes (#415, stubbed API)');
+  const cases = [
+    ['a failed metrics call (API error) keeps the last charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(2) });
+      await refresh(page, 2);
+      await load(page, 2, DEGRADED, ERROR('Synthetic metrics failure'));
+      await assertCharts(page, 2);
+      assert.equal(await cards(page), EMBED_RED, 'the same refresh\'s health is shown');
+    }],
+    ['a failed metrics call (no answer) keeps the last charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(2) });
+      await refresh(page, 2);
+      await load(page, 2, DEGRADED, { fail: true });
+      await assertCharts(page, 2);
+      assert.equal(await cards(page), EMBED_RED, 'the same refresh\'s health is shown');
+    }],
+    ['a JSON 200 without the health shape is unreadable, not a page error', async page => {
+      await load(page, 1, { status: 200, body: { status: 'ok' } }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+      await assertCharts(page, 1);
+    }],
+    ['an empty 200 is unreadable', async page => {
+      await load(page, 1, { status: 200, text: '' }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
+    ['a non-JSON 200 is unreadable', async page => {
+      await load(page, 1, { status: 200, text: '<html><body>Not the API</body></html>' }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
+    ['a 503 with the JSON error envelope shows its message, not cards', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2);
+      await load(page, 2, { status: 503, body: { error: { code: 'SERVICE_UNAVAILABLE', message: 'Synthetic health envelope' } } }, { body: metricsBody(1) });
+      await assertUnreadable(page, 'Service health could not be read: Synthetic health envelope');
+    }],
+    ['a late older health failure cannot replace a newer success', async page => {
+      await load(page, 1, DEGRADED, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, HEALTH, 3, OK);
+      await release(page, HEALTH, 2, { fail: true });
+      const t = await text(page);
+      assert.equal(healthAlert(t), '');
+      assert.equal(await cards(page), ALL_GREEN);
+    }],
+    ['a late older health success cannot replace a newer failure', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, HEALTH, 3, { status: 502, text: '<html>502 Bad Gateway</html>' });
+      await release(page, HEALTH, 2, DEGRADED);
+      await assertUnreadable(page, 'Service health could not be read: The API is not responding');
+    }],
+    ['a late older metrics success cannot replace newer charts', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      await refresh(page, 2); await refresh(page, 3);
+      await release(page, METRICS, 3, { body: metricsBody(5) });
+      await release(page, METRICS, 2, { body: metricsBody(3) });
+      await assertCharts(page, 5);
+    }],
+    ['a late older metrics success after a newer failure is shown', async page => {
+      await refresh(page, 2);
+      await release(page, METRICS, 2, ERROR('Synthetic metrics failure'));
+      await release(page, METRICS, 1, { body: metricsBody(4) });
+      await assertCharts(page, 4);
+    }],
+  ];
+  for (const [name, test] of cases) {
+    let s;
+    try { s = await fixture(browser, base); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.stack || e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+module.exports = { runHealthPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runHealthPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/transfer_page.js
+
+```javascript
+// Transfer page polling and failure display (#382), against the rendered page
+// with every API call stubbed in the browser; no backend reads or writes.
+//
+// Each case gets fresh fetch stubs. Fixed answers cover the collections, the
+// package list and the fidelity lookup unless a case holds them; every other
+// /api/ request is held until the case releases it with a status and body. The
+// page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
+// second.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue } = require('./lib');
+
+const A = 'VfyTransferA', B = 'VfyTransferB';
+const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
+const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
+const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
+const json = (status, body) => ({ status, body: JSON.stringify(body) });
+const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
+// nginx's own page when the API is down; request() turns it into this message.
+const BAD_GATEWAY = { status: 502, body: '<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>' };
+const DOWN = 'The API is not responding. It may still be starting; try again in a minute.';
+const exportJob = (status, extra = {}) => json(200, { job_id: 'vfyexp', status, collection: A, chunks_written: 1, filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null, retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null, ...extra });
+const importJob = (status, extra = {}) => json(200, { job_id: 'vfyimp', status, filename: PACKAGE, on_conflict: 'abort', collection: null, original_collection: null, chunks_written: 1, fidelity: null, renamed: false, notes: [], error: null, error_code: null, error_detail: null, ...extra });
+
+const HALVES = {
+  export: { start: '/api/export', started: json(202, { job_id: 'vfyexp', status: 'queued', collection: A }), poll: '/api/export/job/vfyexp', job: exportJob, idle: 'Export', busy: 'Exporting…', progress: "the export's progress",
+            done: exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true }) },
+  import: { start: '/api/import', started: json(202, { job_id: 'vfyimp', status: 'queued', filename: PACKAGE }), poll: '/api/import/job/vfyimp', job: importJob, idle: 'Import', busy: 'Importing…', progress: "the import's progress",
+            done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
+};
+
+async function fixture(browser, base, { hold = [] } = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  const fixed = {
+    'GET /api/collections': json(200, collectionsBody),
+    'GET /api/packages': json(200, packagesBody),
+    ['GET /api/tune/' + A]: json(200, tuneBody(A)),
+    ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+  };
+  for (const key of hold) delete fixed[key];
+  await page.evaluateOnNewDocument(answers => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
+    const realFetch = window.fetch.bind(window);
+    window.transferFixture = { requests: [] };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const entry = { path, method, done: false };
+      window.transferFixture.requests.push(entry);
+      const answer = answers[method + ' ' + path];
+      if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
+      return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
+    };
+  }, fixed);
+  await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
+  return { ctx, page, errors };
+}
+
+const count = (page, path, method = 'GET') => page.evaluate((p, m) => window.transferFixture.requests.filter(r => r.path === p && r.method === m).length, path, method);
+async function pending(page, path, method = 'GET') {
+  await page.waitForFunction((p, m) => window.transferFixture.requests.some(r => r.path === p && r.method === m && !r.done), { timeout: 5000 }, path, method)
+    .catch(() => { throw new Error(`no ${method} ${path} request arrived`); });
+}
+async function release(page, path, answer, method = 'GET') {
+  await pending(page, path, method);
+  await page.evaluate((p, m, status, body) => {
+    window.transferFixture.requests.find(r => r.path === p && r.method === m && !r.done).resolve(status, body);
+  }, path, method, answer.status, answer.body);
+}
+const text = page => page.evaluate(() => document.body.innerText.replace(/\s+/g, ' '));
+async function waitText(page, want, gone = false) {
+  await page.waitForFunction((w, g) => document.body.innerText.replace(/\s+/g, ' ').includes(w) !== g, { timeout: 5000 }, want, gone)
+    .catch(async () => { throw new Error(`${gone ? 'still shows' : 'never showed'} "${want}"; page: ${(await text(page)).slice(0, 600)}`); });
+}
+// The half's start button, found by either of its labels.
+const button = (page, half) => page.evaluate((idle, busy) => {
+  const b = [...document.querySelectorAll('button')].find(x => [idle, busy].includes(x.textContent.trim()));
+  return b ? { label: b.textContent.trim(), disabled: b.disabled } : null;
+}, HALVES[half].idle, HALVES[half].busy);
+async function expectButton(page, half, busy) {
+  const want = busy ? HALVES[half].busy : HALVES[half].idle;
+  await page.waitForFunction((label, disabled) => [...document.querySelectorAll('button')].some(x => x.textContent.trim() === label && x.disabled === disabled), { timeout: 5000 }, want, busy)
+    .catch(async () => { throw new Error(`expected "${want}" ${busy ? 'disabled' : 'enabled'}, got ${JSON.stringify(await button(page, half))}`); });
+}
+// Buttons only by default: the nav has an "Import" link as well as the Import button.
+const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
+  const b = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
+  if (!b) return false; b.click(); return true;
+}, label, selector);
+
+// Selects the package (import) and starts the half; leaves its start request held.
+async function start(page, half) {
+  if (half === 'import') {
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(PACKAGE)}))`, PACKAGE);
+  }
+  await expectButton(page, half, false);
+  assert.equal(await click(page, HALVES[half].idle), true, `no ${HALVES[half].idle} button`);
+  await pending(page, HALVES[half].start, 'POST');
+}
+async function startAndPoll(page, half) {
+  await start(page, half);
+  await release(page, HALVES[half].start, HALVES[half].started, 'POST');
+  await pending(page, HALVES[half].poll);
+}
+const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
+const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
+
+async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+async function runTransferPageTests(browser, base, reporter) {
+  reporter.section('Transfer page polling and failures (#382)');
+  const cases = [];
+  for (const half of ['export', 'import']) {
+    const h = HALVES[half];
+    cases.push([`${half}: a failed poll is shown and retried with the button still busy, and the next good poll clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.job('running'));
+      await waitText(page, retrying(half), true);
+      await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, retrying(half));
+      await expectButton(page, half, true);
+      await release(page, h.poll, h.done);
+      await waitText(page, 'Done.');
+      await waitText(page, retrying(half), true);
+      await expectButton(page, half, false);
+    }]);
+    cases.push([`${half}: after 30 failed polls in a row polling stops, the reason is shown and the button is usable; a new start clears it`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      for (let i = 0; i < 30; i++) await release(page, h.poll, BAD_GATEWAY);
+      await waitText(page, stopped(half));
+      await expectButton(page, half, false);
+      const polls = await count(page, h.poll);
+      await sleep(400);
+      assert.equal(await count(page, h.poll), polls, 'polling went on after the limit');
+      assert.equal(polls, 31, 'one good poll and 30 failed ones');
+      await start(page, half);
+      await waitText(page, stopped(half), true);
+    }]);
+    cases.push([`${half}: a poll in flight when the page is left schedules no further poll`, async page => {
+      await startAndPoll(page, half);
+      await release(page, h.poll, h.job('running'));
+      await pending(page, h.poll);
+      assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+      await page.waitForFunction(() => location.pathname === '/collections');
+      await release(page, h.poll, h.job('running'));
+      await sleep(400);
+      assert.equal(await count(page, h.poll), 2, 'a poll was sent after the page was left');
+    }]);
+  }
+  cases.push(['export: a start answered after the page was left starts no polling', async page => {
+    await start(page, 'export');
+    assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+    await page.waitForFunction(() => location.pathname === '/collections');
+    await release(page, HALVES.export.start, HALVES.export.started, 'POST');
+    await sleep(400);
+    assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
+                                     [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],
+                                     [404, 'COLLECTION_NOT_FOUND', `Collection '${A}' not found.`]]) {
+    cases.push([`fidelity: a ${status} ${code} from /tune is labelled, not hidden`, async page => {
+      await pending(page, '/api/tune/' + A);
+      await waitText(page, 'Fidelity: reading…');
+      await release(page, '/api/tune/' + A, apiError(status, code, msg));
+      await waitText(page, `Fidelity: unknown — it could not be read: ${msg}`);
+    }, { hold: ['GET /api/tune/' + A] }]);
+  }
+  cases.push(['fidelity: a good lookup shows the fidelity line', async page => {
+    await waitText(page, 'Fidelity: with-sources — 2 original document(s) will travel with the package.');
+  }]);
+  cases.push(['fidelity: a late answer for a collection no longer selected is ignored', async page => {
+    await pending(page, '/api/tune/' + A);
+    await setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(B)}))`, B);
+    await release(page, '/api/tune/' + B, json(200, { ...tuneBody(B), fidelity: 'chunks-only', source_document_count: 0 }));
+    await waitText(page, 'Fidelity: chunks-only');
+    await release(page, '/api/tune/' + A, apiError(503, 'SERVICE_UNAVAILABLE', 'Synthetic late failure.'));
+    await sleep(300);
+    const shown = await text(page);
+    assert.ok(shown.includes('Fidelity: chunks-only') && !shown.includes('Synthetic late failure.'), shown.slice(0, 600));
+  }, { hold: ['GET /api/tune/' + A, 'GET /api/tune/' + B] }]);
+  cases.push(['export: a refused export shows its error_code', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('failed', { error: 'PackageError: Synthetic embedding model mismatch.', error_code: 'EMBEDDING_MISMATCH', error_detail: { expected: 'a', found: 'b' } }));
+    await waitText(page, 'Failed.');
+    const codes = await page.evaluate(() => [...document.querySelectorAll('code')].map(c => c.textContent.trim()));
+    assert.ok(codes.includes('EMBEDDING_MISMATCH'), `codes shown: ${JSON.stringify(codes)}`);
+    await waitText(page, 'Synthetic embedding model mismatch.');
+    await expectButton(page, 'export', false);
+  }]);
+  cases.push(['packages: a failed list is shown without the empty-folder hint, and a good Refresh clears it', async page => {
+    await release(page, '/api/packages', apiError(500, 'INTERNAL_ERROR', 'Synthetic package list failure.'));
+    await waitText(page, 'Could not list the packages in ./exports: Synthetic package list failure.');
+    assert.ok(!(await text(page)).includes('Nothing in ./exports yet'), 'the empty-folder hint is shown for a failed list');
+    assert.equal(await click(page, 'Refresh'), true, 'no Refresh button');
+    await release(page, '/api/packages', json(200, packagesBody));
+    await waitText(page, 'Could not list the packages', true);
+    const listed = await page.evaluate(p => [...document.querySelectorAll('option')].some(o => o.value === p), PACKAGE);
+    assert.equal(listed, true, 'the package is not listed after a good Refresh');
+  }, { hold: ['GET /api/packages'] }]);
+
+  for (const [name, test, opts] of cases) {
+    let s;
+    try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
+    catch (e) { reporter.check(name, false, e.message); }
+    finally { if (s) await s.ctx.close(); }
+  }
+}
+
+module.exports = { runTransferPageTests };
+if (require.main === module) (async () => {
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runTransferPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/goldstandard_page.js
+
+```javascript
+// Gold Standard page details (#393): the default export name, the encoded
+// download URL with the popup blocker on, the review row preview and the sample
+// size bounds, the export name fallbacks, and the popup blocker. Generation outcomes and the guards on actions in flight (#380):
+// the final status, failed pairs and reasons, a stopped poll, Generate and
+// Regenerate while they run, and a refused edit. Every /api/ call from the page
+// is answered here; no backend writes.
+const { sleep, setValue, clickByText, bodyText, makeReporter } = require('./lib');
+
+const SESSION = 'gs_0393abcd';
+const NAME_RE = /^FixtureGold_\d{8}_\d{6}\.json$/;
+// A name the API can't save today, so the check covers every character the
+// issue names; the page must encode whatever name the API returns.
+const SAVED = 'Gold 393 #1?%.json';
+const DOWNLOAD = '/api/goldstandard/download/' + encodeURIComponent(SAVED);
+const CONTEXT = 'abcdefghij'.repeat(40); // 400 characters
+const LONG = 'L'.repeat(140);
+const ANSWER = 'Distinct answer 469';
+const TRUTH = 'Distinct ground truth 469';
+
+const pair = { pair_id: 'p1', question: 'Fixture question 393', answer: 'Fixture answer', contexts: [CONTEXT], ground_truth: 'Fixture answer', source_file: 'fixture.txt', chunk_index: 0, status: 'approved' };
+const sessionBody = (collection, p = pair) => ({ session_id: SESSION, collection, status: 'completed', pairs_total: 1, pairs_completed: 1, pairs: [p] });
+const json = (request, status, body) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(body) });
+const apiError = (status, message) => ({ status, body: { error: { code: 'FIXTURE', message, detail: null } } });
+const pair2 = { ...pair, pair_id: 'p2', question: 'Second question 380', status: 'pending' };
+
+// A page whose /api/ calls are all answered by `opts`; window.open is recorded
+// (and opens nothing) unless realOpen is set.
+async function fixture(browser, base, opts = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const activation = {}, errors = [], generates = [], polls = [], patches = [], regenerates = [], dialogs = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
+  await page.evaluateOnNewDocument(realOpen => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    window.__opened = [];
+    if (!realOpen) window.open = url => { window.__opened.push(String(url)); return null; };
+  }, !!opts.realOpen);
+  if (opts.pollMs) {
+    // The page polls every 2 s; a case that needs more polls asks for a shorter delay.
+    await page.evaluateOnNewDocument(ms => {
+      const si = window.setInterval.bind(window);
+      window.setInterval = (fn, delay, ...rest) => si(fn, delay === 2000 ? ms : delay, ...rest);
+    }, opts.pollMs);
+  }
+  await page.setRequestInterception(true);
+  page.on('request', async request => {
+    const path = new URL(request.url()).pathname;
+    if (!path.startsWith('/api/')) return request.continue();
+    if (path === '/api/collections') {
+      return json(request, 200, { collections: ['FixtureGold', 'Other'].map(name => ({ name, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) });
+    }
+    if (path === '/api/goldstandard/generate') {
+      generates.push(JSON.parse(request.postData() || '{}'));
+      if (opts.generateDelay) await sleep(opts.generateDelay);
+      return json(request, 200, { session_id: SESSION, status: 'generating', pairs_total: 1 });
+    }
+    if (path === '/api/goldstandard/session/' + SESSION && request.method() === 'GET') {
+      polls.push(Date.now());
+      const answer = opts.session ? opts.session(polls.length) : null;
+      if (answer) return json(request, answer.status || 200, answer.body);
+      return json(request, 200, sessionBody(opts.collection || 'FixtureGold'));
+    }
+    if (path.startsWith('/api/goldstandard/session/' + SESSION + '/pair/') && request.method() === 'PATCH') {
+      const body = JSON.parse(request.postData() || '{}');
+      patches.push(body);
+      const answer = opts.patch ? opts.patch(patches.length) : null;
+      if (answer) return json(request, answer.status, answer.body);
+      const target = [pair, pair2].find(x => x.pair_id === path.split('/').pop());
+      return json(request, 200, { ...target, ...body });
+    }
+    if (path === '/api/goldstandard/regenerate') {
+      const body = JSON.parse(request.postData() || '{}');
+      regenerates.push(body);
+      if (opts.regenerateDelay) await sleep(opts.regenerateDelay);
+      return json(request, 200, { ...[pair, pair2].find(x => x.pair_id === body.pair_id), question: 'Regenerated question 380', status: 'pending' });
+    }
+    if (path === '/api/goldstandard/save') {
+      if (opts.saveDelay) await sleep(opts.saveDelay);
+      if (opts.saveUntilInactive) {
+        // Hold the answer until the browser says the click's user activation has
+        // lapsed, not for a fixed time; give up after 15 s. page.evaluate would
+        // itself count as a user gesture and keep the activation alive, so ask
+        // through the protocol with userGesture off.
+        const cdp = await page.createCDPSession();
+        const isActive = () => cdp.send('Runtime.evaluate', { expression: 'navigator.userActivation.isActive', returnByValue: true, userGesture: false })
+          .then(x => x.result.value === true, () => false);
+        activation.atRequest = await isActive();
+        for (let i = 0; i < 150 && await isActive(); i++) await sleep(100);
+        activation.lapsed = !(await isActive());
+      }
+      return json(request, 200, { filename: SAVED, pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/' + SAVED, historical: false, session_validity: { stale: false } });
+    }
+    return json(request, 404, { error: { code: 'NOT_FOUND', message: 'Not stubbed by the fixture.' } });
+  });
+  await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
+  await sleep(300);
+  return { ctx, page, activation, errors, generates, polls, patches, regenerates, dialogs };
+}
+
+const filenameValue = page => page.evaluate(() => document.querySelector('input[placeholder="filename.json"]')?.value ?? null);
+
+async function lookup(page) {
+  await setValue(page, '() => document.getElementById("retained-session")', SESSION);
+  await sleep(100); await clickByText(page, 'Load / refresh session'); await sleep(400);
+}
+
+// Polls the page until fn(arg) is true, for up to 8 s.
+async function until(page, fn, arg) {
+  for (let i = 0; i < 80; i++) {
+    if (await page.evaluate(fn, arg)) return true;
+    await sleep(100);
+  }
+  return false;
+}
+const button = (page, text) => page.evaluate(t => {
+  const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === t);
+  return b ? { disabled: b.disabled } : null;
+}, text);
+const generateState = page => button(page, 'Generate Pairs');
+// A row's action button, found by the row's question and the button's title.
+const rowButton = (page, question, title) => page.evaluate((q, t) => {
+  const d = [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q);
+  const b = d && [...d.querySelectorAll('summary button')].find(x => x.title === t || x.title === 'Regenerating...' && t === 'Regenerate');
+  return b ? { disabled: b.disabled, title: b.title } : null;
+}, question, title);
+const clickRow = (page, question, title) => page.evaluate((q, t) => {
+  const d = [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q);
+  const b = d && [...d.querySelectorAll('summary button')].find(x => x.title === t || x.title === 'Regenerating...' && t === 'Regenerate');
+  if (!b) return false; b.click(); return true;
+}, question, title);
+const page_modalAlert = page => page.evaluate(() => document.querySelector('.fixed [role=alert]')?.textContent.trim() ?? null);
+const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(x => x.textContent.replace(/\s+/g, ' ').trim()));
+const fields = page => page.evaluate(() => [...document.querySelectorAll('.fixed textarea')].map(t => t.value));
+
+async function runGoldStandardPageTests(browser, base, r) {
+  r.section('Gold Standard page details (#393)');
+
+  async function run(name, opts, body, inBrowser = browser) {
+    let s;
+    try {
+      s = await fixture(inBrowser, base, opts);
+      await body(s);
+      r.check(name + ': no React page errors', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    } catch (e) {
+      r.check(name, false, e.stack || e.message);
+    } finally { if (s) await s.ctx.close(); }
+  }
+
+  await run('generate', {}, async s => {
+    await clickByText(s.page, 'Generate Pairs'); await sleep(2600);
+    const value = await filenameValue(s.page);
+    r.check('after Generate the filename is {collection}_{YYYYMMDD_HHMMSS}.json, with no double dot', NAME_RE.test(value || ''), String(value));
+  });
+
+  await run('lookup', { collection: 'Gold fixture-393' }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page);
+    r.check('a loaded session pre-fills the filename from its collection, as the API would name it', /^Gold_fixture393_\d{8}_\d{6}\.json$/.test(value || ''), String(value));
+  });
+
+  await run('long name', { collection: LONG }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page) || '';
+    r.check('a long collection name is shortened to a 128-character filename', value.length === 128 && /^L+_\d{8}_\d{6}\.json$/.test(value), `${value.length}: ${value}`);
+  });
+
+  await run('no collection', { session: () => ({ body: { ...sessionBody('x'), collection: undefined } }) }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page);
+    r.check('a session with no collection pre-fills export_{YYYYMMDD_HHMMSS}.json', /^export_\d{8}_\d{6}\.json$/.test(value || ''), String(value));
+  });
+
+  await run('no safe characters', { collection: '#?%!' }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page);
+    r.check('a collection with no safe characters pre-fills _{YYYYMMDD_HHMMSS}.json, as the API names it', /^_\d{8}_\d{6}\.json$/.test(value || ''), String(value));
+  });
+
+  await run('download URL', {}, async s => {
+    await lookup(s.page);
+    await clickByText(s.page, 'Export Approved'); await sleep(500);
+    const opened = await s.page.evaluate(() => window.__opened);
+    r.check('export opens the download URL with the filename encoded', opened.length === 1 && new URL(opened[0], base).pathname === DOWNLOAD && !opened[0].includes('#'), JSON.stringify(opened));
+  });
+
+  await run('review row', { session: () => ({ body: sessionBody('FixtureGold', { ...pair, answer: ANSWER, ground_truth: TRUTH }) }) }, async s => {
+    await lookup(s.page);
+    const row = await s.page.evaluate(() => {
+      const d = [...document.querySelectorAll('details')].find(x => x.textContent.includes('Fixture question 393'));
+      if (!d) return null;
+      const closed = d.open; d.querySelector('summary').click();
+      const ctx = [...d.querySelectorAll('div')].find(x => x.textContent.startsWith('Context:'));
+      const field = label => {
+        const x = [...d.querySelectorAll('div')].find(y => y.firstElementChild?.tagName === 'STRONG' && y.firstElementChild.textContent === label);
+        return x ? x.textContent.slice(label.length).trim() : null;
+      };
+      return { closed, open: d.open, preview: ctx ? ctx.querySelector('span').textContent : null, answer: field('Answer:'), truth: field('Ground Truth:') };
+    });
+    r.check('a review row expands to the context: its first 300 characters, then …',
+      row && row.closed === false && row.open === true && row.preview === CONTEXT.slice(0, 300) + '…', JSON.stringify(row && { ...row, preview: row.preview && row.preview.length }));
+    r.check('a review row expands to its answer', row && row.answer === ANSWER, JSON.stringify(row && row.answer));
+    r.check('a review row expands to its ground truth, apart from the answer', row && row.truth === TRUTH, JSON.stringify(row && row.truth));
+  });
+
+  await run('sample size', {}, async s => {
+    const state = () => s.page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs');
+      return { disabled: b.disabled, message: document.body.innerText.includes('Sample size must be a whole number from 1 to 100.') };
+    });
+    for (const bad of ['0', '101', '2.5', '']) {
+      await setValue(s.page, '() => document.querySelector("input[type=number]")', bad); await sleep(100);
+      await s.page.evaluate(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').click());
+      await sleep(200);
+      const st = await state();
+      r.check(`sample size "${bad}" disables Generate with the 1-100 message`, st.disabled && st.message, JSON.stringify(st));
+    }
+    r.check('an out-of-range sample size sends no generate request', s.generates.length === 0, JSON.stringify(s.generates));
+    await setValue(s.page, '() => document.querySelector("input[type=number]")', '100'); await sleep(100);
+    const ok = await state();
+    r.check('sample size 100 enables Generate and removes the message', !ok.disabled && !ok.message, JSON.stringify(ok));
+    await setValue(s.page, '() => document.querySelector("input[type=number]")', '1'); await sleep(100);
+    const low = await state();
+    r.check('sample size 1 enables Generate and removes the message', !low.disabled && !low.message, JSON.stringify(low));
+  });
+
+  r.section('Gold Standard outcomes and in-flight guards (#380)');
+  const settled = over => ({ ...sessionBody('FixtureGold'), pairs_attempted: 1, pairs_failed: 0, errors: [], ...over });
+  const distinct = n => Array.from({ length: n }, (_, i) => `PAIR_GENERATION_FAILED: reason ${i + 1}`);
+
+  const outcomes = [
+    ['completed', settled({ pairs_total: 3, pairs_completed: 3 }),
+      ['Generation completed: 3 of 3 pairs generated.'], ['failed', 'no chunks'], false],
+    ['completed with failed pairs', settled({ pairs_total: 4, pairs_completed: 1, pairs_failed: 3, errors: ['TimeoutError: slow model', 'TimeoutError: slow model', 'ValueError: bad json'] }),
+      ['Generation completed: 1 of 4 pairs generated.', '3 pairs failed and are missing from the review list.', 'TimeoutError: slow model (x2)', 'ValueError: bad json'], ['no chunks'], true],
+    ['failed', settled({ status: 'failed', pairs_total: 7, pairs_completed: 0, pairs_failed: 7, pairs: [], errors: distinct(7) }),
+      ['Generation failed.', '7 of 7 pairs failed.', 'reason 1', 'reason 5', 'and 2 more reasons'], ['reason 6', 'Generation completed'], true],
+    ['cancelled', settled({ status: 'cancelled', pairs_total: 5, pairs_completed: 0, pairs_failed: 0, pairs: [] }),
+      ['Generation was cancelled.'], ['Generation completed'], true],
+    ['empty collection', settled({ pairs_total: 0, pairs_completed: 0, pairs: [] }),
+      ['No pairs were generated: the collection has no chunks.'], ['Generation failed'], true],
+  ];
+  for (const [name, body, want, notWant, isAlert] of outcomes) {
+    await run('outcome ' + name, { session: () => ({ body }) }, async s => {
+      await lookup(s.page);
+      const text = await bodyText(s.page);
+      const missing = want.filter(w => !text.includes(w)), extra = notWant.filter(w => text.includes(w));
+      r.check(`outcome, ${name}: the page shows it`, missing.length === 0 && extra.length === 0, JSON.stringify({ missing, extra, text: text.slice(0, 300) }));
+      const roles = await alerts(s.page);
+      r.check(`outcome, ${name}: it is ${isAlert ? 'an alert' : 'a status, not an alert'}`, roles.some(a => a.includes(want[0])) === isAlert, JSON.stringify(roles));
+    });
+  }
+
+  await run('generate guard', {
+    pollMs: 700, generateDelay: 100,
+    session: n => ({ body: n < 3 ? settled({ status: 'generating', pairs_total: 2, pairs_attempted: 0, pairs_completed: 0, pairs: [] }) : settled({ pairs_total: 2, pairs_completed: 2 }) }),
+  }, async s => {
+    await clickByText(s.page, 'Generate Pairs');
+    await sleep(350); // the start is answered; the first poll is still due
+    r.check('Generate is disabled between the start being accepted and the first poll', (await generateState(s.page)).disabled === true, JSON.stringify(await generateState(s.page)));
+    await s.page.evaluate(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').click());
+    await sleep(100);
+    r.check('a click in that window starts no second session and asks no confirm', s.generates.length === 1 && s.dialogs.length === 0, JSON.stringify({ generates: s.generates.length, dialogs: s.dialogs }));
+    r.check('while the session is generating the progress shows and Generate stays disabled', await until(s.page, () => document.body.innerText.includes('Generating') && [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').disabled));
+    r.check('when it completes the outcome shows and Generate is enabled again', await until(s.page, () => document.body.innerText.includes('Generation completed: 2 of 2 pairs generated.') && ![...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').disabled), JSON.stringify(await generateState(s.page)));
+  });
+
+  await run('generating session loaded by id', {
+    session: () => ({ body: settled({ status: 'generating', pairs_total: 2, pairs_attempted: 0, pairs_completed: 0, pairs: [] }) }),
+  }, async s => {
+    await lookup(s.page);
+    r.check('a retained session still generating disables Generate', (await generateState(s.page)).disabled === true, JSON.stringify(await generateState(s.page)));
+  });
+
+  for (const [label, failure] of [['an outage', apiError(503, 'Synthetic outage.')], ['a missing session', apiError(404, 'Synthetic missing session.')]]) {
+    const ctl = { fail: true };
+    await run('poll error, ' + label, {
+      pollMs: 150,
+      session: n => (n >= 2 && ctl.fail) ? failure : { body: n >= 2 ? settled({ pairs_total: 2, pairs_completed: 2 }) : settled({ status: 'generating', pairs_total: 2, pairs_attempted: 0, pairs_completed: 0, pairs: [] }) },
+    }, async s => {
+      await lookup(s.page);
+      const shown = await until(s.page, () => document.body.innerText.includes('Could not read the generation'));
+      const message = (await alerts(s.page)).find(a => a.includes('Could not read the generation')) || '';
+      r.check(`${label} while polling is shown with its reason and the way back`, shown && message.includes(failure.body.error.message) && message.includes('Polling stopped; use Load / refresh session to check again.'), message);
+      const count = s.polls.length;
+      await sleep(900);
+      r.check(`${label} stops the polling`, s.polls.length === count, `${count} -> ${s.polls.length}`);
+      r.check(`${label} releases Generate and drops the stale progress`, (await generateState(s.page)).disabled === false && !(await bodyText(s.page)).includes('Generating'), JSON.stringify(await generateState(s.page)));
+      ctl.fail = false;
+      await clickByText(s.page, 'Load / refresh session');
+      r.check(`Load / refresh after ${label} clears the message and shows the outcome`, await until(s.page, () => document.body.innerText.includes('Generation completed: 2 of 2 pairs generated.') && !document.body.innerText.includes('Could not read the generation')));
+    });
+  }
+
+  await run('regenerate guard', {
+    regenerateDelay: 700, session: () => ({ body: settled({ pairs_total: 2, pairs_completed: 2, pairs: [pair, pair2] }) }),
+  }, async s => {
+    await lookup(s.page);
+    await clickRow(s.page, pair.question, 'Regenerate');
+    await sleep(150);
+    await clickRow(s.page, pair.question, 'Regenerate');
+    const busy = await rowButton(s.page, pair.question, 'Regenerate'), other = await rowButton(s.page, pair2.question, 'Regenerate');
+    r.check('while a pair regenerates its Regenerate button is disabled and says so', busy && busy.disabled && busy.title === 'Regenerating...', JSON.stringify(busy));
+    r.check('another pair\'s Regenerate button stays enabled', other && !other.disabled, JSON.stringify(other));
+    await sleep(100);
+    r.check('repeated clicks send one regenerate request', s.regenerates.length === 1, JSON.stringify(s.regenerates));
+    r.check('when it ends the pair is replaced and its button is enabled again', await until(s.page, () => document.body.innerText.includes('Regenerated question 380')) && (await rowButton(s.page, 'Regenerated question 380', 'Regenerate')).disabled === false);
+  });
+
+  await run('refused edit', {
+    session: () => ({ body: settled({ pairs_total: 2, pairs_completed: 2, pairs: [pair, pair2] }) }),
+    patch: n => n === 1 ? apiError(422, 'Request parameters are invalid.') : null,
+  }, async s => {
+    await lookup(s.page);
+    await clickRow(s.page, pair.question, 'Edit');
+    await sleep(200);
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[0]', 'Typed question 380');
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[1]', '');
+    await clickByText(s.page, 'Save'); await sleep(500);
+    const open = (await bodyText(s.page)).includes('Edit Pair');
+    r.check('a refused edit keeps the modal open with the typed values', open && JSON.stringify(await fields(s.page)) === JSON.stringify(['Typed question 380', '', pair.ground_truth]), JSON.stringify(await fields(s.page)));
+    const inModal = await page_modalAlert(s.page);
+    r.check('the refusal is shown inside the modal', inModal === 'Request parameters are invalid.', String(inModal));
+    r.check('a refused edit sets no page-level error', await s.page.evaluate(() => ![...document.querySelectorAll('p.text-red-600')].some(x => !x.closest('.fixed'))));
+    r.check('the first edit sent only the changed fields', JSON.stringify(s.patches[0]) === JSON.stringify({ status: 'edited', question: 'Typed question 380', answer: '' }), JSON.stringify(s.patches));
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[1]', 'Typed answer 380');
+    await clickByText(s.page, 'Save');
+    r.check('a retry with the typed values saves, closes the modal and updates the row', await until(s.page, () => !document.body.innerText.includes('Edit Pair') && document.body.innerText.includes('Typed question 380')));
+    r.check('the retry sent the changed fields only', JSON.stringify(s.patches[1]) === JSON.stringify({ status: 'edited', question: 'Typed question 380', answer: 'Typed answer 380' }), JSON.stringify(s.patches));
+  });
+
+  await run('edit of one field', {
+    session: () => ({ body: settled({ pairs_total: 2, pairs_completed: 2, pairs: [pair, pair2] }) }),
+  }, async s => {
+    await lookup(s.page);
+    await clickRow(s.page, pair2.question, 'Edit');
+    await sleep(200);
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[2]', 'Only the truth changed');
+    await clickByText(s.page, 'Save');
+    await until(s.page, () => !document.body.innerText.includes('Edit Pair'));
+    r.check('an edit of one field sends that field and the status only', JSON.stringify(s.patches) === JSON.stringify([{ status: 'edited', ground_truth: 'Only the truth changed' }]), JSON.stringify(s.patches));
+  });
+
+  // Puppeteer starts Chromium with --disable-popup-blocking; turn the blocker back
+  // on and click for real, as a user would, so the window.open after the save's
+  // await is judged by the browser's user-activation rule.
+  const blocking = await require('puppeteer-core').launch({
+    executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: 'new',
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    ignoreDefaultArgs: ['--disable-popup-blocking'],
+  });
+  try {
+    for (const [label, wantTab, extra] of [['1 s', true, { saveDelay: 1000 }], ['the click\'s user activation has lapsed', false, { saveUntilInactive: true }]]) {
+      await run(`popup blocker, save after ${label}`, { realOpen: true, ...extra }, async s => {
+        await lookup(s.page);
+        const tabs = [];
+        const onTarget = t => { if (t.type() === 'page' && t.opener()) tabs.push(t.url()); };
+        blocking.on('targetcreated', onTarget);
+        const button = await s.page.evaluateHandle(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Export Approved'));
+        await button.click();
+        // Wait without page.evaluate, which counts as a user gesture and would keep the activation alive.
+        if (extra.saveUntilInactive) for (let i = 0; i < 200 && s.activation.lapsed === undefined; i++) await sleep(100);
+        await sleep(extra.saveUntilInactive ? 1500 : 2500);
+        blocking.off('targetcreated', onTarget);
+        await s.page.bringToFront();
+        const done = /1 pairs exported/.test(await bodyText(s.page));
+        if (wantTab) {
+          r.check('with the popup blocker on, a save answered in 1 s opens the download tab', done && tabs.length === 1 && new URL(tabs[0]).pathname === DOWNLOAD, JSON.stringify({ done, tabs }));
+        } else {
+          r.check('control: the blocker is on (a save answered once the user activation has lapsed opens no tab)', done && tabs.length === 0 && s.activation.atRequest === true && s.activation.lapsed === true, JSON.stringify({ done, tabs, activation: s.activation }));
+        }
+      }, blocking);
+    }
+  } finally { await blocking.close(); }
+}
+
+module.exports = { runGoldStandardPageTests };
+
+if (require.main === module) {
+  (async () => {
+    const browser = await require('puppeteer-core').launch({
+      executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser',
+      headless: 'new', args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+    const reporter = makeReporter();
+    try { await runGoldStandardPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+    finally { await browser.close(); }
+    process.exitCode = reporter.summary() ? 0 : 1;
+  })().catch(error => { console.error(error); process.exitCode = 2; });
+}
+```
+
+### scripts/verify/browser/stub.js
+
+```javascript
+// Shared fixture for the UI control checks (#400): the real built UI in a fresh
+// browser context, with every /api/ request answered by the check itself. Nothing
+// reaches the backend: an /api/ request with no stub is answered 599 and recorded,
+// and the case fails on it.
+const { makeReporter } = require('./lib');
+
+const json = (status, body) => ({ status, type: 'application/json', body: JSON.stringify(body) });
+const apiError = (status, code, message) => json(status, { error: { code, message, detail: null } });
+// nginx's own error page, which the proxy sends when it answers instead of the API.
+const html = (status, title) => ({ status, type: 'text/html', body: `<html><head><title>${status} ${title}</title></head><body><center><h1>${status} ${title}</h1></center><hr><center>nginx</center></body></html>` });
+
+// A response the case releases by hand: `route: () => h.promise`, later `h.release(answer)`.
+function hold() {
+  let release;
+  const promise = new Promise(r => { release = r; });
+  return { promise, release };
+}
+
+// routes: { 'METHOD /api/path': answer | (call) => answer | Promise<answer> }.
+// A key ending in '*' matches any path with that prefix. `call` is
+// { method, path, query, body (parsed JSON, or the raw text), raw }.
+async function openPage(browser, base, { role = 'engineer', routes = {}, path = '/', fastPolls = false, onDialog } = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [], unstubbed = [], calls = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('dialog', async d => { if (onDialog) await onDialog(d); else await d.dismiss(); });
+  await page.evaluateOnNewDocument((r, fast) => {
+    // FormData bodies, which the request interception cannot read back reliably.
+    window.__forms = [];
+    const realFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      if (init && init.body instanceof FormData) window.__forms.push([...init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : 'file:' + v.name]));
+      return realFetch(input, init);
+    };
+    // Seeded once: a case that signs out must stay signed out on the next load.
+    if (r && !sessionStorage.getItem('vfy_seeded')) { sessionStorage.setItem('vfy_seeded', '1'); sessionStorage.setItem('rag_role', JSON.stringify({ role: r })); }
+    if (fast) {
+      const si = window.setInterval.bind(window), st = window.setTimeout.bind(window);
+      window.setInterval = (fn, ms, ...a) => si(fn, ms === 2000 ? 20 : ms, ...a);
+      window.setTimeout = (fn, ms, ...a) => st(fn, ms === 2000 ? 20 : ms, ...a);
+    }
+  }, role, fastPolls);
+  await page.setRequestInterception(true);
+  page.on('request', async request => {
+    const url = new URL(request.url());
+    if (!url.pathname.startsWith('/api/')) return request.continue();
+    const method = request.method();
+    const raw = request.postData() || '';
+    let body = raw;
+    try { body = raw ? JSON.parse(raw) : null; } catch { /* multipart or text: kept raw */ }
+    const call = { method, path: url.pathname, query: url.search, body, raw };
+    calls.push(call);
+    let route = routes[method + ' ' + url.pathname];
+    if (route === undefined) {
+      const key = Object.keys(routes).find(k => k.endsWith('*') && (method + ' ' + url.pathname).startsWith(k.slice(0, -1)));
+      route = key === undefined ? undefined : routes[key];
+    }
+    if (route === undefined) { unstubbed.push(method + ' ' + url.pathname); return request.respond({ status: 599, contentType: 'text/plain', body: 'unstubbed' }); }
+    const answer = typeof route === 'function' ? await route(call) : route;
+    const a = answer && answer.promise ? await answer.promise : answer;
+    try { await request.respond({ status: a.status, contentType: a.type || 'application/json', body: a.body }); }
+    catch { /* the page navigated away while the answer was held */ }
+  });
+  if (path) await page.goto(base + path, { waitUntil: 'domcontentloaded' });
+  return { ctx, page, errors, unstubbed, calls };
+}
+
+const callsTo = (s, method, path) => s.calls.filter(c => c.method === method && c.path === path);
+const text = page => page.evaluate(() => document.body.innerText.replace(/\s+/g, ' ').trim());
+
+async function waitFor(page, fn, why, ...args) {
+  try { await page.waitForFunction(fn, { timeout: 8000 }, ...args); }
+  catch { throw new Error(`timed out waiting for ${why}; page: ${(await text(page)).slice(0, 500)}`); }
+}
+const waitText = (page, want, gone = false) =>
+  waitFor(page, (w, g) => document.body.innerText.replace(/\s+/g, ' ').includes(w) !== g, `"${want}" to ${gone ? 'go' : 'appear'}`, want, gone);
+
+// Buttons or links by exact trimmed text.
+const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
+  const el = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
+  if (!el) return false; el.click(); return true;
+}, label, selector);
+async function press(page, label, selector = 'button') {
+  if (!await click(page, label, selector)) throw new Error(`no ${selector} "${label}"; page: ${(await text(page)).slice(0, 300)}`);
+}
+
+// React ignores a plain .value assignment; use the native setter and the right event.
+const fill = (page, selector, value) => page.evaluate((sel, v) => {
+  const el = document.querySelector(sel);
+  if (!el) throw new Error('no element ' + sel);
+  const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, String(v));
+  el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+}, selector, value);
+
+// Sets the n-th element matching a selector, for sliders that share a selector.
+const fillNth = (page, selector, n, value) => page.evaluate((sel, i, v) => {
+  const el = document.querySelectorAll(sel)[i];
+  if (!el) throw new Error(`no element ${sel}[${i}]`);
+  const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, String(v));
+  el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+}, selector, n, value);
+
+const forms = page => page.evaluate(() => window.__forms);
+const buttonState = (page, label) => page.evaluate(t => {
+  const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === t);
+  return b ? { disabled: b.disabled } : null;
+}, label);
+
+const nav = page => page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+const path = page => page.evaluate(() => location.pathname);
+async function waitPath(page, want) {
+  await waitFor(page, w => location.pathname === w, `the path ${want}`, want);
+}
+
+// Runs each { name, opts, run(session) } in its own page. A case fails on a thrown
+// error, a React page error or an /api/ request it did not stub.
+async function runCases(browser, base, reporter, section, cases) {
+  reporter.section(section);
+  for (const c of cases) {
+    let s;
+    try {
+      s = await openPage(browser, base, c.open || {});
+      await c.run(s);
+      if (s.errors.length) throw new Error('page errors: ' + s.errors.join(' | '));
+      if (s.unstubbed.length) throw new Error('unstubbed API calls: ' + s.unstubbed.join(', '));
+      reporter.check(c.name, true);
+    } catch (e) {
+      reporter.check(c.name, false, String(e.message || e).slice(0, 700));
+    } finally {
+      if (s) await s.ctx.close().catch(() => {});
+    }
+  }
+}
+
+module.exports = { json, apiError, html, hold, openPage, callsTo, text, waitFor, waitText, click, press, fill, fillNth, forms, buttonState, nav, path, waitPath, runCases, makeReporter };
+```
+
+### scripts/verify/browser/ui_controls.js
+
+```javascript
+// UI controls that had no browser check (#400): Collections, Import, navigation
+// and roles, Q&A, Retrieval, and the client's handling of the proxy's own error
+// pages. Every API call is answered by the check (see stub.js), so nothing here
+// touches the backend or a model. Non-ASCII UI text is written as \u escapes.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const S = require('./stub');
+const { json, apiError, html, hold, callsTo, text, waitFor, waitText, press, fill, fillNth, forms, buttonState, nav, waitPath } = S;
+
+const A = 'VfyUiA', B = 'VfyUiB';
+const DASH = '\u2014', DOT = '\u00b7', ELLIPSIS = '\u2026', CROSS = '\u2715';
+const COLS = [
+  { name: A, object_count: 12, index_type: 'hnsw', distance_metric: 'cosine', created_at: '2026-01-02T12:00:00Z', hnsw_config: { ef: 64, efConstruction: 128, maxConnections: 64 } },
+  { name: B, object_count: 0, index_type: 'flat', distance_metric: 'dot', created_at: null, hnsw_config: null },
+];
+const retrievalConfig = (name, over = {}) => ({ collection: name, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true, ...over });
+const queryReply = (over = {}) => ({ answer: 'A plain answer.', citations: null, retrieval_latency_ms: 12, llm_latency_ms: 34, chunks_retrieved: 2, ...over });
+const CITATIONS = [
+  { source_file: 'alpha.txt', chunk_index: 2, score: 0.12345, excerpt: 'First excerpt.' },
+  { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
+];
+// Answers for the pages a case may pass through; a case adds or overrides routes.
+const base = (extra = {}) => ({
+  'GET /api/collections': json(200, { collections: COLS }),
+  'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
+  'GET /api/packages': json(200, { packages: [] }),
+  'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
+  'GET /api/help/transfer': json(200, { topic: 'transfer', markdown: '# Help\n\nSome text.' }),
+  ...extra,
+});
+
+const bodyHas = (page, want) => page.evaluate(w => document.body.innerText.replace(/\s+/g, ' ').includes(w), want);
+const labels = page => page.evaluate(() => [...document.querySelectorAll('label')].map(l => l.textContent.trim()));
+const rangeAttrs = (page, i) => page.evaluate(n => { const r = document.querySelectorAll('input[type=range]')[n]; return r ? { min: r.min, max: r.max, step: r.step, value: r.value } : null; }, i);
+const selectOptions = (page, i) => page.evaluate(n => [...(document.querySelectorAll('select')[n]?.options || [])].map(o => o.value), i);
+const selected = (page, i) => page.evaluate(n => document.querySelectorAll('select')[n]?.value, i);
+const modalOpen = page => page.evaluate(() => !!document.querySelector('.fixed.inset-0'));
+const waitSelected = (page, i, why) => waitFor(page, n => !!document.querySelectorAll('select')[n]?.value, why || 'the collection select to be filled', i);
+
+function tempFiles(names) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vfyui-'));
+  return names.map(n => { const f = path.join(dir, n); fs.writeFileSync(f, 'inert test file\n'); return f; });
+}
+async function queueFiles(page, names) {
+  const input = await page.$('#file-input');
+  await input.uploadFile(...tempFiles(names));
+  await waitText(page, names[names.length - 1]);
+}
+
+// Ctrl+Enter in the question box.
+async function ctrlEnter(page) {
+  await page.focus('textarea');
+  await page.keyboard.down('Control'); await page.keyboard.press('Enter'); await page.keyboard.up('Control');
+}
+async function askQuestion(page, question = 'What is inert?') {
+  await waitSelected(page, 0);
+  await fill(page, 'textarea', question);
+  await ctrlEnter(page);
+}
+const qaOpen = (role, routes = {}) => ({ role, path: '/qa', routes: base({ 'POST /api/query': json(200, queryReply()), ...routes }) });
+
+function collectionsCases() {
+  const open = (routes = {}) => ({ role: 'engineer', path: '/collections', routes: base(routes) });
+  return [
+    { name: 'Collections table shows its columns, each collection and a dash for a null created date', open: open(), async run(s) {
+      await waitText(s.page, A);
+      const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
+      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', '']);
+      const rows = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+      const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), COLS[0].created_at);
+      assert.deepEqual(rows[0].slice(0, 5), [A, '12', 'hnsw', 'cosine', date]);
+      assert.notEqual(date, DASH);
+      assert.deepEqual(rows[1].slice(0, 5), [B, '0', 'flat', 'dot', DASH]);
+    } },
+    { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
+      await waitText(s.page, A);
+      await press(s.page, '+ New Collection');
+      await waitFor(s.page, () => !!document.querySelector('.fixed.inset-0'), 'the modal');
+      assert.equal(await s.page.evaluate(() => document.querySelector('.fixed input:not([type=range])').value), '');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('.fixed select')[0].value), 'hnsw');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('.fixed select')[1].value), 'cosine');
+      assert.deepEqual(await rangeAttrs(s.page, 0), { min: '64', max: '512', step: '8', value: '128' });
+      assert.deepEqual(await rangeAttrs(s.page, 1), { min: '16', max: '128', step: '4', value: '64' });
+      assert.deepEqual(await rangeAttrs(s.page, 2), { min: '16', max: '512', step: '8', value: '64' });
+      const l = await labels(s.page);
+      for (const want of ['efConstruction: 128', 'maxConnections: 64', 'ef: 64']) assert.ok(l.includes(want), `label ${want} in ${JSON.stringify(l)}`);
+      await fillNth(s.page, 'input[type=range]', 0, 256);
+      assert.ok((await labels(s.page)).includes('efConstruction: 256'));
+    } },
+    { name: 'Choosing Flat removes the HNSW sliders and choosing HNSW brings them back', open: open(), async run(s) {
+      await waitText(s.page, A);
+      await press(s.page, '+ New Collection');
+      await fillNth(s.page, '.fixed select', 0, 'flat');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 0, 'the sliders to go');
+      await fillNth(s.page, '.fixed select', 0, 'hnsw');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 3, 'the sliders to return');
+    } },
+    { name: 'Create sends the typed name, the chosen index, distance and slider values, then closes and reloads the list', open: (() => {
+      let lists = 0;
+      return open({ 'GET /api/collections': () => { lists++; return json(200, { collections: lists === 1 ? COLS : [...COLS, { name: 'VfyUiNew', object_count: 0, index_type: 'hnsw', distance_metric: 'dot', created_at: null, hnsw_config: null }] }); },
+                    'POST /api/collections': json(201, { name: 'VfyUiNew' }) });
+    })(), async run(s) {
+      await waitText(s.page, A);
+      await press(s.page, '+ New Collection');
+      await fill(s.page, '.fixed input:not([type=range])', 'VfyUiNew');
+      await fillNth(s.page, '.fixed select', 1, 'dot');
+      await fillNth(s.page, 'input[type=range]', 0, 256);
+      await fillNth(s.page, 'input[type=range]', 1, 32);
+      await fillNth(s.page, 'input[type=range]', 2, 96);
+      await press(s.page, 'Create');
+      await waitText(s.page, 'VfyUiNew');
+      const posts = callsTo(s, 'POST', '/api/collections');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { name: 'VfyUiNew', index_type: 'hnsw', distance_metric: 'dot', hnsw_config: { efConstruction: 256, maxConnections: 32, ef: 96 } });
+      assert.equal(await modalOpen(s.page), false);
+      assert.equal(callsTo(s, 'GET', '/api/collections').length, 2);
+    } },
+  ];
+}
+
+function importCases() {
+  const open = (role = 'engineer', routes = {}) => ({ role, path: '/import', routes: base(routes) });
+  const strategyIs = (page, value) => fillNth(page, 'select', 1, value);
+  const ready = async page => { await waitSelected(page, 0); };
+  return [
+    { name: 'Import queued list shows each file, removes only the one chosen, and Start Ingest follows the queue', open: open(), async run(s) {
+      await ready(s.page);
+      assert.equal((await buttonState(s.page, 'Start Ingest')).disabled, true);
+      await queueFiles(s.page, ['one.txt', 'two.txt']);
+      const names = () => s.page.evaluate(() => [...document.querySelectorAll('ul li span')].map(x => x.textContent.trim()));
+      assert.deepEqual(await names(), ['one.txt', 'two.txt']);
+      assert.equal((await buttonState(s.page, 'Start Ingest')).disabled, false);
+      await press(s.page, CROSS);
+      await waitFor(s.page, () => document.querySelectorAll('ul li').length === 1, 'one file removed');
+      assert.deepEqual(await names(), ['two.txt']);
+      await press(s.page, CROSS);
+      await waitFor(s.page, () => document.querySelectorAll('ul li').length === 0, 'no files left');
+      assert.equal((await buttonState(s.page, 'Start Ingest')).disabled, true);
+    } },
+    { name: 'Import page lists the collections, selects the first and shows the default sliders', open: open(), async run(s) {
+      await ready(s.page);
+      assert.deepEqual(await selectOptions(s.page, 0), [A, B]);
+      assert.equal(await selected(s.page, 0), A);
+      const l = await labels(s.page);
+      for (const want of ['Chunk Size: 1000', 'Overlap: 200', 'Min Chunk Size: 100']) assert.ok(l.includes(want), `${want} in ${JSON.stringify(l)}`);
+      assert.ok(!l.some(x => x.startsWith('Similarity Threshold')));
+    } },
+    { name: 'Engineer sees Overlap for fixed, overlap and language, and Similarity Threshold only for semantic', open: open(), async run(s) {
+      await ready(s.page);
+      const has = async prefix => (await labels(s.page)).some(x => x.startsWith(prefix));
+      for (const strategy of ['fixed', 'overlap', 'language']) {
+        await strategyIs(s.page, strategy);
+        await waitText(s.page, strategy === 'language' ? 'natural sentence' : strategy === 'fixed' ? 'equal-sized' : 'shares some text');
+        assert.equal(await has('Overlap:'), true, strategy + ' shows Overlap');
+        assert.equal(await has('Similarity Threshold'), false, strategy + ' hides Similarity');
+      }
+      await strategyIs(s.page, 'context_aware');
+      await waitText(s.page, 'headings, paragraphs');
+      assert.equal(await has('Overlap:'), false);
+      assert.equal(await has('Similarity Threshold'), false);
+      await strategyIs(s.page, 'semantic');
+      await waitText(s.page, 'same topic');
+      assert.equal(await has('Overlap:'), false);
+      assert.equal(await has('Similarity Threshold: 0.85'), true);
+    } },
+    { name: 'Developer never sees Similarity Threshold, not even for semantic', open: open('developer'), async run(s) {
+      await ready(s.page);
+      await strategyIs(s.page, 'semantic');
+      await waitText(s.page, 'same topic');
+      assert.equal((await labels(s.page)).some(x => x.startsWith('Similarity Threshold')), false);
+      assert.equal((await labels(s.page)).some(x => x.startsWith('Overlap:')), false);
+    } },
+    { name: 'Lowering Chunk Size pulls Overlap down to Chunk Size minus 50 and caps the Overlap slider', open: open(), async run(s) {
+      await ready(s.page);
+      await fillNth(s.page, 'input[type=range]', 0, 150);
+      await waitFor(s.page, () => [...document.querySelectorAll('label')].some(l => l.textContent.trim() === 'Overlap: 100'), 'Overlap 100');
+      assert.ok((await labels(s.page)).includes('Chunk Size: 150'));
+      assert.equal((await rangeAttrs(s.page, 1)).max, '100');
+      await fillNth(s.page, 'input[type=range]', 0, 3000);
+      await waitFor(s.page, () => [...document.querySelectorAll('label')].some(l => l.textContent.trim() === 'Chunk Size: 3000'), 'Chunk Size 3000');
+      assert.equal((await rangeAttrs(s.page, 1)).max, '2000');
+      assert.ok((await labels(s.page)).includes('Overlap: 100'), 'overlap is not raised again');
+    } },
+    { name: 'Start Ingest sends the collection, strategy and slider values as the form fields', open: open('engineer', {
+      'POST /api/ingest/upload': json(202, { job_id: 'vfyjob', status: 'queued', files_queued: 1, collection: B }),
+      'GET /api/ingest/job/*': json(200, { job_id: 'vfyjob', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 1, errors: [] }) }), async run(s) {
+      await ready(s.page);
+      await queueFiles(s.page, ['doc.txt']);
+      await fillNth(s.page, 'select', 0, B);
+      await strategyIs(s.page, 'semantic');
+      await waitText(s.page, 'same topic');
+      await fillNth(s.page, 'input[type=range]', 0, 2000);
+      await fillNth(s.page, 'input[type=range]', 1, 40);
+      await fillNth(s.page, 'input[type=range]', 2, 0.5);
+      await press(s.page, 'Start Ingest');
+      await waitFor(s.page, () => window.__forms.length === 1, 'the upload');
+      const [form] = await forms(s.page);
+      const get = k => form.filter(([n]) => n === k).map(([, v]) => v);
+      assert.deepEqual(get('files'), ['file:doc.txt']);
+      assert.deepEqual(get('collection'), [B]);
+      assert.deepEqual(get('strategy'), ['semantic']);
+      assert.deepEqual(get('chunk_size'), ['2000']);
+      assert.deepEqual(get('min_chunk_size'), ['40']);
+      assert.deepEqual(get('similarity_threshold'), ['0.5']);
+      assert.deepEqual(get('chunk_overlap'), ['200']);
+    } },
+    { name: 'Import "+ New" modal ignores a blank name, creates with cosine and the default HNSW values, selects the new collection, and Cancel sends nothing', open: (() => {
+      let lists = 0;
+      return open('engineer', { 'GET /api/collections': () => { lists++; return json(200, { collections: lists === 1 ? COLS : [...COLS, { name: 'VfyUiNew', object_count: 0, index_type: 'flat', distance_metric: 'cosine', created_at: null, hnsw_config: null }] }); },
+                                'POST /api/collections': json(201, { name: 'VfyUiNew' }) });
+    })(), async run(s) {
+      await ready(s.page);
+      await press(s.page, '+ New');
+      await waitFor(s.page, () => !!document.querySelector('.fixed.inset-0'), 'the modal');
+      await press(s.page, 'Create');
+      await fill(s.page, '.fixed input', '   ');
+      await press(s.page, 'Create');
+      assert.equal(callsTo(s, 'POST', '/api/collections').length, 0);
+      assert.equal(await modalOpen(s.page), true);
+      await press(s.page, 'Cancel');
+      assert.equal(await modalOpen(s.page), false);
+      assert.equal(callsTo(s, 'POST', '/api/collections').length, 0);
+      await press(s.page, '+ New');
+      await fill(s.page, '.fixed input', 'VfyUiNew');
+      await fill(s.page, '.fixed select', 'flat');
+      await press(s.page, 'Create');
+      await waitFor(s.page, () => document.querySelectorAll('select')[0].value === 'VfyUiNew', 'the new collection selected');
+      const posts = callsTo(s, 'POST', '/api/collections');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { name: 'VfyUiNew', index_type: 'flat', distance_metric: 'cosine', hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 } });
+      assert.equal(await modalOpen(s.page), false);
+    } },
+  ];
+}
+
+function navigationCases() {
+  const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
+  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer']);
+    } },
+    { name: 'Developer is sent back to Q&A from /collections and /health, but can open /transfer and /help/transfer', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      for (const p of ['/collections', '/health']) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+      await goto(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitPath(s.page, '/transfer');
+      await goto(s.page, '/help/transfer');
+      await waitText(s.page, 'Export and Import');
+      await waitPath(s.page, '/help/transfer');
+    } },
+    { name: 'End User opening a Developer page directly is sent to Q&A (gating is client-side only until #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
+      for (const p of [...gated, '/collections', '/health']) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+    } },
+    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Choosing ${badge[role]} on the landing page opens /qa with that role badge and stores the role`, open: { role: null, path: '/', routes: base() }, async run(s) {
+      await waitText(s.page, 'Select your role to continue');
+      assert.equal(await s.page.evaluate(label => {
+        const b = [...document.querySelectorAll('button')].find(x => x.querySelector('h2')?.textContent.trim() === label);
+        if (!b) return false; b.click(); return true;
+      }, badge[role]), true);
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim()), badge[role]);
+      assert.deepEqual(JSON.parse(await s.page.evaluate(() => sessionStorage.getItem('rag_role'))), { role });
+    } })),
+    { name: 'Switch Role returns to the role chooser, forgets the role, and a later /qa visit goes back to it', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await press(s.page, 'Switch Role');
+      await waitPath(s.page, '/');
+      await waitText(s.page, 'Select your role to continue');
+      assert.equal(await s.page.evaluate(() => sessionStorage.getItem('rag_role')), null);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await goto(s.page, '/qa');
+      await waitText(s.page, 'Select your role to continue');
+      await waitPath(s.page, '/');
+    } },
+  ];
+}
+
+function qaCases() {
+  return [
+    { name: 'Ask is disabled for empty and blank questions and enabled for text', open: qaOpen('engineer'), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal((await buttonState(s.page, 'Ask')).disabled, true);
+      await fill(s.page, 'textarea', '   ');
+      assert.equal((await buttonState(s.page, 'Ask')).disabled, true);
+      await fill(s.page, 'textarea', 'a question');
+      assert.equal((await buttonState(s.page, 'Ask')).disabled, false);
+    } },
+    { name: 'Ctrl+Enter submits the question once, and does nothing on an empty box', open: qaOpen('engineer'), async run(s) {
+      await waitSelected(s.page, 0);
+      await ctrlEnter(s.page);
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'POST', '/api/query').length, 0);
+      await fill(s.page, 'textarea', 'What is inert?');
+      await ctrlEnter(s.page);
+      await waitText(s.page, 'A plain answer.');
+      const posts = callsTo(s, 'POST', '/api/query');
+      assert.equal(posts.length, 1);
+      assert.equal(posts[0].body.question, 'What is inert?');
+      assert.equal(posts[0].body.collection, A);
+    } },
+    { name: 'Plain Enter inserts a newline and does not submit', open: qaOpen('engineer'), async run(s) {
+      await waitSelected(s.page, 0);
+      await s.page.focus('textarea');
+      await s.page.keyboard.type('line one');
+      await s.page.keyboard.press('Enter');
+      await s.page.keyboard.type('line two');
+      assert.equal(await s.page.evaluate(() => document.querySelector('textarea').value), 'line one\nline two');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'POST', '/api/query').length, 0);
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'While a question is answered the button reads Thinking and is disabled, then Ask returns', open: qaOpen('engineer', { 'POST /api/query': () => h }), async run(s) {
+        await askQuestion(s.page);
+        await waitText(s.page, 'Thinking' + ELLIPSIS);
+        assert.equal((await buttonState(s.page, 'Thinking' + ELLIPSIS)).disabled, true);
+        h.release(json(200, queryReply()));
+        await waitText(s.page, 'A plain answer.');
+        assert.equal((await buttonState(s.page, 'Ask')).disabled, false);
+      } };
+    })(),
+    { name: 'With citations off the query asks for none and no Sources panel shows, even if the reply carries some', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ citations: CITATIONS })) }), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[type=checkbox]').checked), false);
+      await askQuestion(s.page);
+      await waitText(s.page, 'A plain answer.');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.include_citations, false);
+      assert.equal(await bodyHas(s.page, 'Sources'), false);
+    },},
+    { name: 'With citations on the query asks for them and the Sources panel lists file, chunk, score (n/a when null) and excerpt', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ citations: CITATIONS })) }), async run(s) {
+      await waitSelected(s.page, 0);
+      await s.page.click('input[type=checkbox]');
+      await askQuestion(s.page);
+      await waitText(s.page, 'Sources');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.include_citations, true);
+      const panel = await s.page.evaluate(() => [...document.querySelectorAll('h3')].find(h => h.textContent.trim() === 'Sources')?.parentElement.innerText.replace(/\s+/g, ' '));
+      for (const want of ['alpha.txt', `chunk 2 ${DOT} score 0.123`, 'First excerpt.', 'beta.txt', `chunk 0 ${DOT} score n/a`, 'Second excerpt.']) assert.ok(panel.includes(want), `${want} in ${panel}`);
+    } },
+    { name: 'Unchecking the citations box hides the panel of the answer on screen and checking it brings it back without a new query', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ citations: CITATIONS })) }), async run(s) {
+      await waitSelected(s.page, 0);
+      await s.page.click('input[type=checkbox]');
+      await askQuestion(s.page);
+      await waitText(s.page, 'Sources');
+      await s.page.click('input[type=checkbox]');
+      await waitText(s.page, 'Sources', true);
+      await s.page.click('input[type=checkbox]');
+      await waitText(s.page, 'Sources');
+      assert.equal(callsTo(s, 'POST', '/api/query').length, 1);
+    } },
+    { name: 'The answer renders markdown and the latency line shows both times', open: qaOpen('engineer', { 'POST /api/query': json(200, queryReply({ answer: 'This is **bold words** here.\n\n- first item\n- second item', retrieval_latency_ms: 12, llm_latency_ms: 345 })) }), async run(s) {
+      await askQuestion(s.page);
+      await waitText(s.page, 'bold words');
+      const dom = await s.page.evaluate(() => ({
+        strong: [...document.querySelectorAll('.prose strong')].map(x => x.textContent),
+        items: [...document.querySelectorAll('.prose li')].map(x => x.textContent.trim()),
+      }));
+      assert.deepEqual(dom.strong, ['bold words']);
+      assert.deepEqual(dom.items, ['first item', 'second item']);
+      assert.equal(await bodyHas(s.page, '**'), false);
+      assert.equal(await bodyHas(s.page, `Retrieved in 12ms ${DOT} Generated in 345ms`), true);
+    } },
+    (() => {
+      let n = 0;
+      return { name: 'A failed query shows the API message with no answer or latency line, and asking again clears it', open: qaOpen('engineer', { 'POST /api/query': () => (++n === 1 ? apiError(500, 'INTERNAL_ERROR', 'Synthetic query failure.') : json(200, queryReply())) }), async run(s) {
+        await askQuestion(s.page);
+        await waitText(s.page, 'Synthetic query failure.');
+        assert.equal(await bodyHas(s.page, 'Retrieved in'), false);
+        assert.equal(await bodyHas(s.page, 'A plain answer.'), false);
+        assert.equal((await buttonState(s.page, 'Ask')).disabled, false);
+        await ctrlEnter(s.page);
+        await waitText(s.page, 'A plain answer.');
+        assert.equal(await bodyHas(s.page, 'Synthetic query failure.'), false);
+        assert.equal(await bodyHas(s.page, 'Retrieved in'), true);
+      } };
+    })(),
+    { name: 'End User sees no method display and the query asks for response_format end_user', open: qaOpen('end_user'), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select').length), 1);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select[disabled]').length), 0);
+      await askQuestion(s.page);
+      await waitText(s.page, 'A plain answer.');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.response_format, 'end_user');
+    } },
+    ...['engineer', 'developer'].map(role => ({ name: `${role === 'engineer' ? 'Engineer' : 'Developer'} sees the method display and the query asks for response_format engineer`, open: qaOpen(role), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select').length), 2);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('select[disabled]').length), 1);
+      await askQuestion(s.page);
+      await waitText(s.page, 'A plain answer.');
+      assert.equal(callsTo(s, 'POST', '/api/query')[0].body.response_format, 'engineer');
+    } })),
+  ];
+}
+
+function retrievalCases() {
+  const saved = over => ({ 'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop(), over)) });
+  const open = routes => ({ role: 'engineer', path: '/retrieval', routes: base(routes) });
+  const alphaLabel = page => page.evaluate(() => [...document.querySelectorAll('label')].find(l => l.textContent.includes('Meaning:'))?.textContent.trim() || null);
+  return [
+    { name: 'Retrieval page says the settings shown are the saved ones', open: open(saved({ retrieval_mode: 'semantic', top_k: 9, is_default: false })), async run(s) {
+      await waitText(s.page, 'Showing the settings saved for this collection.');
+      assert.equal(await bodyHas(s.page, 'showing defaults'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[name=mode][value=semantic]').checked), true);
+      assert.ok(await bodyHas(s.page, 'Top-K Results: 9'));
+    } },
+    { name: 'Retrieval page says defaults are shown when nothing is saved', open: open(saved({ is_default: true })), async run(s) {
+      await waitText(s.page, `No settings saved for this collection yet ${DASH} showing defaults.`);
+      assert.equal(await bodyHas(s.page, 'Showing the settings saved'), false);
+    } },
+    { name: 'The alpha slider shows for Hybrid only, starts at the saved value, and the changed value is saved', open: open({ ...saved({ retrieval_mode: 'hybrid', alpha: 0.25, top_k: 7, is_default: false }),
+        'POST /api/retrieval/config': call => json(200, { ...call.body, is_default: false }) }), async run(s) {
+      await waitText(s.page, 'Showing the settings saved');
+      assert.equal(await alphaLabel(s.page), `Keyword \u2190 Balance \u2192 Meaning: 0.25`);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('input[type=range]').length), 2);
+      await s.page.click('input[name=mode][value=semantic]');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 1, 'the alpha slider to go (semantic)');
+      assert.equal(await alphaLabel(s.page), null);
+      await s.page.click('input[name=mode][value=hnsw]');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 1, 'no alpha slider (vector)');
+      await s.page.click('input[name=mode][value=hybrid]');
+      await waitFor(s.page, () => document.querySelectorAll('input[type=range]').length === 2, 'the alpha slider to return');
+      await fillNth(s.page, 'input[type=range]', 1, 0.4);
+      await waitFor(s.page, () => [...document.querySelectorAll('label')].some(l => l.textContent.trim().endsWith('Meaning: 0.4')), 'alpha 0.4');
+      await press(s.page, 'Save for this collection');
+      await waitText(s.page, 'Saved!');
+      const posts = callsTo(s, 'POST', '/api/retrieval/config');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { collection: A, retrieval_mode: 'hybrid', top_k: 7, alpha: 0.4, ef: null, response_format: 'engineer' });
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'Save is disabled and the page says Loading while the saved settings are read, then it is enabled', open: open({ 'GET /api/retrieval/config/*': () => h }), async run(s) {
+        await waitText(s.page, 'Loading saved settings' + ELLIPSIS);
+        assert.equal((await buttonState(s.page, 'Save for this collection')).disabled, true);
+        h.release(json(200, retrievalConfig(A)));
+        await waitText(s.page, 'Loading saved settings' + ELLIPSIS, true);
+        assert.equal((await buttonState(s.page, 'Save for this collection')).disabled, false);
+      } };
+    })(),
+  ];
+}
+
+// The proxy answers some errors itself, as HTML; the client turns them into text
+// (ui/src/api/client.ts). Driven through the Import page's upload.
+function proxyCases() {
+  const one = (name, answer, want) => ({ name, open: { role: 'engineer', path: '/import', routes: base({ 'POST /api/ingest/upload': answer }) }, async run(s) {
+    await waitSelected(s.page, 0);
+    await queueFiles(s.page, ['doc.txt']);
+    await press(s.page, 'Start Ingest');
+    await waitText(s.page, want);
+    const shown = await s.page.evaluate(() => document.querySelector('p.text-red-600')?.textContent.trim());
+    assert.equal(shown, want);
+    assert.ok(!/JSON|Unexpected token|<html/i.test(shown), 'no parser text: ' + shown);
+  } });
+  return [
+    one('A proxy 413 page is shown as the upload limit message', html(413, 'Request Entity Too Large'), 'The upload is larger than the 512 MB limit. Split it into smaller batches.'),
+    one('A proxy 502 page is shown as "the API is not responding"', html(502, 'Bad Gateway'), 'The API is not responding. It may still be starting; try again in a minute.'),
+    one('A proxy 504 page is shown as "the API took too long"', html(504, 'Gateway Time-out'), 'The API took too long to respond.'),
+    one('An HTML error page with no special text is shown as its status', html(500, 'Internal Server Error'), 'HTTP 500'),
+    one('A 200 that is not JSON is reported as unreadable', { status: 200, type: 'text/html', body: '<html><body>not json</body></html>' }, 'The server sent a response the UI could not read.'),
+    one("The API's own JSON message wins over the status text", apiError(413, 'PAYLOAD_TOO_LARGE', 'Synthetic API message.'), 'Synthetic API message.'),
+  ];
+}
+
+async function runUiControlTests(browser, baseUrl, reporter) {
+  S.BASE = baseUrl;
+  const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
+  await run('Collections table and create modal (#400)', collectionsCases());
+  await run('Import queue, sliders and "+ New" modal (#400)', importCases());
+  await run('Navigation, roles and redirects; gating is client-side only until #25 (#400)', navigationCases());
+  await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
+  await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
+  await run('Client handling of the proxy error pages (#400)', proxyCases());
+}
+
+module.exports = { runUiControlTests };
+if (require.main === module) (async () => {
+  const { makeReporter } = require('./lib');
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runUiControlTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+  finally { await browser.close(); }
+  process.exitCode = reporter.summary() ? 0 : 1;
+})().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/ui_pages.js
+
+```javascript
+// UI pages whose controls had no browser check (#400): Gold Standard generate and
+// review, the Transfer page's export and import controls, the Help page and the
+// Health latency display. Every API call is answered by the check (see stub.js).
+// Non-ASCII UI text is written as \u escapes. The Transfer polling and /tune
+// failure labels are checked by transfer_page.js (#382) and not repeated here.
+const assert = require('node:assert/strict');
+const S = require('./stub');
+const { json, apiError, html, hold, callsTo, waitFor, waitText, press, fill, fillNth, buttonState, waitPath } = S;
+
+const A = 'VfyUiA', B = 'VfyUiB';
+const DOT = '\u00b7', DASH = '\u2014', ELLIPSIS = '\u2026', ARROW = '\u2192';
+const COLS = [
+  { name: A, object_count: 12, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null },
+  { name: B, object_count: 0, index_type: 'flat', distance_metric: 'dot', created_at: null, hnsw_config: null },
+];
+const bodyHas = (page, want) => page.evaluate(w => document.body.innerText.replace(/\s+/g, ' ').includes(w), want);
+const tune = (name, fidelity = 'with-sources') => ({ collection: name, fidelity, source_document_count: 2, can_rechunk: fidelity === 'with-sources', can_reembed: true, can_reindex: true, note: '' });
+const common = (extra = {}) => ({
+  'GET /api/collections': json(200, { collections: COLS }),
+  'GET /api/packages': json(200, { packages: [] }),
+  'GET /api/tune/*': call => json(200, tune(call.path.split('/').pop())),
+  'GET /api/help/transfer': json(200, { topic: 'transfer', markdown: '# Help\n\nSome text.' }),
+  ...extra,
+});
+const waitSelected = (page, i) => waitFor(page, n => !!document.querySelectorAll('select')[n]?.value, 'the collection select to be filled', i);
+
+// -- Gold Standard -----------------------------------------------------------
+const SID = 'gs_vfyui01';
+const pair = (id, status, question = 'Question ' + id) => ({ pair_id: id, question, answer: 'Answer ' + id, contexts: ['Context ' + id], ground_truth: 'Truth ' + id, source_file: id + '.txt', chunk_index: 0, status });
+const session = (pairs, over = {}) => ({ session_id: SID, collection: A, status: 'completed', pairs_total: pairs.length, pairs_attempted: pairs.length, pairs_completed: pairs.length, pairs_failed: 0, pairs, ...over });
+const reviewPairs = () => [pair('p1', 'pending'), pair('p2', 'approved'), pair('p3', 'edited'), pair('p4', 'rejected')];
+const SESSION = '/api/goldstandard/session/' + SID;
+
+// Loads a retained session by id, which shows the review phase without generating.
+async function loadSession(page) {
+  await waitSelected(page, 0);
+  await fill(page, '#retained-session', SID);
+  await press(page, 'Load / refresh session');
+  await waitText(page, 'Phase 2');
+}
+const summary = page => page.evaluate(() => [...document.querySelectorAll('p')].find(p => /approved .* pending/.test(p.textContent))?.textContent.replace(/\s+/g, ' ').trim());
+const pairControl = (page, question, title) => page.evaluate((q, t) => {
+  const d = [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q);
+  const b = d?.querySelector(`button[title=${t}]`);
+  if (!b) return false; b.click(); return true;
+}, question, title);
+const detailsOpen = (page, question) => page.evaluate(q => [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q)?.open, question);
+const statusOf = (page, question) => page.evaluate(q => [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q)?.querySelector('summary span.rounded')?.textContent.trim(), question);
+
+function goldCases() {
+  const gold = (routes = {}, over = {}) => ({ role: 'engineer', path: '/goldstandard', ...over, routes: common(routes) });
+  // A small server: the page polls the session once after loading, so the answers
+  // must follow the changes the page makes.
+  const review = (routes = {}, pairs = reviewPairs()) => gold({
+    ['GET ' + SESSION]: () => json(200, session(pairs)),
+    ['PATCH ' + SESSION + '/pair/*']: call => {
+      const i = pairs.findIndex(p => p.pair_id === call.path.split('/').pop());
+      pairs[i] = { ...pairs[i], ...call.body };
+      return json(200, pairs[i]);
+    },
+    'POST /api/goldstandard/regenerate': call => {
+      const i = pairs.findIndex(p => p.pair_id === call.body.pair_id);
+      pairs[i] = { ...pairs[i], question: 'Regenerated question', answer: 'New answer', status: 'pending' };
+      return json(200, pairs[i]);
+    },
+    ...routes,
+  });
+  let confirmAnswer = false;
+  return [
+    { name: 'Gold Standard lists the collections with the first selected, and the sample size input is 1 to 100 starting at 20', open: gold(), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('select option')].map(o => o.value)), [A, B]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select').value), A);
+      assert.deepEqual(await s.page.evaluate(() => { const i = document.querySelector('input[type=number]'); return { min: i.min, max: i.max, value: i.value }; }), { min: '1', max: '100', value: '20' });
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'Generate sends the chosen collection and sample size once and is disabled until the start is answered and the session settles', open: gold({
+        'POST /api/goldstandard/generate': () => h,
+        ['GET ' + SESSION]: json(200, session(reviewPairs())) }, { fastPolls: true }), async run(s) {
+        await waitSelected(s.page, 0);
+        await fillNth(s.page, 'select', 0, B);
+        await fill(s.page, 'input[type=number]', 5);
+        await press(s.page, 'Generate Pairs');
+        await waitFor(s.page, () => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Generate Pairs')?.disabled === true, 'Generate Pairs to be disabled');
+        h.release(json(202, { session_id: SID, status: 'generating', pairs_total: 4, pairs_completed: 0 }));
+        await waitFor(s.page, () => [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Generate Pairs')?.disabled === false, 'Generate Pairs to be enabled');
+        const posts = callsTo(s, 'POST', '/api/goldstandard/generate');
+        assert.equal(posts.length, 1);
+        assert.deepEqual(posts[0].body, { collection: B, sample_size: 5 });
+      } };
+    })(),
+    (() => {
+      let phase = 'generating';
+      return { name: 'Generating shows attempted/total with a matching bar, and the review phase appears when the session completes', open: gold({
+        'POST /api/goldstandard/generate': json(202, { session_id: SID, status: 'generating', pairs_total: 4, pairs_completed: 0 }),
+        ['GET ' + SESSION]: () => json(200, phase === 'generating' ? session([pair('p1', 'pending')], { status: 'generating', pairs_total: 4, pairs_attempted: 1, pairs_completed: 1 }) : session(reviewPairs())) }, { fastPolls: true }), async run(s) {
+        await waitSelected(s.page, 0);
+        await press(s.page, 'Generate Pairs');
+        await waitText(s.page, `Generating${ELLIPSIS} 1/4 pairs`);
+        assert.equal(await s.page.evaluate(() => document.querySelector('.bg-blue-500.h-2').style.width), '25%');
+        assert.equal(await bodyHas(s.page, 'Phase 2'), true);
+        phase = 'done';
+        await waitText(s.page, 'Generating', true);
+        await waitText(s.page, 'Phase 2');
+        assert.equal(await summary(s.page), `1 approved ${DOT} 1 edited ${DOT} 1 rejected ${DOT} 1 pending`);
+      } };
+    })(),
+    { name: 'A refused generate shows the API message and leaves Generate enabled', open: gold({ 'POST /api/goldstandard/generate': apiError(409, 'GENERATION_BUSY', 'Synthetic generate refusal.') }), async run(s) {
+      await waitSelected(s.page, 0);
+      await press(s.page, 'Generate Pairs');
+      await waitText(s.page, 'Synthetic generate refusal.');
+      assert.equal((await buttonState(s.page, 'Generate Pairs')).disabled, false);
+    } },
+    { name: 'Generate with a session already shown asks first: Cancel sends nothing, OK starts a new one', open: Object.assign(gold({
+        'POST /api/goldstandard/generate': json(202, { session_id: SID, status: 'completed', pairs_total: 4, pairs_completed: 4 }),
+        ['GET ' + SESSION]: json(200, session(reviewPairs())) }), { onDialog: async d => { confirmAnswer ? await d.accept() : await d.dismiss(); } }), async run(s) {
+      await loadSession(s.page);
+      let dialogs = 0;
+      s.page.on('dialog', d => { dialogs++; assert.match(d.message(), /Start a new session\?/); });
+      confirmAnswer = false;
+      await press(s.page, 'Generate Pairs');
+      await waitFor(s.page, () => true, 'a tick');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(dialogs, 1);
+      assert.equal(callsTo(s, 'POST', '/api/goldstandard/generate').length, 0);
+      confirmAnswer = true;
+      await press(s.page, 'Generate Pairs');
+      await waitFor(s.page, () => true, 'a tick');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(dialogs, 2);
+      assert.equal(callsTo(s, 'POST', '/api/goldstandard/generate').length, 1);
+    } },
+    { name: 'The summary bar counts approved, edited, rejected and pending pairs', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await summary(s.page), `1 approved ${DOT} 1 edited ${DOT} 1 rejected ${DOT} 1 pending`);
+    } },
+    { name: 'Approve and Reject send the pair status, update the row and the summary, and leave the row closed', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Approve'), true);
+      await waitFor(s.page, () => /2 approved .* 0 pending/.test(document.body.innerText), 'p1 approved');
+      assert.equal(await statusOf(s.page, 'Question p1'), 'approved');
+      assert.equal(await detailsOpen(s.page, 'Question p1'), false);
+      assert.equal(await pairControl(s.page, 'Question p2', 'Reject'), true);
+      await waitFor(s.page, () => /1 approved .* 2 rejected/.test(document.body.innerText.replace(/\s+/g, ' ')), 'p2 rejected');
+      assert.equal(await statusOf(s.page, 'Question p2'), 'rejected');
+      assert.equal(await detailsOpen(s.page, 'Question p2'), false);
+      const patches = s.calls.filter(c => c.method === 'PATCH');
+      assert.deepEqual(patches.map(c => [c.path, c.body]), [[SESSION + '/pair/p1', { status: 'approved' }], [SESSION + '/pair/p2', { status: 'rejected' }]]);
+    } },
+    { name: 'Regenerate sends the session and pair and replaces only that pair', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p3', 'Regenerate'), true);
+      await waitText(s.page, 'Regenerated question');
+      assert.equal(await bodyHas(s.page, 'Question p3'), false);
+      for (const q of ['Question p1', 'Question p2', 'Question p4']) assert.equal(await bodyHas(s.page, q), true, q);
+      const posts = callsTo(s, 'POST', '/api/goldstandard/regenerate');
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { session_id: SID, pair_id: 'p3' });
+      assert.equal(await detailsOpen(s.page, 'Regenerated question'), false);
+    } },
+    { name: 'Edit opens the pair, Cancel sends nothing and Save sends status edited with the three fields', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Edit'), true);
+      await waitText(s.page, 'Edit Pair');
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('.fixed textarea')].map(t => t.value)), ['Question p1', 'Answer p1', 'Truth p1']);
+      await press(s.page, 'Cancel');
+      await waitText(s.page, 'Edit Pair', true);
+      assert.equal(s.calls.filter(c => c.method === 'PATCH').length, 0);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Edit'), true);
+      await waitText(s.page, 'Edit Pair');
+      await fillNth(s.page, '.fixed textarea', 0, 'Edited question');
+      await fillNth(s.page, '.fixed textarea', 1, 'Edited answer');
+      await fillNth(s.page, '.fixed textarea', 2, 'Edited truth');
+      await press(s.page, 'Save');
+      await waitText(s.page, 'Edited question');
+      const patches = s.calls.filter(c => c.method === 'PATCH');
+      assert.deepEqual(patches.map(c => c.body), [{ status: 'edited', question: 'Edited question', answer: 'Edited answer', ground_truth: 'Edited truth' }]);
+      assert.equal(await statusOf(s.page, 'Edited question'), 'edited');
+      assert.equal(await summary(s.page), `1 approved ${DOT} 2 edited ${DOT} 1 rejected ${DOT} 0 pending`);
+    } },
+    { name: 'A failed review action shows the API message and keeps the pair as it was', open: review({ ['PATCH ' + SESSION + '/pair/*']: apiError(500, 'INTERNAL_ERROR', 'Synthetic patch failure.') }), async run(s) {
+      await loadSession(s.page);
+      assert.equal(await pairControl(s.page, 'Question p1', 'Approve'), true);
+      await waitText(s.page, 'Synthetic patch failure.');
+      assert.equal(await statusOf(s.page, 'Question p1'), 'pending');
+      assert.equal(await summary(s.page), `1 approved ${DOT} 1 edited ${DOT} 1 rejected ${DOT} 1 pending`);
+    } },
+    { name: 'Export Approved is enabled only while some pair is approved or edited', open: review({}, [pair('p1', 'pending'), pair('p4', 'rejected')]), async run(s) {
+      await loadSession(s.page);
+      assert.equal((await buttonState(s.page, 'Export Approved')).disabled, true);
+    } },
+    { name: 'Export Approved is enabled when a pair is approved', open: review(), async run(s) {
+      await loadSession(s.page);
+      assert.equal((await buttonState(s.page, 'Export Approved')).disabled, false);
+    } },
+  ];
+}
+
+// -- Transfer: export and import controls ------------------------------------
+const PKG_OK = 'ragpkg-vfyuia-20261021-0000-abcd1234.tar.gz', PKG_BAD = 'ragpkg-broken-20261021-0000-ffff0000.tar.gz';
+const PACKAGES = [
+  { filename: PKG_OK, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true },
+  { filename: PKG_BAD, size_bytes: 10, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: false },
+];
+const exportJob = (status, extra = {}) => json(200, { job_id: 'vfyexp', status, collection: A, chunks_written: 0, filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null, retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null, ...extra });
+const importJob = (status, extra = {}) => json(200, { job_id: 'vfyimp', status, filename: PKG_OK, on_conflict: 'abort', collection: null, original_collection: null, chunks_written: 0, fidelity: null, renamed: false, notes: [], error: null, error_code: null, error_detail: null, ...extra });
+const optionTexts = (page, i) => page.evaluate(n => [...document.querySelectorAll('select')[n].options].map(o => o.textContent.trim()), i);
+
+function transferCases() {
+  const xfer = (routes = {}) => ({ role: 'developer', path: '/transfer', fastPolls: true, routes: common(routes) });
+  const pkgs = { 'GET /api/packages': json(200, { packages: PACKAGES }) };
+  return [
+    { name: 'Export lists each collection with its chunk count, selects the first and looks up the fidelity of a newly chosen one', open: xfer(), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.deepEqual(await optionTexts(s.page, 0), [`${A} (12 chunks)`, `${B} (0 chunks)`]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select').value), A);
+      await waitFor(s.page, () => true, 'a tick');
+      assert.equal(callsTo(s, 'GET', '/api/tune/' + A).length, 1);
+      await fillNth(s.page, 'select', 0, B);
+      await waitFor(s.page, () => true, 'a tick');
+      await new Promise(r => setTimeout(r, 200));
+      assert.equal(callsTo(s, 'GET', '/api/tune/' + B).length, 1);
+    } },
+    (() => {
+      const h = hold();
+      return { name: 'The fidelity line reads "reading" while looked up, then names with-sources and the documents that travel', open: xfer({ 'GET /api/tune/*': () => h }), async run(s) {
+        await waitText(s.page, `Fidelity: reading${ELLIPSIS}`);
+        h.release(json(200, tune(A)));
+        await waitText(s.page, `Fidelity: with-sources ${DASH} 2 original document(s) will travel with the package.`);
+        assert.equal(await bodyHas(s.page, 'reading'), false);
+      } };
+    })(),
+    { name: 'A metadata-only collection says no original documents were kept', open: xfer({ 'GET /api/tune/*': call => json(200, tune(call.path.split('/').pop(), 'metadata-only')) }), async run(s) {
+      await waitText(s.page, `Fidelity: metadata-only ${DASH} No original documents were retained, so the package cannot be re-chunked after import.`);
+    } },
+    { name: 'The include-models box starts unchecked and its state is sent with the export', open: xfer({
+        'POST /api/export': json(202, { job_id: 'vfyexp', status: 'queued', collection: A }),
+        'GET /api/export/job/vfyexp': exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz', size_bytes: 1000, fidelity: 'with-sources', models_bundled: false, retrieve_script: true }) }), async run(s) {
+      await waitSelected(s.page, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[type=checkbox]').checked), false);
+      await press(s.page, 'Export');
+      await waitText(s.page, 'Done.');
+      await s.page.click('input[type=checkbox]');
+      await press(s.page, 'Export');
+      await waitFor(s.page, () => true, 'a tick');
+      await waitFor(s.page, () => window.__forms !== undefined, 'page');
+      await new Promise(r => setTimeout(r, 300));
+      const posts = callsTo(s, 'POST', '/api/export');
+      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false }, { collection: A, include_models: true }]);
+    } },
+    (() => {
+      let phase = 'running';
+      return { name: 'A running export shows its chunk count with the button busy, then the file, size and options when done, plus warnings', open: xfer({
+        'POST /api/export': json(202, { job_id: 'vfyexp', status: 'queued', collection: A }),
+        'GET /api/export/job/vfyexp': () => (phase === 'running' ? exportJob('running', { chunks_written: 5 })
+          : exportJob('completed', { chunks_written: 9, filename: 'ragpkg-vfy.tar.gz', size_bytes: 2500000, fidelity: 'with-sources', models_bundled: true, retrieve_script: true, warnings: ['Synthetic export warning.'] })) }), async run(s) {
+        await waitSelected(s.page, 0);
+        await press(s.page, 'Export');
+        await waitText(s.page, `Writing${ELLIPSIS} 5 chunks so far.`);
+        assert.equal((await buttonState(s.page, `Exporting${ELLIPSIS}`)).disabled, true);
+        phase = 'done';
+        await waitText(s.page, 'Done.');
+        await waitText(s.page, 'ragpkg-vfy.tar.gz');
+        assert.equal(await bodyHas(s.page, '(2.5 MB, with-sources, models included, with retrieve.py)'), true);
+        assert.equal(await bodyHas(s.page, 'Synthetic export warning.'), true);
+        assert.equal((await buttonState(s.page, 'Export')).disabled, false);
+      } };
+    })(),
+  ];
+}
+
+function packageCases() {
+  const xfer = (routes = {}) => ({ role: 'developer', path: '/transfer', fastPolls: true, routes: common(routes) });
+  const withPkgs = (routes = {}) => xfer({ 'GET /api/packages': json(200, { packages: PACKAGES }), ...routes });
+  const pick = (page, name) => fillNth(page, 'select', 1, name);
+  const start = async (page, name = PKG_OK) => { await waitFor(page, n => [...document.querySelectorAll('select')[1].options].length > 1, 'the packages'); await pick(page, name); await press(page, 'Import'); };
+  return [
+    { name: 'A readable package shows its collection, chunks, fidelity and size; an unreadable one says so', open: withPkgs(), async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      assert.deepEqual(await optionTexts(s.page, 1), ['Select a package' + ELLIPSIS, `${PKG_OK} ${DASH} ${A}, 3 chunks, with-sources, 2 KB`, `${PKG_BAD} ${DASH} unreadable`]);
+      assert.equal(await bodyHas(s.page, 'Nothing in ./exports yet'), false);
+    } },
+    (() => {
+      let lists = 0;
+      return { name: 'With no packages the empty hint shows, and Refresh asks again and lists what appeared', open: xfer({ 'GET /api/packages': () => json(200, { packages: ++lists === 1 ? [] : PACKAGES }) }), async run(s) {
+        await waitText(s.page, 'Nothing in ./exports yet. Copy a package there and press Refresh.');
+        await press(s.page, 'Refresh');
+        await waitText(s.page, 'Nothing in ./exports yet', true);
+        assert.equal(callsTo(s, 'GET', '/api/packages').length, 2);
+        assert.equal((await optionTexts(s.page, 1)).length, 3);
+      } };
+    })(),
+    { name: 'Import is disabled until a package is chosen; Abort is the default conflict choice and the chosen one is sent', open: withPkgs({
+        'POST /api/import': json(202, { job_id: 'vfyimp', status: 'queued', filename: PKG_OK }),
+        'GET /api/import/job/vfyimp': importJob('completed', { collection: A + '_2', original_collection: A, renamed: true, chunks_written: 3, fidelity: 'with-sources', notes: ['Synthetic import note.'] }) }), async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      assert.equal((await buttonState(s.page, 'Import')).disabled, true);
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[name=conflict]:checked').value), 'abort');
+      await pick(s.page, PKG_OK);
+      assert.equal((await buttonState(s.page, 'Import')).disabled, false);
+      await s.page.click('input[name=conflict][value=rename]');
+      await press(s.page, 'Import');
+      await waitText(s.page, `Imported as ${A}_2 (renamed from ${A}) ${DASH} 3 chunks, with-sources`);
+      assert.equal(await bodyHas(s.page, 'Synthetic import note.'), true);
+      const posts = callsTo(s, 'POST', '/api/import');
+      assert.deepEqual(posts.map(c => c.body), [{ filename: PKG_OK, on_conflict: 'rename' }]);
+    } },
+    { name: 'A failed import shows Failed, its error code and message, and Import is enabled again', open: withPkgs({
+        'POST /api/import': json(202, { job_id: 'vfyimp', status: 'queued', filename: PKG_OK }),
+        'GET /api/import/job/vfyimp': importJob('failed', { error_code: 'PACKAGE_CORRUPT', error: 'Synthetic package failure.' }) }), async run(s) {
+      await start(s.page);
+      await waitText(s.page, 'Failed.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('p.text-red-600 code')?.textContent.trim()), 'PACKAGE_CORRUPT');
+      assert.equal(await bodyHas(s.page, 'Synthetic package failure.'), true);
+      assert.equal((await buttonState(s.page, 'Import')).disabled, false);
+    } },
+    { name: 'An import the API refuses to start shows its message and leaves Import enabled', open: withPkgs({ 'POST /api/import': apiError(409, 'COLLECTION_EXISTS', 'Synthetic import refusal.') }), async run(s) {
+      await start(s.page);
+      await waitText(s.page, 'Synthetic import refusal.');
+      assert.equal((await buttonState(s.page, 'Import')).disabled, false);
+      assert.equal(callsTo(s, 'GET', '/api/import/job/vfyimp').length, 0);
+    } },
+  ];
+}
+
+function helpCases() {
+  return [
+    { name: 'A failed help request shows the reason and a hint, with no Loading text left behind', open: { role: 'developer', path: '/help/transfer', routes: common({ 'GET /api/help/transfer': apiError(500, 'INTERNAL_ERROR', 'Synthetic help failure.') }) }, async run(s) {
+      await waitText(s.page, 'Could not load the help content (Synthetic help failure.). The API may be starting up.');
+      assert.equal(await bodyHas(s.page, `Loading${ELLIPSIS}`), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('article').length), 0);
+    } },
+    { name: 'A proxy error page on the help request is shown as its readable message', open: { role: 'developer', path: '/help/transfer', routes: common({ 'GET /api/help/transfer': html(502, 'Bad Gateway') }) }, async run(s) {
+      await waitText(s.page, 'Could not load the help content (The API is not responding. It may still be starting; try again in a minute.). The API may be starting up.');
+    } },
+    { name: 'The help page and the Transfer page link to each other', open: { role: 'developer', path: '/help/transfer', routes: common() }, async run(s) {
+      await waitText(s.page, 'Some text.');
+      await press(s.page, `Go to Transfer ${ARROW}`, 'a');
+      await waitPath(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await press(s.page, `How export and import work ${ARROW}`, 'a');
+      await waitPath(s.page, '/help/transfer');
+      await waitText(s.page, 'Some text.');
+    } },
+  ];
+}
+
+// -- Health: latency stat row, charts and empty state ------------------------
+const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' } } } });
+const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection: A, retrieval_mode: 'hnsw', retrieval_ms: r, llm_ms: l, total_ms: r + l });
+const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
+
+function healthCases() {
+  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
+  return [
+    { name: 'Health shows the latency trend heading, a P50/P95/P99 row per stage in whole ms, and a chart with its three series', open: open(metrics([record(1, 10, 100), record(2, 12, 110), record(3, 14, 120)])), async run(s) {
+      await waitText(s.page, 'Latency Trends (3 queries in ring buffer)');
+      const boxes = await s.page.evaluate(() => [...document.querySelectorAll('.border.rounded.p-3')].map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+      assert.deepEqual(boxes, [`RETRIEVAL P50: 10ms ${DOT} P95: 21ms ${DOT} P99: 30ms`, `LLM P50: 100ms ${DOT} P95: 201ms ${DOT} P99: 300ms`, `TOTAL P50: 111ms ${DOT} P95: 221ms ${DOT} P99: 332ms`]);
+      await waitFor(s.page, () => document.querySelectorAll('.recharts-line').length === 3, 'three chart lines');
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('.recharts-legend-item-text')].map(t => t.textContent.trim()).sort()), ['LLM', 'Retrieval', 'Total']);
+      assert.equal(await bodyHas(s.page, 'No query data yet'), false);
+    } },
+    { name: 'Health with no queries recorded shows the empty message and no chart', open: open(metrics([], { total_records: 0 })), async run(s) {
+      await waitText(s.page, 'No query data yet. Run some Q&A queries to populate charts.');
+      assert.equal(await bodyHas(s.page, 'Latency Trends'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('.recharts-wrapper').length), 0);
+      assert.equal(await bodyHas(s.page, 'RETRIEVAL'), false);
+    } },
+  ];
+}
+
+async function runUiPageTests(browser, base, reporter) {
+  const run = (section, cases) => S.runCases(browser, base, reporter, section, cases);
+  await run('Gold Standard generate and review actions (#400)', goldCases());
+  await run('Transfer export controls (#400)', transferCases());
+  await run('Transfer package list and import (#400)', packageCases());
+  await run('Help page error state and cross-links (#400)', helpCases());
+  await run('Health latency stat row, chart and empty state (#400)', healthCases());
+}
+
+module.exports = { runUiPageTests };
+if (require.main === module) (async () => {
+  const { makeReporter } = require('./lib');
+  const browser = await require('puppeteer-core').launch({ executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const reporter = makeReporter();
+  try { await runUiPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
   finally { await browser.close(); }
   process.exitCode = reporter.summary() ? 0 : 1;
 })().catch(e => { console.error(e); process.exitCode = 2; });
@@ -25437,7 +30348,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session, safe_attributes
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
@@ -26155,7 +31066,7 @@ class TelemetryTests(unittest.TestCase):
         from contextlib import asynccontextmanager
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, Mock
-        api=Path(os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+        api=Path(os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
         tree=ast.parse((api/'main.py').read_text())
         function=next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name=='lifespan')
         namespace={'asynccontextmanager':asynccontextmanager,'FastAPI':object}
@@ -26172,6 +31083,7 @@ class TelemetryTests(unittest.TestCase):
             importer.sweep_interrupted_imports=lambda:[]
             importer.sweep_stale_workdirs=lambda:[]
             service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
+                                    packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
@@ -26713,7 +31625,8 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         self.wire()
 
     async def test_query_real_pipeline_and_dependency_error(self):
-        collection = NS(query=NS(near_vector=lambda **kw: NS(objects=[])))
+        collection = NS(query=NS(near_vector=lambda **kw: NS(objects=[])),
+                        config=NS(get=lambda: NS(vector_index_config=NS(distance_metric=None))))
         fake_client = NS(collections=NS(get=lambda name: collection))
         async def chat(*args):
             return SECRET

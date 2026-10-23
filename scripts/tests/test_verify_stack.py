@@ -397,7 +397,8 @@ class RestartGuardTests(unittest.TestCase):
         self.assertEqual(self.reason(COMPOSE_PROJECT_NAME='rag-verify'), '')
 
     def test_every_restart_section_asks_first(self):
-        for name in ('01_infrastructure.sh', '02_ingest.sh', '04_goldstandard.sh', '05_transfer.sh'):
+        for name in ('01_infrastructure.sh', '02_ingest.sh', '03_query.sh', '04_goldstandard.sh', '05_transfer.sh',
+                     '16_api_paths.sh'):
             with self.subTest(suite=name):
                 text = (VERIFY / name).read_text()
                 block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]
@@ -407,6 +408,55 @@ class RestartGuardTests(unittest.TestCase):
                 self.assertLess(ask, min(acts))
         self.assertNotIn('COMPOSE_PROJECT_NAME:-rag-docker', (VERIFY / '01_infrastructure.sh').read_text())
 
+    def removal(self, **env):
+        box = Sandbox(self)
+        result = box.run(['bash', '-c', f'. "{VERIFY}/lib.sh"; volume_removal_refusal_reason'], **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_volume_removal_refusals(self):
+        # #465: `down -v` runs only on rag-verify with the overlay in COMPOSE_FILE.
+        both = '/c/docker-compose.yml:/h/docker-compose.verify.yml'
+        refused = {
+            'project unset': dict(COMPOSE_FILE=both),
+            'rag-docker': dict(COMPOSE_PROJECT_NAME='rag-docker', COMPOSE_FILE=both),
+            'rag-docker, RAG_VERIFY_LIVE=1': dict(COMPOSE_PROJECT_NAME='rag-docker', COMPOSE_FILE=both,
+                                                  RAG_VERIFY_LIVE='1'),
+            'another project': dict(COMPOSE_PROJECT_NAME='my-rag', COMPOSE_FILE=both),
+            'RAG-VERIFY': dict(COMPOSE_PROJECT_NAME='RAG-VERIFY', COMPOSE_FILE=both),
+            'COMPOSE_FILE unset': dict(COMPOSE_PROJECT_NAME='rag-verify'),
+            'COMPOSE_FILE empty': dict(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=''),
+            'base file only': dict(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE='/c/docker-compose.yml'),
+            'look-alike suffix': dict(COMPOSE_PROJECT_NAME='rag-verify',
+                                      COMPOSE_FILE='/c/docker-compose.yml:/h/docker-compose.verify.yml.bak'),
+            'look-alike prefix': dict(COMPOSE_PROJECT_NAME='rag-verify',
+                                      COMPOSE_FILE='/c/docker-compose.yml:/h/my-docker-compose.verify.yml'),
+            'overlay as a folder': dict(COMPOSE_PROJECT_NAME='rag-verify',
+                                        COMPOSE_FILE='/h/docker-compose.verify.yml/x.yml'),
+            'other separator': dict(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_PATH_SEPARATOR=';',
+                                    COMPOSE_FILE='/c:/docker-compose.verify.yml.d;/c/docker-compose.yml'),
+        }
+        for case, env in refused.items():
+            with self.subTest(case=case):
+                reason = self.removal(**env)
+                self.assertTrue(reason)
+                if env.get('COMPOSE_PROJECT_NAME') != 'rag-docker':
+                    self.assertIn('stack.sh', reason)
+        self.assertEqual(self.removal(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=both), '')
+        self.assertEqual(self.removal(COMPOSE_PROJECT_NAME='rag-verify',
+                                      COMPOSE_FILE='/h/docker-compose.verify.yml'), '')
+        self.assertEqual(self.removal(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_PATH_SEPARATOR=';',
+                                      COMPOSE_FILE='/c/docker-compose.yml;/h/docker-compose.verify.yml'), '')
+
+    def test_api_paths_asks_before_removing_volumes(self):
+        # #465: the first-start check asks the volume guard before `down -v`.
+        text = (VERIFY / '16_api_paths.sh').read_text()
+        down_v = [m.start() for m in re.finditer(r'docker compose[^\n]*down -v', text)]
+        self.assertEqual(len(down_v), 1)
+        ask = text.find('$(volume_removal_refusal_reason)')
+        self.assertNotEqual(ask, -1, 'the volume guard is not asked')
+        self.assertLess(ask, down_v[0])
+
     def test_infrastructure_checks_the_limit_before_restarting(self):
         # #130: an invalid RAG_RESTART_LIMIT_S fails the check and restarts nothing.
         text = (VERIFY / '01_infrastructure.sh').read_text()
@@ -414,6 +464,40 @@ class RestartGuardTests(unittest.TestCase):
         down = re.search(r'docker compose[^\n]*down', block)
         self.assertIsNotNone(down, 'restart command not found')
         self.assertIn('restart_limit', block[:down.start()])
+
+
+
+class ApiPathsFirstStartTests(unittest.TestCase):
+    """#465: suite 16 removes volumes only on the verify project, run with Docker and curl stubbed."""
+
+    BOTH = '/c/docker-compose.yml:/h/docker-compose.verify.yml'
+
+    def run_suite(self, **env):
+        box = Sandbox(self)
+        result = box.run(['bash', str(VERIFY / '16_api_paths.sh')], STUB_CURL_CODE='200',
+                         RAG_API='http://localhost:9/api', RAG_ALLOW_RESTART='1', RAG_SKIP_SLOW='1',
+                         RAG_RESTART_LIMIT_S='5', **env)
+        compose = [call for call in box.calls() if call[:2] == ['docker', 'compose']]
+        removed = [call for call in compose if 'down' in call and '-v' in call]
+        restarted = [call for call in compose if 'down' in call and '-v' not in call]
+        self.assertTrue(restarted, 'the suite did not reach its restart check: ' + result.stdout + result.stderr)
+        return result, removed
+
+    def test_another_project_keeps_its_volumes(self):
+        result, removed = self.run_suite(COMPOSE_PROJECT_NAME='my-rag', COMPOSE_FILE=self.BOTH)
+        self.assertEqual(removed, [])
+        self.assertRegex(result.stdout, r'FAIL\s+a first start from empty volumes[^\n]*rag-verify')
+
+    def test_verify_project_without_the_overlay_keeps_its_volumes(self):
+        result, removed = self.run_suite(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE='/c/docker-compose.yml')
+        self.assertEqual(removed, [])
+        self.assertRegex(result.stdout, r'FAIL\s+a first start from empty volumes[^\n]*docker-compose\.verify\.yml')
+
+    def test_verify_project_with_the_overlay_removes_them(self):
+        result, removed = self.run_suite(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=self.BOTH)
+        self.assertEqual([call[-2:] for call in removed], [['down', '-v']])
+        self.assertIn('-p', removed[0])
+        self.assertEqual(removed[0][removed[0].index('-p') + 1], 'rag-verify')
 
 
 # Weaviate's measured cold start on a copy of real data, rounded up to 30s (#130).
@@ -975,7 +1059,7 @@ class CraftedPackageWriteTests(unittest.TestCase):
     Desktop the container can read a freshly closed bind-mounted file as empty."""
 
     def test_every_crafted_package_is_renamed_into_place(self):
-        for name, var, count in (('05_transfer.sh', 'part', 5), ('retrieval_settings.py', 'part', 1),
+        for name, var, count in (('05_transfer.sh', 'part', 6), ('retrieval_settings.py', 'part', 1),
                                  ('legacy_retrieval.py', 'partial', 1)):
             with self.subTest(file=name):
                 source = (VERIFY / name).read_text()

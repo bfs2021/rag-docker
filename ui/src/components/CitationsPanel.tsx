@@ -9,7 +9,7 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
           <div key={i} className="text-xs bg-gray-50 border rounded p-2">
             <div className="flex justify-between mb-1">
               <span className="font-medium">{c.source_file}</span>
-              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score.toFixed(3)}</span>
+              <span className="text-gray-500">chunk {c.chunk_index} · score {c.score === null ? 'n/a' : c.score.toFixed(3)}</span>
             </div>
             <p className="text-gray-700 italic">{c.excerpt}</p>
           </div>

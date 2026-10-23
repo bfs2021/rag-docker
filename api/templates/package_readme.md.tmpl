@@ -39,7 +39,9 @@ curl -X POST http://localhost:8080/api/import \
 
 `on_conflict` is required and has no default. It is one of `abort` (fail if the
 name is taken), `rename` (import under a free name) or `replace` (overwrite,
-but only after this package has been proven to import cleanly).
+but only after this package has been proven to import cleanly; a failure while the
+final copy is being built can leave the name unavailable, with the data kept in a
+recovery collection named in the error).
 
 ## The filename is a label, not an input
 

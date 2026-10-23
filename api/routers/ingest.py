@@ -8,18 +8,19 @@ from fastapi import APIRouter, Form, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
+                            IngestUploadResponse, JobStatusResponse)
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
-from services.collection_writes import CollectionDeletingError
+from services.collection_writes import CollectionDeletingError, canonical
 from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
-    collection: str
+    collection: CollectionName
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -34,6 +35,9 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    # A form field's default is not validated through CollectionName, so the
+    # stored-name rule is applied here (#372).
+    collection = canonical(collection)
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files)
@@ -100,7 +104,7 @@ async def job_status(job_id: str):
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: str):
+async def get_ingest_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 

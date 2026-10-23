@@ -986,6 +986,17 @@ def _member_name(filename: str) -> str | None:
     return name
 
 
+def _is_macos_metadata(logical: str) -> bool:
+    """Whether a ZIP member is macOS metadata rather than a document (#378).
+
+    Finder's Compress stores each file's resource fork and extended attributes
+    as an AppleDouble file, __MACOSX/<folder>/._<name>, and other macOS tools
+    write ._<name> beside the file. Either keeps the real file's suffix, so the
+    suffix check would queue it as a document of its own."""
+    path = PurePosixPath(logical)
+    return path.parts[0] == "__MACOSX" or path.name.startswith("._")
+
+
 def _limit_text(limit: int) -> str:
     mib = 1024 * 1024
     if limit >= mib and limit % mib == 0:
@@ -1012,7 +1023,8 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
     Every member is read to its end first, including the ones that will be
     skipped. A zip with any unreadable member is refused as a whole, naming
-    them; nothing is repaired, and nothing from it is ingested (#290).
+    them; nothing is repaired, and nothing from it is ingested (#290). macOS
+    metadata members (__MACOSX/, ._*) are skipped like unsupported ones (#378).
 
     The request's ZIPs may expand to at most the budget (#298): the sizes this
     ZIP declares are checked before anything is read, then the bytes actually
@@ -1078,6 +1090,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
 
         for member, logical in members:
             basename = PurePosixPath(logical).name
+            if _is_macos_metadata(logical):
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} (macOS metadata (AppleDouble), not a document)")
+                continue
             if not (PurePosixPath(logical).suffix.lower() in SUPPORTED_EXTENSIONS
                     or _is_json_gz(basename) or _is_jsonl_gz(basename)):
                 queue.skipped.append(
@@ -1132,7 +1148,8 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int) -> str:
-    tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
+    # The prefix is how the startup sweep finds a killed job's staging (#377).
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
     # a later one with the same name. Dropping them without a word makes a ZIP
     # of 8 files silently report 6, with nothing saying which two or why.

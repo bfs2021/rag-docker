@@ -940,21 +940,33 @@ async def start_generation(
     }
 
 
+def _session_not_found(session_id: str) -> GoldStandardError:
+    return GoldStandardError("SESSION_NOT_FOUND", f"Session '{session_id}' not found.", 404)
+
+
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
+    """The updated pair, or None for an unknown pair. An unknown session raises
+    SESSION_NOT_FOUND, so the two 404s stay apart (#381)."""
     def change(current):
         for pair in current["pairs"]:
             if pair["pair_id"] == pair_id:
                 pair.update({key: value for key, value in updates.items() if value is not None})
                 return pair
         return None
-    return await asyncio.to_thread(_update_session_sync, session_id, change)
+
+    def apply():
+        with _state_lock:
+            if session_id not in _sessions:
+                raise _session_not_found(session_id)
+            return _update_session_sync(session_id, change)
+    return await asyncio.to_thread(apply)
 
 
 @telemetry.traced("rag.regenerate")
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
-        return None
+        raise _session_not_found(session_id)
     if session.get("status") == "generating":
         # The generation loop is appending to session["pairs"] and saving it;
         # regenerating underneath that races with it and can lose a pair.

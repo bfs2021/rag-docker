@@ -27,6 +27,11 @@ async def lifespan(app: FastAPI):
         # unowned marker-like names must survive startup.
         log = logging.getLogger(__name__)
         try:
+            from routers import collections as collection_routes
+            await asyncio.to_thread(collection_routes.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted collection registry writes failed")
+        try:
             abandoned = await wc.sweep_staging()
             if abandoned:
                 log.warning("Removed %d staging collection(s) left by a previous run: %s. "
@@ -47,6 +52,14 @@ async def lifespan(app: FastAPI):
                             len(stale_dirs), ", ".join(stale_dirs))
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted imports failed")
+        try:
+            from services import packager
+            leftovers = await asyncio.to_thread(packager.sweep_build_leftovers)
+            if leftovers:
+                log.warning("Removed %d leftover(s) of an interrupted export from the "
+                            "exports folder: %s", len(leftovers), ", ".join(leftovers))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted exports failed")
         # Job records survive a restart (#23). After the sweeps, so a job interrupted
         # mid-import is reported failed and its half-built collection already swept.
         # No worker from the previous process is alive, so any job still queued or

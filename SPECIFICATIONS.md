@@ -237,6 +237,21 @@ healthcheck:
 
 ### 3.1 Endpoints
 
+**Collection names (#372).** Weaviate stores a collection under its name with the first
+character upper-cased and the rest unchanged (`myDocs` is stored as `MyDocs`). Every
+endpoint that takes a collection name from the caller, in the body, the path, the query
+string or a form field, replaces it with that stored name before using it. So whichever
+spelling of the first character a request uses, the registry entry, retained originals,
+ingest and retrieval settings, gold-standard sessions, query metrics and job guards are
+keyed by the stored name, and responses and messages that name the collection give it.
+Nothing else is case-folded: `mydocs` is a different name from `MyDocs`. Import takes its
+name from the package, which must already be in this form (`RAG_EXPORT_SPECIFICATIONS.md`).
+State written under a lowercase-first spelling before #372 (a registry entry, a `sources/` folder, a
+settings file, a session's `collection`, a metric record) is not migrated, and it isn't read under the
+stored name either: such a collection lists `created_at` as `null`, exports and tunes without those
+originals, settings and sessions, and its old metric records match only that old spelling. Recreating
+the state (re-ingesting, saving the settings again) puts it under the stored name.
+
 #### 3.1.1 Health
 
 ```
@@ -327,6 +342,21 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
+The registry is written atomically (#388): each create or delete writes the whole registry to a
+uniquely named temporary file in the same folder, fsyncs it and replaces
+`collection_registry.json` with it, under one lock in the API process, so a crash or a failed
+write (for example on a full `ingest_uploads` volume) leaves the old file whole. The folder is
+then fsynced, so a power loss right after a save doesn't lose the replacement; if that fsync
+fails, the save fails with the new file already in place (#445). At startup, before the first
+request, the API removes the temporary files (`.collection_registry.json.*.tmp`) of saves a
+crash interrupted; one it can't remove is logged and kept (#445). The file is
+owner-only (mode 0600). A registry that exists but can't be read (it can't be opened, isn't
+UTF-8 JSON, or isn't a JSON object) is never treated as empty: it is left unchanged and logged.
+`GET /collections` then answers with `created_at` `null` for every collection, and
+`POST /collections` and `DELETE /collections/{name}` still create or delete the collection and
+answer as usual, without recording or removing its entry, until the file is fixed or removed.
+A missing file is an empty registry.
+
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to list the collections
 (unreachable, timed out or any other error) (#373): "Cannot list the collections: Weaviate
 could not be read. Try again when Weaviate is available." `detail` is `null`. The cause is
@@ -367,6 +397,9 @@ ignore valid HNSW settings.
 ```json
 { "name": "Documents", "status": "created" }
 ```
+
+`name` is the name as stored (§3.1, #372): a request for `myDocs` answers `MyDocs`, and
+`collection_registry.json` records its `created_at` under `MyDocs`.
 
 **Response 409** if collection already exists.
 
@@ -558,6 +591,17 @@ most 512 MB decompressed, nothing decompressed written to disk). Each line becom
 as described in §5.1; chunks have `source_type` `jsonl`, and the retained original is the file
 as uploaded.
 
+**macOS metadata in ZIPs (#378).** A ZIP made with the macOS Finder holds, beside each file, an
+AppleDouble file with its resource fork and extended attributes, `__MACOSX/<folder>/._<name>`,
+which keeps the file's suffix; other macOS tools write `._<name>` beside the file. These are not
+documents. A ZIP member whose logical name (below) has `__MACOSX` as its first folder, or whose
+file name starts with `._`, is not queued, whatever its suffix, and is listed in the job's
+`skipped` as `<zip filename>:<member path> (macOS metadata (AppleDouble), not a document)`, not
+left out silently. The match is exact and case-sensitive, so names that only contain these
+strings (`_report.txt`, `notes._v2.txt`, `.hidden.txt`, `__MACOSX_notes.txt`,
+`docs/__MACOSX/readme.txt`) are queued as usual. Such members are still validated like any
+member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPPORTED_FILES`.
+
 **Logical names and re-ingesting (#22).** Every file is stored under a logical name: the
 `source_file` of its chunks and the filename in its retained-source index entry.
 
@@ -638,7 +682,8 @@ three counts change in one update (#324). Job records written before
 these two fields existed read back with both `null`, not `0`, which would be untrue (#302).
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
-ingested, each with its reason: an unsupported type, or a later input with the same name.
+ingested, each with its reason: an unsupported type, macOS metadata in a ZIP (#378), or a
+later input with the same name.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -656,7 +701,9 @@ kind are kept: at startup by file time, and while the API runs, starting a job p
 the finished records saved longest ago (a `queued` or `running` one never is). A removed job
 answers `404 JOB_NOT_FOUND`, as it would after a restart. A job's first record is written off
 the event loop; a start whose request is cancelled during that write leaves no record and
-releases its guards (#309).
+releases its guards (#309). An interrupted ingest's upload staging directory
+(`{UPLOAD_DIR}/ingest-*`, the upload and its extracted ZIP members) is removed at the next
+startup, before the first request; links are never followed (#377).
 
 On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`, where
 `<file>` is the uploaded filename, or `<zip filename>:<member path>` for a ZIP member. A
@@ -744,7 +791,9 @@ acknowledges that request's complete value was published; a later successful sav
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
 Failed saves clean up their own temporary file when filesystem permissions
-allow. Package import publishes ingest settings through this same lock and
+allow. After the replacement the folder is fsynced, so a power loss right after a
+save doesn't lose it (#445); a failed folder fsync doesn't acknowledge the save
+either, though the new value is then already in place. Package import publishes ingest settings through this same lock and
 atomic writer. Published files use mode 0600 (API owner read/write), including
 replacements of older files.
 
@@ -818,6 +867,21 @@ When `include_citations` is `true`:
 }
 ```
 
+A citation's `score` is higher-is-better in every retrieval mode (#376). Citations are listed in
+retrieval order, best match first, so their scores don't increase down the list.
+
+| Mode | `score` |
+|---|---|
+| `hnsw`, `flat`, `semantic` | A similarity converted from Weaviate's distance by the collection's distance metric: `cosine`: `1 - distance` (the cosine similarity, -1 to 1); `dot`: `-distance` (the dot product); `l2-squared`: `1 / (1 + distance)` (0 to 1). |
+| `hybrid` | Weaviate's fusion score, unchanged. |
+
+The metric is read from Weaviate on every query, so a collection deleted and recreated with
+another metric is converted by its new one. `score` is `null` when Weaviate returns no distance
+(or no hybrid score), or when the collection's config has no metric or a metric that isn't one
+of the three above; it is never replaced by 0.0. A failed read of the metric is a Weaviate
+failure: the query answers the 503 below (#373). Non-null scores are rounded to 4 decimals.
+Scores rank the chunks of one answer; they aren't comparable across modes or metrics.
+
 **Response 404** if the collection does not exist (uses `COLLECTION_NOT_FOUND` error code).
 
 **Response 503** `SERVICE_UNAVAILABLE` when Weaviate can't be read to check that the
@@ -829,6 +893,11 @@ the pipeline (#373): an Ollama call (the reformulation, the query embedding or t
 that can't connect, times out or answers an error status, or a Weaviate retrieval call that
 raises. The message names the service: "The question was not answered: Ollama could not be
 reached, timed out or returned an error. Try again when Ollama is available." (or Weaviate).
+In `hybrid` and `semantic` modes Weaviate embeds the question itself through Ollama, so an
+Ollama failure there comes back as a Weaviate error; a Weaviate failure in those modes names
+both (#411): "The question was not answered: Weaviate could not be reached, timed out or
+returned an error, or Ollama could not embed the question for it. Try again when Weaviate and
+Ollama are available."
 `detail` is `{"collection": "<name>"}`, no metrics record is written, and the cause is logged,
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
@@ -865,6 +934,16 @@ special-case a new collection.
 `is_default: true` means no configuration has been explicitly saved and these are
 system defaults (`hnsw`, `top_k: 5`, `alpha: 0.75`, `ef: null`,
 `response_format: "end_user"`).
+
+A saved file that can't be read, isn't JSON, holds JSON that isn't an object, or has a
+field of the wrong type (for example `"top_k": "x"`) is logged as a warning, and the
+response is the defaults with `is_default: true`, never an error (#439). Fields of the
+right type are returned as saved, missing fields are filled from the defaults, and an
+export still refuses such a file (RAG_EXPORT_SPECIFICATIONS.md §5). An `alpha` of
+`NaN` or `Infinity`, which JSON can't carry, counts as the wrong type, while a finite
+`alpha` outside 0.0-1.0 is returned as saved. A saved `is_default` key, the response's
+own field rather than a setting, also gives the defaults; export ignores it, as it
+does any unknown key (#477).
 
 Saved `ef` is a legacy inactive field, not a query override. `GET /collections` reports actual HNSW settings as `hnsw_config` (ef, efConstruction, maxConnections), or null for a Flat, Dynamic or unrecognized index configuration. An unavailable distance metric is reported as `unknown`. Both hnsw/flat query-mode names use the existing physical index.
 
@@ -1021,7 +1100,7 @@ Updates the status or edited content of one pair. Called by the UI when the user
 }
 ```
 
-`status` must be one of `"approved"`, `"edited"`, `"rejected"`, `"pending"`. Providing `question`, `answer`, or `ground_truth` fields without setting `status: "edited"` is a 422 error. All text fields are optional — only provided fields are updated.
+`status` must be one of `"approved"`, `"edited"`, `"rejected"`, `"pending"`. Providing `question`, `answer`, or `ground_truth` fields without setting `status: "edited"` is a 422 error. A provided `question`, `answer` or `ground_truth` must contain text: an empty or whitespace-only value is refused with 422 `INVALID_PARAMETER`, since `save` would export it as an empty RAGAS field. Other values are stored as sent. All text fields are optional — only provided fields are updated. The body is validated before the session is looked up.
 
 **Response 200:** Returns the updated pair object.
 
@@ -1053,7 +1132,7 @@ Regenerates one specific pair. Preserves all other pairs in the session.
 
 **Response 200:** Returns the single regenerated pair object (same schema as above). The regenerated pair's `status` is reset to `"pending"`.
 
-**Response 404** if the session or pair ID does not exist (same error format as PATCH above).
+**Response 404** if the session or pair ID does not exist (same error format as PATCH above): `SESSION_NOT_FOUND` for an unknown session, `PAIR_NOT_FOUND` for an unknown pair in an existing session. Neither calls the model.
 
 **Response 409** (`SESSION_BUSY`) if called while the session's `status` is still `"generating"`.
 
@@ -1158,7 +1237,9 @@ answer, the record still counts in the ring, and the API still starts. A line le
 by a failed write doesn't cost the next record, which starts a line of its own.
 
 **Query parameters:** `collection`, `retrieval_mode` (both optional filters), and
-`history_limit` (integer, 0-500, default 100).
+`history_limit` (integer, 0-500, default 100). Queries are recorded, and `collection` is
+matched, under the stored collection name (§3.1, #372), so `myDocs` and `MyDocs` select the
+same records.
 
 **Response 200:**
 ```json
@@ -1377,7 +1458,9 @@ carries the reason and `filename` stays null. Export, import and tune job record
 across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
-collection's export slot is released.
+collection's export slot is released. A build interrupted by a restart leaves them in
+`EXPORTS_DIR` (`.build-*` and `.<stem>.tar.gz.partial`) until the next startup removes them,
+before the first request; completed packages are never touched (#377).
 
 `warnings` is non-fatal. It records, for example, chunks whose `source_sha256`
 could not be resolved to exactly one retained document.
@@ -1404,12 +1487,19 @@ could destroy a collection the caller did not mean to touch. It is one of
 
 **Response 202:** `{ "job_id": "...", "status": "queued", "filename": "..." }`
 
-**409 `IMPORT_IN_PROGRESS`** if the same file is already being imported.
+**409 `IMPORT_IN_PROGRESS`** if the same package file is already being imported:
+the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
+`a/../x.tar.gz` are one file (#391).
 
 Everything else — unreadable archive, bad digest, embedding mismatch, name
-collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2) — is reported
-through the job rather than this response, because none of it is knowable without
-reading the package.
+collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
+into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
+job rather than this response, because none of it is knowable without reading the
+package. One import runs per target collection, whatever its `on_conflict`: a second
+import into a collection another import is building fails with `error_code`
+`IMPORT_IN_PROGRESS` and `error_detail` `{"collection": "<target>"}`, and changes
+nothing. A `rename` that moves to a new name competes for that name, not the
+original (#391).
 
 ---
 
@@ -1474,6 +1564,11 @@ ingest default.
   they list has stored chunks (every file produced no chunks at ingest), so there
   is nothing to rebuild (#328). No job is created. The other `SOURCES_REQUIRED`
   refusals below still come through the job.
+- **409 `SOURCE_INDEX_INVALID`** from `/tune/rechunk`, and from `/tune/reembed`
+  with chunking fields, when the collection's retained source index is invalid
+  (#389). No job is created; repair the index before re-chunking. Re-embedding
+  without chunking fields and re-indexing don't read the retained sources, so
+  they still start.
 - **503 `SERVICE_UNAVAILABLE`** from those same requests when Weaviate can't be
   read for that check (#340). No job is created; try again when Weaviate is
   available. The cause is logged, not returned.
@@ -1586,6 +1681,22 @@ A file that cannot be read as a package is still listed, with `readable: false`
 and null metadata, so it does not silently disappear from the UI. Import reports
 precisely why it cannot be used.
 
+The listing reads each archive only up to its top-level `manifest.json`
+(`<directory>/manifest.json`) and nothing after it, so a large package is not
+decompressed to list it (#383). New packages put the manifest first
+(`RAG_EXPORT_SPECIFICATIONS.md` §4.2); in older ones the files before it are read
+past, which is slower but works. The manifest read is bounded at 16 MiB: a larger
+manifest is not read and its package is listed `readable: false`, as is one whose
+manifest is missing, damaged, not UTF-8, not valid JSON or not a JSON object.
+
+The listed values are typed as in the manifest (`RAG_EXPORT_SPECIFICATIONS.md`
+§4.4): `collection` an object, its `name` a string and its `chunk_count` an
+integer, `fidelity` and `created_at` strings. A value that is absent or `null`
+(`collection` included) is listed as `null`. A value of any other JSON type is not
+coerced (`"12"`, `12.0` and `true` are not integers): the package is listed
+`readable: false` with null metadata, and the listing still answers 200 with the
+other packages (#451).
+
 The package format itself — filename convention, layout, manifest and
 `chunks.jsonl` — is specified in `RAG_EXPORT_SPECIFICATIONS.md` §4.
 
@@ -1643,7 +1754,7 @@ Flat (KNN) index has no tunable parameters.
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -1855,11 +1966,11 @@ Visible on all pages post-role-selection. Contents vary by role:
 
 **Elements:**
 
-- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection.
+- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Question text input (multi-line, submit via "Ask" button or Ctrl+Enter; plain Enter inserts a newline).
 - Citations toggle (checkbox, off by default, labeled "Show source citations").
 - Answer display area (markdown-rendered).
-- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score, excerpt.
+- Citation list (shown below answer when toggle is on): source file, chunk index, relevance score (higher is better, 3 decimals; `n/a` when the API returns `null`, #376), excerpt.
 - Latency display (small, below answer): `Retrieved in Xms · Generated in Xms`.
 - Retrieval mode selector — visible to Engineer and Developer roles only. Hidden for End User. Read-only: it displays the mode saved for the selected collection, which is changed on the Retrieval Config page. The settings are fetched from `GET /retrieval/config/{collection}` whenever the selected collection changes; if nothing is saved for that collection the API returns the defaults (`hnsw`, `top_k: 5`).
 
@@ -1892,12 +2003,12 @@ settings, regardless of when a prior collection's save completes.
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
 - File list showing queued files with remove buttons.
-- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest.
+- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list. After a create, the selector selects the new collection under the name the API answered with, which is the name the list shows (`myDocs` selects `MyDocs`, #372).
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
-- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID.
+- "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
 - Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
@@ -1984,27 +2095,30 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Roles:** Engineer, Developer
 
 **Phase 1 — Generate:**
-- Collection selector.
-- Sample size input (1–100, default 20).
+- Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
+- Sample size input (1–100, default 20). While the value is empty, not a whole number, below 1 or above 100, "Generate Pairs" is disabled and the page says "Sample size must be a whole number from 1 to 100."; no request is sent (#393).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
-- Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review table as they complete (partial display during generation).
+- "Generate Pairs" is disabled while its start request is in flight, while a generation runs and between the start being accepted and the first poll answer (so a second click cannot start another session or skip the confirmation below); a retained session that is still `generating` disables it too (#380).
+- Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review list as they complete (partial display during generation).
+- If a poll fails, polling stops and the page says so as an alert: "Could not read the generation's progress: " followed by the reason, then "Polling stopped; use Load / refresh session to check again." The progress is no longer shown and Generate is enabled again. "Load / refresh session" clears the message and polls again while the session is `generating` (#380).
+- When the session is no longer `generating`, the page shows its outcome under the controls (#380), for a session generated here and for a retained session loaded by ID. `completed`: "Generation completed: C of T pairs generated." and, when `pairs_failed` is above 0, "F pairs failed and are missing from the review list." (a warning). `completed` with `pairs_total` 0: "No pairs were generated: the collection has no chunks." `failed`: "Generation failed." and "F of T pairs failed." when `pairs_failed` is above 0 (an error). `cancelled`: "Generation was cancelled." Any other status: "Generation ended with status S." Under the headline the `errors` reasons are listed once each, with "(xN)" when a reason repeats, at most five, then "and K more reasons". Warnings and errors are alerts.
 - If a session already exists in the UI (from a previous generation), clicking "Generate Pairs" displays a confirmation dialog: "This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?" Previous sessions remain on the server (accessible via direct session ID) but are no longer referenced by the UI after confirmation.
 
 **Phase 2 — Review:**
-- Table of generated pairs. Columns: Question, Answer, Source File, Status, Actions.
-- Each row expandable to show full context chunk.
+- List of generated pairs, one expandable row per pair (#393). The collapsed row shows the question, the source file, the status and the actions below.
+- Expanding a row shows the answer, the ground truth and a preview of the first context chunk: its first 300 characters, followed by `…`.
 - Actions per row:
   - Approve (green check) → calls `PATCH /goldstandard/session/{session_id}/pair/{pair_id}` with `{ "status": "approved" }`
-  - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included)
+  - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included; with no change, only the status). If the `PATCH` is refused (for example a cleared field, `422 INVALID_PARAMETER`), the form stays open with the typed values and shows the API's message inside it as an alert; no page-level error is set (#380).
   - Reject (red X) → calls `PATCH` with `{ "status": "rejected" }`
-  - Regenerate (refresh icon) → calls `POST /goldstandard/regenerate` with `session_id` and `pair_id`, replaces row with returned pair
+  - Regenerate (refresh icon) → calls `POST /goldstandard/regenerate` with `session_id` and `pair_id`, replaces row with returned pair. While that request runs (up to 1800 s) the pair's button is disabled with the title "Regenerating..." and the other pairs' buttons stay enabled (#380).
 - Summary bar: `X approved · Y edited · Z rejected · W pending`
 
 **Phase 3 — Export:**
 - "Export Approved" button (disabled until at least 1 approved or edited pair exists).
 - Historical sessions use "Export Historical Approved" and additionally require an explicit checkbox acknowledging that the file omits validity warnings and is not a current baseline. The backend independently enforces the choice.
-- Filename field: pre-filled with `{collection}_{timestamp}`, editable.
-- Calls `POST /goldstandard/save` → on success, triggers download of the resulting JSON file.
+- Filename field: pre-filled with the API's default name, `{collection}_{YYYYMMDD_HHMMSS}.json` (UTC, with the collection part made safe and shortened as the `POST /goldstandard/save` default does), when a generation starts and when a retained session is loaded; editable (#393).
+- Calls `POST /goldstandard/save` → on success, opens `GET /goldstandard/download/{filename}` in a new tab, with the returned filename percent-encoded as one path segment, to download the resulting JSON file (#393). Browsers allow that tab only shortly after the click: with Chromium's popup blocker on, it opens when the save answers within about 5 seconds and is blocked after that.
 - Export summary shown: `17 pairs exported, 3 excluded (rejected/pending)`.
 
 ### 7.8 Collections Page
@@ -2012,8 +2126,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/collections`  
 **Roles:** Engineer only
 
-- Table of collections: name, object count, index type, distance metric, created date.
+- Table of collections: name, object count, index type, distance metric, created date. If the list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, and keeps any rows already shown; the next successful load (after a create or delete) clears it (#379).
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
+- A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
@@ -2023,9 +2138,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Roles:** Engineer only
 
 - Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
-- When health can't be read (no answer from the API, a proxy error page, or any other error without a health body), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
+- When health can't be read (no answer from the API, a proxy error page, any other error without a health body, or a 200 without a health body (#415)), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
 - Latency trend charts (from the `history` field of `GET /metrics/latency`, bounded by `history_limit`, default 100): line chart of `total_ms` over time alongside `retrieval_ms` and `llm_ms`. Summary stat row shows P50/P95/P99 for each component from the `retrieval_latency`, `llm_latency` and `total_latency` objects.
 - Health and latency metrics load separately: a degraded or failed health call doesn't stop the charts from loading. A failed metrics call keeps the charts last shown.
+- A slow response from an older refresh never replaces a newer one's: a health result (cards or message) is shown only if no later refresh's health result is already shown, and the same for latency metrics (#415). A failed metrics call changes nothing, so a late metrics result from an older refresh is still shown when no later one has been.
 - Auto-refreshes every 30 seconds.
 
 ---
@@ -2040,18 +2156,25 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Collection selector (from `GET /collections`).
 - **Fidelity shown before the export runs**, from `GET /tune/{collection}`:
   `with-sources` with the document count, or `chunks-only` with what that costs.
-  The choice is informed rather than discovered afterwards in the manifest.
+  The choice is informed rather than discovered afterwards in the manifest. The
+  line is never hidden: it reads "Fidelity: reading…" while the lookup runs, and
+  "Fidelity: unknown — it could not be read:" with the reason when the lookup
+  fails (409 `SOURCE_INDEX_INVALID`, 503, 404 or a proxy error). It always belongs
+  to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
 - Progress while the job runs, then the filename, size, fidelity, whether models
   were bundled and whether `retrieve.py` was generated. Warnings from the job are
-  shown in full.
+  shown in full. A failed export shows its `error_code` (for example
+  `EMBEDDING_MISMATCH`) before the error, as the import half does.
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
   chunk count, fidelity and size. Unreadable files are listed too, marked as
-  such, so nothing silently disappears.
+  such, so nothing silently disappears. A failed `GET /packages` shows "Could not
+  list the packages in ./exports:" with the reason, instead of the empty-folder
+  hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
   consequence spelled out. There is no default in the API, and the page makes the
   difference explicit because the wrong choice can delete a collection.
@@ -2060,7 +2183,14 @@ A retained session can be loaded/refreshed by its session ID, including when its
   sessions restored).
 
 Both halves poll their job endpoint every 2s and stop polling when the job
-finishes or the page unmounts.
+finishes or the page unmounts; a poll in flight at unmount, or a start answered
+after it, schedules nothing. A failed poll is shown ("Could not check the
+export's progress, retrying:" with the reason) and retried at the same interval,
+with the button still busy; the next good poll clears the message. After 30
+failed polls in a row (about a minute, enough for an API restart) the half stops
+watching the job, says so with the last error and that the job may still be
+running, and enables its button again, so the page never stays stuck until a
+reload (#382).
 
 ### 7.11 Transfer Help Page
 
@@ -2140,7 +2270,7 @@ rag-docker/
 │   ├── ragclient.py            # HTTP client + error translation
 │   ├── paths.py                # Inbox path validation
 │   └── tools/                  # 15 tools across 5 modules
-├── package.sh                  # Source-only zip (~150 KB; target needs internet)
+├── package.sh                  # Source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh          # Self-contained bundle (~4.6 GB; no network needed)
 ├── install-offline.sh          # Installs from that bundle on an air-gapped Mac
 ├── proxy/
@@ -2257,6 +2387,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] A collection created, ingested into, configured, queried, exported, tuned or used for gold-standard generation under a lowercase-first spelling keeps all its state under the stored name: the 201 answers `MyDocs` for `myDocs`, the list shows its `created_at`, its originals are retained under the stored name so export is with-sources and re-chunk finds them, one settings file serves both spellings, and the metrics filter and the one-export guard treat both spellings as one collection (#372).
+      *`test_collection_spelling.py` (run by `02_ingest.sh`) drives each route through the app with a lowercase-first name and checks the name every worker, file and record receives; it fails on the code before #372. `05_transfer.sh`, on the verify stack, creates and ingests under a lowercase-first name, reads the tuning options and exports under the stored name (with-sources), re-chunks under the lowercase name and, with LLM work, checks a query's metrics under both spellings; on the code before #372 the 201, `created_at`, upload answer, tuning-options, with-sources export and metrics checks fail. `ui_criteria.js` checks the Import page selects the created collection as stored.*
 - [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources, configurations and registry entries, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies. Import-replace notes count sessions under both spellings.
       *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration. The live backend rejects case-only neighbouring collections; Linux-volume checks still verify case-distinct sidecar/session preservation, while controlled tests cover both backend collections.*
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
@@ -2396,8 +2528,8 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_delete_busy.py` sends no value, `false`, `1`, `yes`, an empty value and `truee` (400, no lookup, nothing deleted), a missing collection without it (400, not 404) and `TRUE`/`True` (200). `02_ingest.sh` repeats the 400 cases and a `confirm=TRUE` delete on the live verify stack, and `test_mcp_delete.py` checks the MCP tool sends `confirm=true` with `name` still its only input.*
 - [x] While a delete of a collection is in progress, a new ingest, export, tune or generation job for it answers `409 COLLECTION_DELETING` and leaves nothing behind, and an import of it ends `failed` with that code; a delete still waiting for the writer guard keeps #40's ordering (#302).
       *`test_delete_busy.py` holds a real `DELETE` inside its backend delete and drives each route and the import worker against it, under both spellings, and checks generation answers without its one-second wait. `ui_criteria.js` checks the Import page shows the message for an upload refused this way. An `abort` import whose target is still present also ends `COLLECTION_DELETING` (#324).*
-- [x] When Weaviate can't be read to check whether the collection exists, `POST /query`, `POST /goldstandard/generate`, `POST /collections`, `DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` (#366) and the tune starts `POST /tune/rechunk`, `/tune/reembed` and `/tune/reindex` (#349) answer HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and nothing run, created, saved or queued. `GET /tune/{collection}` answers the same 503 when its existence check or its re-chunk coverage check can't read Weaviate (#349).
-      *`test_reingest.py` (run by `02_ingest.sh`) calls each handler with Weaviate failing, and sends each request through the app over HTTP, checking the JSON 503 reaches the client (#369).*
+- [x] When Weaviate can't be read to check whether the collection exists, `POST /query`, `POST /goldstandard/generate`, `POST /collections`, `DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` (#366) and the tune starts `POST /tune/rechunk`, `/tune/reembed` and `/tune/reindex` (#349) answer HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and nothing run, created, saved or queued. `GET /tune/{collection}` answers the same 503 when its existence check or its re-chunk coverage check can't read Weaviate (#349). `POST /tune/rechunk` and `POST /tune/reembed` with chunking fields answer it too when their re-chunk coverage check can't read Weaviate (#340), with no job and the guards released.
+      *`test_reingest.py` (run by `02_ingest.sh`) calls each handler with Weaviate failing, and sends each request through the app over HTTP, checking the JSON 503 reaches the client (#369), the tune starts' re-chunk check included (#409).*
 - [x] A gold-standard start cancelled while its session is being prepared ends its registration and leaves the session `cancelled`, so the collection can be deleted (#302).
       *`test_delete_busy.py` cancels a start while sampling is held, then checks the registration, the session's status, a `200` delete, and that a settle that fails is reported as a failed generation. A cancelled start whose preparation fails settles nothing (#324).*
 - [x] Ingest jobs report `chunks_submitted` and `chunks_accepted` beside `chunks_stored`, counted once per file from its final attempt; older records read them back as `null`; the Import page shows the three only when they differ (#302).
@@ -2450,6 +2582,19 @@ now lives once, in `api/services/ingest_config.py`.
       against a top-level member, folders, `a/../b.txt` and `./c.txt`, paths leaving the
       archive and the provenance of labels. `02_ingest.sh` ingests a ZIP with
       `a/report.txt` and `b/report.txt` and two parts with one filename through the proxy.*
+- [x] A ZIP's macOS metadata (`__MACOSX/` members and `._*` AppleDouble files) is not ingested and is listed in `skipped` with its reason; names that only look like it are ingested (#378).
+      *A Finder ZIP's `__MACOSX/._report.pdf` kept `.pdf` and was queued as a document of
+      its own. `test_reingest.py` covers a Finder-style ZIP (only the file queued, the
+      AppleDouble member in `skipped`), a `._*` file beside its file, other `__MACOSX/`
+      members whatever their suffix, look-alike names that are still queued, and a ZIP of
+      only metadata refused with `NO_SUPPORTED_FILES`. It also checks that these members
+      are still validated, a damaged one refusing the ZIP and their bytes counting toward
+      the expansion cap, that `./__MACOSX/._r.txt`, `x/../__MACOSX/notes.txt` and
+      `d/./._e.txt` are matched by their normalised names and listed under the archive's
+      spelling, and that a direct upload named `._notes.txt` is still ingested (#455).
+      `02_ingest.sh` ingests a Finder-style
+      ZIP through the proxy: the job completes with no errors, stores only the file's
+      chunks and lists the AppleDouble member in `skipped`.*
 - [x] Two ingest jobs that replace one logical name in one collection run one at a time: afterwards exactly one job's version is stored, whole (its full chunk set, its `chunks_replaced` equal to the other job's `chunks_stored`, one retained digest naming the name, the winner's); which job runs last is not promised (#22).
       *`02_ingest.sh` sends two uploads of one name, with different content, at once
       through the proxy and checks that both jobs complete, exactly one version's text is
@@ -2467,6 +2612,12 @@ now lives once, in `api/services/ingest_config.py`.
       *hnsw, flat, hybrid and semantic each returned chunks and an answer.*
 - [x] `include_citations: true` returns citation objects with source_file and score.
       *Each citation carries source_file, chunk_index, score and excerpt.*
+- [x] A citation's score is higher-is-better in every mode, and `null` when missing (#376).
+      *In each of the four modes the scores are numbers, best first. On a real Weaviate, cosine,
+      dot and l2-squared collections give the documented similarities of known vectors, and a
+      collection recreated with another metric is converted by the new one. Controlled tests
+      cover a missing distance or hybrid score (`null`), an unknown metric, and a failed metric
+      read answering 503; the Q&A page shows `n/a` for a `null` score.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
@@ -2474,9 +2625,10 @@ now lives once, in `api/services/ingest_config.py`.
       end_user prompt now asks for a short answer without technical detail, so
       "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
-- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373).
-- [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged; the file never holds more than 1,000 lines, is compacted atomically to its last 500 records, and those reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
-      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call and each retrieval mode's Weaviate call; it fails on the code before #373.*
+- [x] When, after the existence check, an Ollama call in the query pipeline can't connect, times out or answers an error status, or a Weaviate retrieval call fails, `POST /query` answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error naming the service, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and no metrics record written (#373). In `hybrid` and `semantic` modes, where Weaviate embeds the question through Ollama, a Weaviate failure names both Weaviate and Ollama (#411).
+      *`test_error_envelope.py` (run by `01_infrastructure.sh`) sends each case through the app over HTTP, for each Ollama call (the synthesis in both response formats) and each retrieval mode's Weaviate call; it fails on the code before #373, and its hybrid and semantic wording on the code before #411.*
+- [x] When the query's metrics record can't be written to `metrics.jsonl`, `POST /query` still answers 200 with its answer and the failure is logged. The file is bounded: an append that brings it to 1,000 lines, counted from the records loaded at startup, compacts it atomically to its last 500 records. A failed compaction leaves it longer until a later append's retry succeeds, and after a failed startup load it can pass 1,000 lines before its first compaction. The last 500 records reload into the ring after a restart, which reads at most the file's last 1 MiB (#374).
+      *`scripts/tests/test_metrics.py` (run by `03_query.sh` in the built API image with `--network none`) sends the failed writes through the app over HTTP and checks `GET /metrics/latency` still counts the record; it checks the bound, compaction failures and concurrent records, and the startup load of a whole file, a large legacy file, a tail without a line break and an unreadable file; it fails on the code before #374. With `RAG_ALLOW_RESTART=1`, `03_query.sh` restarts the API after its queries and checks `GET /metrics/latency` reports the same records.*
 
 - [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
       *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
@@ -2522,6 +2674,9 @@ now lives once, in `api/services/ingest_config.py`.
       status still read "pending" — an export could ship text nobody approved
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
+- [x] PATCH and regenerate answer 404 `SESSION_NOT_FOUND` for an unknown session and 404 `PAIR_NOT_FOUND` for an unknown pair in an existing session. PATCH refuses an empty or whitespace-only `question`, `answer` or `ground_truth` with 422 `INVALID_PARAMETER` and leaves the pair unchanged.
+      *Evidence: `04_goldstandard.sh` runs `scripts/tests/test_goldstandard_review.py` (all four 404 cases, nothing written and no model call; the empty-field refusal for each field, before the session lookup; accepted-edit controls) and checks the unknown-session codes through the proxy, and in the LLM section the unknown-pair code and an empty question on a generated pair.*
+      *Originally an unknown session answered `PAIR_NOT_FOUND` on both endpoints, and an empty edit was stored and exported as an empty RAGAS field (#381).*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`). Startup settles interrupted generations as failed, preserving completed pairs, counters and validity metadata; ordinary scans leave active generation alone.
       *Evidence: `session_persistence_cases.py` covers fresh-process settlement, mixed completed/interrupted sessions with edits and stale/orphan metadata, worker refusal without cache/file mutation, plain reason persisted without a false storage error, successful regeneration and on-disk retry after write failure. `04_goldstandard.sh` includes a guarded disposable API hard-stop and regeneration check when a retained pair is available.*
 - [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
@@ -2592,6 +2747,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
 - [x] Citations toggle correctly hides/shows citation panel.
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
+      interception and checks that the box starts unchecked and the query sends
+      `include_citations` false with no Sources panel, even when the reply carries citations; that
+      checked, it sends true and the panel lists file, chunk, score (`n/a` for null) and excerpt; and
+      that unchecking and checking it again hides and shows the panel of the answer on screen
+      without a new query.*
 - [x] Chunking strategy selection updates the explanation panel without page reload.
       *All five strategies render distinct text; zero navigations.*
 - [x] Health dashboard shows per-service latency; auto-refreshes every 30 seconds.
@@ -2601,7 +2762,20 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health` with a
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
-      for a missing model and an unreachable Ollama or Weaviate.*
+      for a missing model and an unreachable Ollama or Weaviate.
+      `scripts/verify/browser/health_page.js` (suite 06, #415) holds each stubbed answer and
+      checks that a failed metrics call keeps the charts, that a 200 without a health body (JSON
+      of another shape, empty or not JSON) and a 503 error envelope show a message, not cards,
+      and that a late response from an older refresh never replaces a newer health result or
+      newer charts; its JSON-200, empty-200 and three late-response checks fail on the code before
+      #415. `test_health.py` also checks Weaviate and Ollama down together, and that memory below
+      the recommendation or unreadable leaves `/health` at 200 `ok`.*
+- [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, and shows a failed package list (#382).
+      *Evidence: `scripts/verify/browser/transfer_page.js` (suite 06, through `ui_criteria.js`)
+      stubs every API call in the browser: proxy 502s while polling either half, a poll in
+      flight and an export start answered after the page is left, 409, 503 and 404 from
+      `/tune`, a late fidelity answer for another collection, an `EMBEDDING_MISMATCH` export
+      and a 500 from `/packages`. 13 of its 14 checks fail on the code before #382.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
@@ -2611,10 +2785,42 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       with a synthetic `409 COLLECTION_BUSY` by request interception, so no collection is
       touched, and checks one `DELETE` was sent, the alert inside the dialog, the row and
       the cleared message after Cancel.*
+- [x] A refused collection create is shown inside the New Collection modal on the Collections page and in the Import page's "+ New" modal: the modal stays open with the API's message as an alert, and Cancel or a successful create clears it (#379).
+      *Before, the error went to the page-level line behind the modal's overlay. `ui_criteria.js`
+      answers the `POST /collections` with a synthetic `409 COLLECTION_EXISTS`, then a `201`, by
+      request interception, so no collection is created, and checks one `POST`, the alert inside
+      the open modal, and no alert after Cancel or a success. On the Import page, a create whose
+      list reload fails closes the modal and shows a failed list. The checks fail on the code
+      before #379.*
+- [x] A failed collection list is shown as an alert, "Could not load the collections:" with the reason, on the Collections, Import, Q&A and Gold Standard pages (#379).
+      *Before, the error was swallowed, so an outage looked like "no collections". `ui_criteria.js`
+      answers `GET /collections` with a synthetic `503` on each page, and checks the Collections
+      page clears the message on its next successful load. The checks fail on the code before
+      #379.*
+- [x] The Gold Standard page pre-fills the export filename as `{collection}_{YYYYMMDD_HHMMSS}.json`, made safe and at most 128 characters, after a generation and after a lookup; opens the download with the filename encoded; refuses a sample size outside 1-100 before calling the API; and shows each pair as an expandable row with a 300-character context preview (#393).
+      *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
+      API call by request interception. Its filename, encoded-URL and sample-size checks fail on the
+      code before #393 (`..json`, an empty field after a lookup, a raw `#` in the URL, and a generate
+      request sent for 0, 101, 2.5 and an empty field). It also clicks Export in Chromium with the
+      popup blocker on: a save answered in 1 s opens the download tab, and a control answered once
+      `navigator.userActivation.isActive` is false opens none. It also asserts the expanded row's
+      answer and ground truth, the `export` and no-safe-character filename fallbacks and that a
+      sample size of 1 enables Generate (#469).*
+- [x] The Gold Standard page shows how a generation ended (final status, failed pairs and the `errors` reasons, and the empty collection), stops polling with a message when a poll fails, keeps Generate disabled while a start or generation runs and Regenerate disabled per pair while it runs, and keeps the edit form open with the typed values when the `PATCH` is refused, sending only the changed fields (#380).
+      *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
+      API call by request interception: a completed, partially failed, failed, cancelled and empty
+      session; a poll answered 503 and 404; a second Generate click in the window before the first
+      poll; repeated Regenerate clicks; and an edit refused with 422, then retried. 30 of its checks
+      fail on the code before #380 (no outcome shown, polling forever, a second session started,
+      a second regenerate request, the modal closed with all three fields sent).*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
+      *Evidence for the proxy pages: `ui_controls.js` (suite 06) answers the Import upload with
+      nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON error, and checks the
+      message shown for each (the 512 MB limit text for a 413, "HTTP 500" for a plain 500, and
+      never a JSON syntax error).*
 
 - [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
   *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
@@ -2627,20 +2833,36 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
   *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
+- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
+  *Evidence: `test_startup_sweep.py` (13 cases in the API image, run by `02_ingest.sh`), including a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
+
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
   *Evidence: compose start_period and `RestartTimingTests` verify capped waiting, elapsed time from the supplied start, and positive six-digit limit validation.*
 
-- [x] `docker compose up` brings all five services healthy within 5 minutes on first run (including model pull).
-      *Model volume deleted and re-pulled from scratch: **233s (3.9 min)**. Both
-      models returned with their original IDs.*
+- [x] `docker compose up` brings all five services healthy within 5 minutes on a first start from empty data volumes, with the models already in the model volume.
+      *With `RAG_ALLOW_RESTART=1`, `16_api_paths.sh` (run by `01_infrastructure.sh`)
+      removes the verify project's volumes but its model copy (`down -v`) and times
+      `up -d --wait`. The model pull isn't part of the automated check (#465). A
+      first run with the pull, measured by hand: model volume deleted and re-pulled
+      from scratch, **233s (3.9 min)**. Both models returned with their original IDs.*
 - [x] `docker compose up` brings all five services healthy within 120 seconds on subsequent runs (models cached in volume, no re-download).
       *22s.*
 - [x] Weaviate data persists across `docker compose down && docker compose up`.
       *10 collections with identical object counts.*
 - [x] `collection_registry.json` and `ingest_configs/` persist across restarts; `GET /collections` reflects correct `created_at` after restart.
       *`created_at`, index type and distance metric all preserved.*
+- [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
+      *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
+- [x] The collection registry and settings saves fsync their folder after the replacement, and a failed folder fsync fails the save; API startup removes the `.collection_registry.json.*.tmp` files of interrupted registry saves, keeping the registry and every other file (#445).
+      *Evidence: `scripts/tests/test_collection_registry.py` (suite 01) and `scripts/tests/test_settings_persistence.py` (suite 07); the folder-fsync checks and the startup check (a leftover still there after the lifespan) fail on the code before #445.*
+- [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
+      *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, a manifest of exactly 16 MiB lists while one byte more is refused, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first, and suite 05 checks that `GET /packages` lists that export as readable with its collection, chunk count, fidelity and creation time.*
+- [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).
+      *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): eight wrongly typed manifests are each listed `readable: false` beside a readable package, and `collection: null` and absent values list as `null`; both checks fail on the code before #451 (the listing answered 500).*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
+- [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
+      *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
       weaviate publish nothing; ollama and ui expose container ports only.*
@@ -2648,8 +2870,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
-- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned.
-  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373.*
+- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
+  *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373. Suite 01 also checks through the proxy on the running stack that an unknown route answers 404 `NOT_FOUND` and a wrong method `METHOD_NOT_ALLOWED` (#411).*
+- [x] `package.sh` and `package-offline.sh` archives hold exactly the files git tracks in the current commit (`HEAD`), with no untracked or ignored file and no uncommitted change, and both scripts refuse to run unless their directory is the top level of a git checkout (§11.2, #384).
+  *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
 
 ---
 
@@ -2683,14 +2907,19 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive | ~150 KB zip | ~4.6 GB tar |
+| Archive | ~1.3 MB zip | ~4.6 GB tar |
 | Contains | source only | source + all 5 images + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
 
-Both archives MUST exclude `.DS_Store`, `node_modules/`, `__pycache__/`,
-`dist/`, `.env*` and previous archives. Neither carries the Weaviate index or
-uploaded files; those are created empty on first start.
+Both archives MUST hold exactly the files git tracks in the current commit
+(`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
+not `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, `.env*`, `*.tar`,
+`offline/`, previous archives, `.claude/` or `dev-docs/`, nor the contents of
+`ingest-inbox/` and `exports/` (their tracked `.gitkeep` keeps the directories).
+Uncommitted changes are not included. Both scripts MUST refuse to run unless
+their directory is the top level of a git checkout (#384). Neither carries the
+Weaviate index or uploaded files; those are created empty on first start.
 
 ### 11.3 Offline bundle contents
 
@@ -2698,7 +2927,7 @@ uploaded files; those are created empty on first start.
 
 ```
 rag-docker/
-├── <the full source tree>
+├── <the files git tracks in HEAD, as package.sh>
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)

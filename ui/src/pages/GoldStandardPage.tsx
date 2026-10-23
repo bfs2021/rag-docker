@@ -1,6 +1,41 @@
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, Session, GoldPair } from '../api/client'
 
+// The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
+// UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
+// 0-9 and '_' dropped, and the collection part shortened to keep 128 characters.
+function defaultExportName(collection: string, now = new Date()): string {
+  const iso = now.toISOString()
+  const ts = `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}_${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}`
+  const safe = collection.replace(/ /g, '_').replace(/[^A-Za-z0-9_]/g, '')
+  const suffix = `_${ts}.json`
+  return safe.slice(0, 128 - suffix.length) + suffix
+}
+
+type Outcome = { tone: 'ok' | 'warn' | 'error'; lines: string[]; reasons: string[] }
+
+// What a settled session ended as (#380): its status, the pairs that failed and
+// why. null while it is still generating.
+function outcomeOf(s: Session): Outcome | null {
+  if (s.status === 'generating') return null
+  const failed = s.pairs_failed ?? 0
+  const failedLine = `${failed} of ${s.pairs_total} pairs failed.`
+  const counts = new Map<string, number>()
+  for (const reason of s.errors ?? []) counts.set(reason, (counts.get(reason) ?? 0) + 1)
+  const all = [...counts].map(([reason, n]) => n > 1 ? `${reason} (x${n})` : reason)
+  const reasons = all.slice(0, 5)
+  if (all.length > 5) reasons.push(`and ${all.length - 5} more reasons`)
+  if (s.status === 'completed') {
+    if (s.pairs_total === 0) return { tone: 'warn', lines: ['No pairs were generated: the collection has no chunks.'], reasons }
+    const lines = [`Generation completed: ${s.pairs_completed} of ${s.pairs_total} pairs generated.`]
+    if (failed > 0) lines.push(`${failed} pairs failed and are missing from the review list.`)
+    return { tone: failed > 0 ? 'warn' : 'ok', lines, reasons }
+  }
+  if (s.status === 'failed') return { tone: 'error', lines: ['Generation failed.', ...(failed > 0 ? [failedLine] : [])], reasons }
+  if (s.status === 'cancelled') return { tone: 'warn', lines: ['Generation was cancelled.', ...(failed > 0 ? [failedLine] : [])], reasons }
+  return { tone: 'warn', lines: [`Generation ended with status ${s.status}.`], reasons }
+}
+
 export default function GoldStandardPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -14,19 +49,29 @@ export default function GoldStandardPage() {
   const exportPendingRef = useRef(false)
   const activeSessionRef = useRef('')
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
   const [editingPair, setEditingPair] = useState<GoldPair | null>(null)
   const [editQuestion, setEditQuestion] = useState('')
   const [editAnswer, setEditAnswer] = useState('')
   const [editGroundTruth, setEditGroundTruth] = useState('')
+  // A poll that failed stops polling and says so (#380).
+  const [pollError, setPollError] = useState('')
+  // Pairs whose regenerate request is running, as `sessionId/pairId` (#380).
+  const [regenerating, setRegenerating] = useState<string[]>([])
+  const regeneratingRef = useRef(new Set<string>())
+  // A failed edit keeps the modal open and says why (#380).
+  const [editError, setEditError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     api.getCollections().then(r => {
       setCollections(r.collections)
+      setListError('')
       if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }, [])
 
   useEffect(() => {
@@ -40,7 +85,11 @@ export default function GoldStandardPage() {
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
-      } catch { /* ignore */ }
+      } catch (e: unknown) {
+        if (!active || activeSessionRef.current !== sessionId) return
+        clearInterval(pollRef.current!)
+        setPollError(`Could not read the generation's progress: ${e instanceof Error ? e.message : String(e)}. Polling stopped; use Load / refresh session to check again.`)
+      }
     }, 2000)
     return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
@@ -54,20 +103,22 @@ export default function GoldStandardPage() {
     if (!id || exportPendingRef.current) return
     activeSessionRef.current = ''
     setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
-    setError(''); setSaveResult(''); setLoading(true)
+    setError(''); setPollError(''); setSaveResult(''); setLoading(true)
     try {
       const loaded = await api.getSession(id)
       activeSessionRef.current = loaded.session_id
       setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
-      setFilename('')
+      setFilename(defaultExportName(loaded.collection ?? 'export'))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { setLoading(false) }
   }
 
   async function generate() {
+    if (!sampleSizeValid || loading || running) return
     if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
+    setPollError('')
     setLoading(true)
     setSaveResult('')
     try {
@@ -76,8 +127,7 @@ export default function GoldStandardPage() {
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
       setSession(null)
-      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
-      setFilename(`${collection}_${ts}.json`)
+      setFilename(defaultExportName(collection))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -85,12 +135,14 @@ export default function GoldStandardPage() {
     }
   }
 
-  async function patchPair(pairId: string, status: string, updates?: { question?: string; answer?: string; ground_truth?: string }) {
+  function applyPair(pairId: string, updated: GoldPair) {
+    setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+  }
+
+  async function patchPair(pairId: string, status: string) {
     if (!sessionId) return
-    const body = { status, ...updates }
     try {
-      const updated = await api.patchPair(sessionId, pairId, body)
-      setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+      applyPair(pairId, await api.patchPair(sessionId, pairId, { status }))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -98,11 +150,15 @@ export default function GoldStandardPage() {
 
   async function regenerate(pairId: string) {
     if (!sessionId) return
+    const key = `${sessionId}/${pairId}`
+    if (regeneratingRef.current.has(key)) return
+    regeneratingRef.current.add(key); setRegenerating(Array.from(regeneratingRef.current))
     try {
-      const updated = await api.regeneratePair({ session_id: sessionId, pair_id: pairId })
-      setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+      applyPair(pairId, await api.regeneratePair({ session_id: sessionId, pair_id: pairId }))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      regeneratingRef.current.delete(key); setRegenerating(Array.from(regeneratingRef.current))
     }
   }
 
@@ -112,7 +168,8 @@ export default function GoldStandardPage() {
     try {
       const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
       setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
-      window.open(api.downloadUrl(res.filename), '_blank')
+      // downloadUrl puts the name into the path as given, so encode it here (#393).
+      window.open(api.downloadUrl(encodeURIComponent(res.filename)), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { exportPendingRef.current = false; setExportPending(false) }
@@ -123,23 +180,35 @@ export default function GoldStandardPage() {
     setEditQuestion(pair.question)
     setEditAnswer(pair.answer)
     setEditGroundTruth(pair.ground_truth)
+    setEditError('')
   }
 
+  // Only the fields that changed are sent; a refused edit keeps the modal open
+  // with what was typed (#380).
   async function submitEdit() {
-    if (!editingPair) return
-    await patchPair(editingPair.pair_id, 'edited', {
-      question: editQuestion,
-      answer: editAnswer,
-      ground_truth: editGroundTruth,
-    })
-    setEditingPair(null)
+    if (!editingPair || !sessionId) return
+    const updates: { question?: string; answer?: string; ground_truth?: string } = {}
+    if (editQuestion !== editingPair.question) updates.question = editQuestion
+    if (editAnswer !== editingPair.answer) updates.answer = editAnswer
+    if (editGroundTruth !== editingPair.ground_truth) updates.ground_truth = editGroundTruth
+    try {
+      applyPair(editingPair.pair_id, await api.patchPair(sessionId, editingPair.pair_id, { status: 'edited', ...updates }))
+      setEditingPair(null)
+    } catch (e: unknown) {
+      setEditError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const approved = session?.pairs.filter(p => p.status === 'approved').length ?? 0
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
+  // An empty field reads as 0, so it is refused too (#393).
+  const sampleSizeValid = Number.isInteger(sampleSize) && sampleSize >= 1 && sampleSize <= 100
   const historical = Boolean(session?.stale || session?.orphaned)
+  // A start or generation is running until the session settles, unless polling stopped on an error (#380).
+  const running = !pollError && Boolean(sessionId) && (session === null || session.status === 'generating')
+  const outcome = session ? outcomeOf(session) : null
   const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
@@ -156,20 +225,33 @@ export default function GoldStandardPage() {
             </select>
           </div>
           <div>
-            <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
-            <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
+            <label htmlFor="sample-size" className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
+            <input id="sample-size" type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || running || exportPending || !sampleSizeValid} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
+        {!sampleSizeValid && <p role="alert" className="text-red-600 text-sm mt-3">Sample size must be a whole number from 1 to 100.</p>}
+        {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
-        {session && session.status === 'generating' && (
+        {session && session.status === 'generating' && !pollError && (
           <div className="mt-3">
             <p className="text-sm text-blue-600">Generating… {session.pairs_attempted ?? session.pairs_completed}/{session.pairs_total} pairs</p>
             <div className="w-full bg-gray-200 rounded h-2 mt-1">
               <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${session.pairs_total > 0 ? ((session.pairs_attempted ?? session.pairs_completed) / session.pairs_total) * 100 : 0}%` }} />
             </div>
+          </div>
+        )}
+        {pollError && <p role="alert" className="text-red-600 text-sm mt-3">{pollError}</p>}
+        {outcome && (
+          <div role={outcome.tone === 'ok' ? 'status' : 'alert'} className={`mt-3 border rounded p-3 text-sm ${outcome.tone === 'ok' ? 'border-green-300 bg-green-50 text-green-800' : outcome.tone === 'warn' ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-red-300 bg-red-50 text-red-800'}`}>
+            {outcome.lines.map(line => <p key={line}>{line}</p>)}
+            {outcome.reasons.length > 0 && (
+              <ul className="list-disc ml-5 mt-1 text-xs">
+                {outcome.reasons.map(reason => <li key={reason}>{reason}</li>)}
+              </ul>
+            )}
           </div>
         )}
       </div>
@@ -215,7 +297,7 @@ export default function GoldStandardPage() {
                   <button onClick={e => { e.preventDefault(); patchPair(pair.pair_id, 'approved') }} className="text-green-600 hover:text-green-800 text-lg leading-none" title="Approve">✓</button>
                   <button onClick={e => { e.preventDefault(); openEdit(pair) }} className="text-blue-500 hover:text-blue-700 text-sm" title="Edit">✎</button>
                   <button onClick={e => { e.preventDefault(); patchPair(pair.pair_id, 'rejected') }} className="text-red-500 hover:text-red-700 text-sm" title="Reject">✕</button>
-                  <button onClick={e => { e.preventDefault(); regenerate(pair.pair_id) }} className="text-gray-400 hover:text-gray-600 text-sm" title="Regenerate">↺</button>
+                  <button onClick={e => { e.preventDefault(); regenerate(pair.pair_id) }} disabled={regenerating.includes(`${sessionId}/${pair.pair_id}`)} className="text-gray-400 hover:text-gray-600 text-sm disabled:opacity-50" title={regenerating.includes(`${sessionId}/${pair.pair_id}`) ? 'Regenerating...' : 'Regenerate'}>↺</button>
                 </summary>
                 <div className="px-3 pb-3 space-y-2 text-xs text-gray-600">
                   <div><strong>Answer:</strong> {pair.answer}</div>
@@ -256,6 +338,7 @@ export default function GoldStandardPage() {
             <textarea value={editAnswer} onChange={e => setEditAnswer(e.target.value)} rows={2} className="w-full border rounded px-2 py-1 text-sm mb-3" />
             <label className="block text-xs text-gray-600 mb-1">Ground Truth</label>
             <textarea value={editGroundTruth} onChange={e => setEditGroundTruth(e.target.value)} rows={2} className="w-full border rounded px-2 py-1 text-sm mb-4" />
+            {editError && <p role="alert" className="text-red-600 text-sm mb-3">{editError}</p>}
             <div className="flex justify-end gap-2">
               <button onClick={() => setEditingPair(null)} className="text-sm text-gray-500">Cancel</button>
               <button onClick={submitEdit} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Save</button>

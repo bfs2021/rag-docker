@@ -4,10 +4,12 @@
 #
 #   bash package-offline.sh [output.tar]
 #
-# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
-#   * the source tree
+#   * the source tree: the files git tracks in the current commit (HEAD),
+#     built with `git archive`, exactly as package.sh does. Untracked and
+#     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
 #   * the Ollama model weights (phi3.5 + nomic-embed-text)
 #
@@ -17,6 +19,14 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. Checked first, before any image or volume is touched.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package-offline.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
 
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
@@ -50,26 +60,11 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/rag-docker/offline"
 
-echo "==> Copying source"
-tar cf - \
-  --exclude='./.DS_Store' --exclude='*/.DS_Store' \
-  --exclude='*/node_modules/*' --exclude='*/__pycache__/*' \
-  --exclude='*.pyc' --exclude='*/dist/*' \
-  --exclude='*/.venv/*' --exclude='*/venv/*' \
-  --exclude='./.env' --exclude='*/.env' --exclude='*/.env.*' \
-  --exclude='./.git/*' --exclude='*.tar' --exclude='*.zip' \
-  --exclude='./offline/*' \
-  --exclude='./ingest-inbox/*' \
-  --exclude='./exports/*' \
-  . | ( cd "$STAGE/rag-docker" && tar xf - )
-
-# Both zip and tar drop a directory once all its contents are excluded, so the
-# mount target is recreated explicitly. Without it Docker creates ./ingest-inbox
-# as root on the target machine and the user cannot drop files into it.
-mkdir -p "$STAGE/rag-docker/ingest-inbox"
-touch "$STAGE/rag-docker/ingest-inbox/.gitkeep"
-mkdir -p "$STAGE/rag-docker/exports"
-touch "$STAGE/rag-docker/exports/.gitkeep"
+echo "==> Copying source (tracked files of the current commit)"
+# ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so both mount targets
+# exist on the target machine; without them Docker creates the directories as
+# root and the user cannot drop files into ./ingest-inbox.
+git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"

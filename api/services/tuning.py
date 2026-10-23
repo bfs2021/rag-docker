@@ -173,6 +173,18 @@ def _nothing_to_rebuild(collection: str) -> PackageError:
         {"collection": collection})
 
 
+# An invalid retained source index (sources.load_index raises ValueError) is
+# refused before a job is created too, as the tuning options already report it
+# (#389). Re-embedding from stored chunks and re-indexing never read it.
+def _source_index_invalid(collection: str) -> PackageError:
+    return PackageError(
+        "SOURCE_INDEX_INVALID",
+        f"Cannot re-chunk '{collection}': its retained source index is invalid. "
+        "Repair it before re-chunking; re-embedding from stored chunks and "
+        "re-indexing remain available.",
+        {"collection": collection})
+
+
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
@@ -183,16 +195,17 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
 
 
 def _refuse_nothing_to_rebuild(collection: str) -> None:
-    """The one re-chunk refusal made before a job is created (#328).
+    """The re-chunk refusals made before a job is created: an invalid
+    retained source index (#389) and nothing to rebuild (#328).
 
-    The other refusals, and an invalid index, are still reported by the job.
-    A Weaviate failure during the walk raises ServiceUnavailableError, which
-    the router answers with 503 rather than a bare 500 (#340).
+    The other refusals are still reported by the job. A Weaviate failure
+    during the walk raises ServiceUnavailableError, which the router answers
+    with 503 rather than a bare 500 (#340).
     """
     try:
         documents = sources.load_index(collection)["documents"]
-    except ValueError:
-        return
+    except ValueError as exc:
+        raise _source_index_invalid(collection) from exc
     if not documents:
         return
     try:
@@ -556,8 +569,9 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guards; the store removes the record.
     try:
-        # A re-chunk with nothing to rebuild is refused here, before any job
-        # exists (#328); the walk runs off the event loop too.
+        # A re-chunk with an invalid source index (#389) or nothing to rebuild
+        # (#328) is refused here, before any job exists; the walk runs off the
+        # event loop too.
         if operation == "rechunk" or (operation == "reembed" and params.get("chunking") is not None):
             await asyncio.to_thread(_refuse_nothing_to_rebuild, source_collection)
         await _jobs.create(job_id, {

@@ -41,8 +41,9 @@ function isHealthResult(data: any): data is HealthResult {
 
 // GET /health answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
-// service failed and could not show it red (#375). This call accepts a 503
-// that carries that body; every other error is thrown as request() would.
+// service failed and could not show it red (#375). This call accepts a 200 or
+// a 503 that carries that body; every other error is thrown as request() would,
+// and a 200 without it is unreadable (#415).
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
@@ -58,13 +59,15 @@ async function getHealthResult(): Promise<HealthResult> {
   if (!res.ok) {
     throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
   }
-  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
-  return data as HealthResult
+  // Another JSON shape, text or an empty body: the page would throw while
+  // rendering the cards, or show nothing at all (#415).
+  throw new Error('The server sent a response the UI could not read.')
 }
 
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
-  createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
+  // Answers with the name as stored, first letter capitalised (#372).
+  createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
@@ -136,7 +139,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -180,7 +183,7 @@ export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface ImportBody { filename: string; on_conflict: string }
 export interface ImportStart { job_id: string; status: string; filename: string }

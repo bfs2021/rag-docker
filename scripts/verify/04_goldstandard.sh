@@ -18,6 +18,21 @@ section "§10.3 Gold Standard"
 bash ./09_sampling.sh
 check "UUID sampling acceptance" $?
 
+# Review errors need no model: an unknown session is SESSION_NOT_FOUND, an
+# unknown pair PAIR_NOT_FOUND, and an empty edit is refused with 422 (#381).
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_goldstandard_review.py)
+check "review 404 codes and empty-edit refusal" $?
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/gs_00000000/pair/p_1" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X POST \
+  "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+  -d '{"session_id":"gs_00000000","pair_id":"p_1"}')
+check_eq "regenerate on an unknown session returns 404 SESSION_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
+
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
@@ -100,6 +115,16 @@ code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X PATCH \
   "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
   -d '{"status":"approved"}')
 check_eq "a status-only change is accepted" "$code" "200"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/$PID" -H 'Content-Type: application/json' \
+  -d '{"status":"edited","question":""}')
+check_eq "an empty question is refused with 422 INVALID_PARAMETER" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "422 INVALID_PARAMETER"
+code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X PATCH \
+  "$API/goldstandard/session/$SID/pair/p_unknown" -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}')
+check_eq "PATCH on an unknown pair returns 404 PAIR_NOT_FOUND" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 PAIR_NOT_FOUND"
 
 # ── regenerate replaces exactly one pair ─────────────────────────────────────
 if [ "$actual" -ge 2 ]; then

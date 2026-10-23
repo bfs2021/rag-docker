@@ -31,7 +31,7 @@ class BundleFixture(unittest.TestCase):
         self.patch = patch.object(settings, 'ollama_models_dir', str(self.store))
         self.patch.start()
         self.addCleanup(self.patch.stop)
-        self.src = self.pkg / 'models' / 'review-model'
+        self.src = self.pkg / 'models' / 'review-model' / 'latest'  # a folder per name and tag (#487)
         (self.src / 'blobs').mkdir(parents=True)
         self.contents = [b'ordinary config bytes', b'ordinary layer bytes']
         self.digests = ['sha256:' + hashlib.sha256(data).hexdigest() for data in self.contents]
@@ -222,7 +222,8 @@ class ImporterModelIntegrityTests(BundleFixture):
         embed = embed_model or self.model
         with patch.object(settings, 'embed_model', embed), \
              patch.object(settings, 'llm_model', llm_model or self.model), \
-             patch.object(importer, '_ollama_reports', lambda model: ollama_reports):
+             patch.object(importer, '_ollama_reports',
+                          ollama_reports if callable(ollama_reports) else lambda model: ollama_reports):
             return importer._ensure_models(self.pkg, {'embedding': {'model': embed}})
 
     def install_then_corrupt(self):
@@ -248,14 +249,15 @@ class ImporterModelIntegrityTests(BundleFixture):
         self.assert_unpublished()
 
     def test_valid_bundled_embedding_model_is_installed_through_the_importer(self):
-        notes = self.ensure()
+        notes = self.ensure(ollama_reports=True)  # the install is confirmed through Ollama (#390)
         self.assertTrue(any('installed from the package' in note for note in notes), notes)
         self.assertTrue(models.is_installed(self.model))
 
     # A namespaced model ('user/model') has no path in the store layout, so the
     # store can't check or install it; import defers to Ollama instead (#81).
     def test_namespaced_optional_llm_does_not_break_import(self):
-        notes = self.ensure(llm_model='someone/assistant:latest')
+        notes = self.ensure(llm_model='someone/assistant:latest',
+                            ollama_reports=lambda model: model == self.model)
         self.assertTrue(any("'someone/assistant:latest' is absent" in note for note in notes), notes)
 
     def test_namespaced_embedding_model_reported_by_ollama_is_accepted(self):
