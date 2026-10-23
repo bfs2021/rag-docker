@@ -10,6 +10,11 @@ The manifest names every blob the model needs, so bundling resolves blobs
 2.3 GB across 9 blobs for two models; a naive copy would sweep up unrelated
 weights, and on a machine with other models pulled it would be far worse.
 
+In a package each model gets its own folder, `models/<name>/<tag>/`, so two
+tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+files. Packages built before #487 used `models/<name>/`; such a folder is used
+only for the one tag the package manifest gives that name.
+
 Copying the files verbatim is deliberate. Offline there is no registry to pull
 from, and rebuilding a model through Ollama's HTTP API would mean reconstructing
 its template, params and license from the config blob — a reproduction, not the
@@ -48,6 +53,12 @@ def split_ref(model: str) -> tuple[str, str]:
     if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
         raise ValueError("Model name and tag must be simple path components")
     return name, tag
+
+
+def model_ref(model: str) -> str:
+    """'phi3.5' -> 'phi3.5:latest': the name and tag a package folder holds."""
+    name, tag = split_ref(model)
+    return f"{name}:{tag}"
 
 
 def manifest_path(model: str) -> Path:
@@ -155,9 +166,10 @@ def is_installed(model: str) -> bool:
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
-    """Files to place under `models/<model>/`, as (relative path, source).
+    """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
-    Returns them rather than copying so the caller can digest each file into the
+    Each tag has its own folder, so two tags of one name never overwrite each
+    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
     package manifest as it is written.
     """
     mp = manifest_path(model)
@@ -165,22 +177,66 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
         raise FileNotFoundError(f"Ollama has no manifest for '{model}' at {mp}")
     manifest = json.loads(mp.read_text())
 
-    name, _ = split_ref(model)
-    files: list[tuple[str, Path]] = [(f"models/{name}/manifest.json", mp)]
+    name, tag = split_ref(model)
+    files: list[tuple[str, Path]] = [(f"models/{name}/{tag}/manifest.json", mp)]
     for digest in _digests(manifest):
         blob = blob_path(digest)
         if not blob.is_file():
             raise FileNotFoundError(
                 f"Model '{model}' references blob {digest} which is not in the store")
-        files.append((f"models/{name}/blobs/{digest.replace(':', '-')}", blob))
+        files.append((f"models/{name}/{tag}/blobs/{digest.replace(':', '-')}", blob))
     return files
 
 
-def bundled_models(pkg: Path) -> list[str]:
+def _legacy_tag(name: str, package_manifest) -> str | None:
+    """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
+
+    Those packages didn't record it. The package manifest names the embedding
+    model and the LLM; when exactly one tag of `name` is among them, the folder
+    holds that tag. Two tags of one name shared the folder, the last copy
+    overwriting the first's manifest, so the folder can't be trusted for either.
+    """
+    if not isinstance(package_manifest, dict):
+        return None
+    tags = set()
+    for section in ("embedding", "llm"):
+        entry = package_manifest.get(section)
+        model = entry.get("model") if isinstance(entry, dict) else None
+        if isinstance(model, str) and supports_name(model):
+            model_name, tag = split_ref(model)
+            if model_name == name:
+                tags.add(tag)
+    return tags.pop() if len(tags) == 1 else None
+
+
+def bundled_source(pkg: Path, model: str, package_manifest=None) -> Path | None:
+    """The package folder holding exactly this name and tag, or None."""
+    name, tag = split_ref(model)
+    folder = _contained(pkg, "models", name, tag)
+    if _contained(folder, "manifest.json").is_file():
+        return folder
+    legacy = _contained(pkg, "models", name)
+    if _contained(legacy, "manifest.json").is_file() and _legacy_tag(name, package_manifest) == tag:
+        return legacy
+    return None
+
+
+def bundled_models(pkg: Path, package_manifest=None) -> list[str]:
+    """`name:tag` of each model the package bundles, by the rules of `bundled_source`."""
     d = pkg / "models"
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
+    refs = set()
+    for folder in d.iterdir():
+        if not folder.is_dir():
+            continue
+        if (folder / "manifest.json").is_file():
+            tag = _legacy_tag(folder.name, package_manifest)
+            if tag is not None:
+                refs.add(f"{folder.name}:{tag}")
+        refs.update(f"{folder.name}:{sub.name}" for sub in folder.iterdir()
+                    if sub.is_dir() and (sub / "manifest.json").is_file())
+    return sorted(refs)
 
 
 def _publish(path: Path, write, *, replace: bool = True) -> None:
@@ -209,19 +265,20 @@ def _publish(path: Path, write, *, replace: bool = True) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def install_model(pkg: Path, model: str) -> None:
+def install_model(pkg: Path, model: str, package_manifest=None) -> None:
     """Verify all referenced bytes before publishing the captured manifest.
 
     Existing content is checked and reused unchanged. A corrupt existing blob
     is refused rather than replacing shared content behind other model names.
     An interrupted install can leave valid unreferenced blobs, never a newly
-    published manifest whose bytes were not checked.
+    published manifest whose bytes were not checked. Only a folder holding this
+    exact name and tag is installed (#487); `package_manifest` tells which tag
+    a pre-#487 folder holds.
     """
-    name, _ = split_ref(model)
-    src = _contained(pkg, "models", name)
-    src_manifest = _contained(src, "manifest.json")
-    if not src_manifest.is_file():
+    src = bundled_source(pkg, model, package_manifest)
+    if src is None:
         raise FileNotFoundError(f"Package does not bundle '{model}'")
+    src_manifest = _contained(src, "manifest.json")
     manifest_bytes = src_manifest.read_bytes()
     digests = _digests(json.loads(manifest_bytes))
     destination = manifest_path(model)

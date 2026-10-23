@@ -200,6 +200,20 @@ class _Builder:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
 
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
     """Expand `@@INCLUDE:name@@` from templates/partials/<name>.md.
@@ -437,20 +451,27 @@ def build(
         # 5b. bundled models, resolved through each model's manifest
         bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # A model shared by embedding and the LLM is copied once, so removing
+            # a failed copy can never remove a copy that succeeded.
+            wanted = list(dict.fromkeys([settings.embed_model, settings.llm_model]))
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
                 for model in wanted:
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        bundled.append(model.split(":")[0])
+                        bundled.append(model_bundle.model_ref(model))
         models_bundled = bool(bundled)
 
         if unresolved:

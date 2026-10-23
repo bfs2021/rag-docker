@@ -35,8 +35,8 @@ with tempfile.TemporaryDirectory(prefix='model-integrity-', dir=settings.upload_
         models.install_model(pkg, model)
         assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
         print('PASS already-present real blobs reused unchanged', flush=True)
-        name, _ = models.split_ref(model)
-        damaged = pkg / 'models' / name / 'blobs' / digests[-1].replace(':', '-')
+        name, tag = models.split_ref(model)
+        damaged = pkg / 'models' / name / tag / 'blobs' / digests[-1].replace(':', '-')
         damaged.write_bytes(b'ordinary mismatched review bytes')
         try:
             models.install_model(pkg, model)

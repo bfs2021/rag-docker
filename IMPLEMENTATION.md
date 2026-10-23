@@ -6026,6 +6026,20 @@ class _Builder:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
 
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
     """Expand `@@INCLUDE:name@@` from templates/partials/<name>.md.
@@ -6263,20 +6277,27 @@ def build(
         # 5b. bundled models, resolved through each model's manifest
         bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # A model shared by embedding and the LLM is copied once, so removing
+            # a failed copy can never remove a copy that succeeded.
+            wanted = list(dict.fromkeys([settings.embed_model, settings.llm_model]))
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
                 for model in wanted:
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        bundled.append(model.split(":")[0])
+                        bundled.append(model_bundle.model_ref(model))
         models_bundled = bool(bundled)
 
         if unresolved:
@@ -7237,7 +7258,13 @@ ON_CONFLICT = ("abort", "rename", "replace")
 
 # Job records survive an API restart (#23); see jobstore.py.
 _jobs = jobstore.JobStore("import")
+# Package names being imported: the file the worker opens, whatever the path
+# spelling sent (#391).
 _active: set[str] = set()
+# Target collections claimed by an import job, canonical name -> job id. A second
+# import into the same target is refused whatever its conflict mode, so two
+# imports never build, mark or clean up one collection at once (#391).
+_targets: dict[str, str] = {}
 _lock = threading.Lock()
 
 # Weaviate capitalises the first character of a collection name and rejects
@@ -7444,6 +7471,38 @@ def canonical(name: str) -> str:
     return name[:1].upper() + name[1:] if name else name
 
 
+def _package_key(filename: str) -> str:
+    """The package the worker opens, so every spelling of one file is one key."""
+    return Path(filename).name
+
+
+def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
+    """Claim `target` for this import, or refuse while another import holds it.
+
+    `instead_of`, a name this job claimed earlier, is released in the same step:
+    a `rename` no longer writes the name it moved away from.
+    """
+    name = canonical(target)
+    with _lock:
+        owner = _targets.get(name)
+        if owner is not None and owner != job_id:
+            raise PackageError(
+                "IMPORT_IN_PROGRESS",
+                f"Another import into '{name}' is running. Start this import again "
+                "once it finishes.",
+                {"collection": name})
+        if instead_of is not None and _targets.get(canonical(instead_of)) == job_id:
+            del _targets[canonical(instead_of)]
+        _targets[name] = job_id
+    return name
+
+
+def _release_targets(job_id: str) -> None:
+    with _lock:
+        for name in [name for name, owner in _targets.items() if owner == job_id]:
+            del _targets[name]
+
+
 def _safe_file(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
@@ -7557,7 +7616,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
     embed_model = settings.embed_model
     llm_model = settings.llm_model
-    bundled = model_bundle.bundled_models(pkg)
+    # `name:tag`; a folder counts only for the tag it holds (#487).
+    bundled = model_bundle.bundled_models(pkg, manifest)
 
     for model, required in ((embed_model, True), (llm_model, False)):
         if not model_bundle.supports_name(model):
@@ -7610,7 +7670,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {name}`, then import again.",
                 {"model": name})
-        if name not in bundled:
+        if model_bundle.model_ref(model) not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -7625,7 +7685,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
-            model_bundle.install_model(pkg, model)
+            model_bundle.install_model(pkg, model, manifest)
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
@@ -7918,6 +7978,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
+        # One import per target, whatever its conflict mode, claimed before the
+        # existence check and held until the job ends (#391).
+        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
@@ -7934,7 +7997,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     {"collection": target})
 
             if exists and on_conflict == "rename":
-                target = _rename_target(original, id8)
+                target = _claim_target(job_id, _rename_target(original, id8), instead_of=target)
 
             # The target is final: DELETE /collections refuses it from here until
             # this job ends (#40). Replace's own delete of the old target below
@@ -8026,15 +8089,17 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         shutil.rmtree(work, ignore_errors=True)
         collection_writes.end_job("import", job_id)
         with _lock:
-            _active.discard(filename)
+            _active.discard(_package_key(filename))
+        _release_targets(job_id)
 
 
 async def start_import_job(filename: str, on_conflict: str) -> str:
     job_id = str(uuid.uuid4())[:8]
+    key = _package_key(filename)
     with _lock:
-        if filename in _active:
+        if key in _active:
             raise RuntimeError(filename)
-        _active.add(filename)
+        _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -8057,7 +8122,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         })
     except BaseException:
         with _lock:
-            _active.discard(filename)
+            _active.discard(key)
         raise
     asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
     return job_id
@@ -8077,6 +8142,11 @@ The manifest names every blob the model needs, so bundling resolves blobs
 *through the manifest* rather than copying the blob store. The store here holds
 2.3 GB across 9 blobs for two models; a naive copy would sweep up unrelated
 weights, and on a machine with other models pulled it would be far worse.
+
+In a package each model gets its own folder, `models/<name>/<tag>/`, so two
+tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+files. Packages built before #487 used `models/<name>/`; such a folder is used
+only for the one tag the package manifest gives that name.
 
 Copying the files verbatim is deliberate. Offline there is no registry to pull
 from, and rebuilding a model through Ollama's HTTP API would mean reconstructing
@@ -8116,6 +8186,12 @@ def split_ref(model: str) -> tuple[str, str]:
     if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
         raise ValueError("Model name and tag must be simple path components")
     return name, tag
+
+
+def model_ref(model: str) -> str:
+    """'phi3.5' -> 'phi3.5:latest': the name and tag a package folder holds."""
+    name, tag = split_ref(model)
+    return f"{name}:{tag}"
 
 
 def manifest_path(model: str) -> Path:
@@ -8223,9 +8299,10 @@ def is_installed(model: str) -> bool:
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
-    """Files to place under `models/<model>/`, as (relative path, source).
+    """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
-    Returns them rather than copying so the caller can digest each file into the
+    Each tag has its own folder, so two tags of one name never overwrite each
+    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
     package manifest as it is written.
     """
     mp = manifest_path(model)
@@ -8233,22 +8310,66 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
         raise FileNotFoundError(f"Ollama has no manifest for '{model}' at {mp}")
     manifest = json.loads(mp.read_text())
 
-    name, _ = split_ref(model)
-    files: list[tuple[str, Path]] = [(f"models/{name}/manifest.json", mp)]
+    name, tag = split_ref(model)
+    files: list[tuple[str, Path]] = [(f"models/{name}/{tag}/manifest.json", mp)]
     for digest in _digests(manifest):
         blob = blob_path(digest)
         if not blob.is_file():
             raise FileNotFoundError(
                 f"Model '{model}' references blob {digest} which is not in the store")
-        files.append((f"models/{name}/blobs/{digest.replace(':', '-')}", blob))
+        files.append((f"models/{name}/{tag}/blobs/{digest.replace(':', '-')}", blob))
     return files
 
 
-def bundled_models(pkg: Path) -> list[str]:
+def _legacy_tag(name: str, package_manifest) -> str | None:
+    """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
+
+    Those packages didn't record it. The package manifest names the embedding
+    model and the LLM; when exactly one tag of `name` is among them, the folder
+    holds that tag. Two tags of one name shared the folder, the last copy
+    overwriting the first's manifest, so the folder can't be trusted for either.
+    """
+    if not isinstance(package_manifest, dict):
+        return None
+    tags = set()
+    for section in ("embedding", "llm"):
+        entry = package_manifest.get(section)
+        model = entry.get("model") if isinstance(entry, dict) else None
+        if isinstance(model, str) and supports_name(model):
+            model_name, tag = split_ref(model)
+            if model_name == name:
+                tags.add(tag)
+    return tags.pop() if len(tags) == 1 else None
+
+
+def bundled_source(pkg: Path, model: str, package_manifest=None) -> Path | None:
+    """The package folder holding exactly this name and tag, or None."""
+    name, tag = split_ref(model)
+    folder = _contained(pkg, "models", name, tag)
+    if _contained(folder, "manifest.json").is_file():
+        return folder
+    legacy = _contained(pkg, "models", name)
+    if _contained(legacy, "manifest.json").is_file() and _legacy_tag(name, package_manifest) == tag:
+        return legacy
+    return None
+
+
+def bundled_models(pkg: Path, package_manifest=None) -> list[str]:
+    """`name:tag` of each model the package bundles, by the rules of `bundled_source`."""
     d = pkg / "models"
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
+    refs = set()
+    for folder in d.iterdir():
+        if not folder.is_dir():
+            continue
+        if (folder / "manifest.json").is_file():
+            tag = _legacy_tag(folder.name, package_manifest)
+            if tag is not None:
+                refs.add(f"{folder.name}:{tag}")
+        refs.update(f"{folder.name}:{sub.name}" for sub in folder.iterdir()
+                    if sub.is_dir() and (sub / "manifest.json").is_file())
+    return sorted(refs)
 
 
 def _publish(path: Path, write, *, replace: bool = True) -> None:
@@ -8277,19 +8398,20 @@ def _publish(path: Path, write, *, replace: bool = True) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def install_model(pkg: Path, model: str) -> None:
+def install_model(pkg: Path, model: str, package_manifest=None) -> None:
     """Verify all referenced bytes before publishing the captured manifest.
 
     Existing content is checked and reused unchanged. A corrupt existing blob
     is refused rather than replacing shared content behind other model names.
     An interrupted install can leave valid unreferenced blobs, never a newly
-    published manifest whose bytes were not checked.
+    published manifest whose bytes were not checked. Only a folder holding this
+    exact name and tag is installed (#487); `package_manifest` tells which tag
+    a pre-#487 folder holds.
     """
-    name, _ = split_ref(model)
-    src = _contained(pkg, "models", name)
-    src_manifest = _contained(src, "manifest.json")
-    if not src_manifest.is_file():
+    src = bundled_source(pkg, model, package_manifest)
+    if src is None:
         raise FileNotFoundError(f"Package does not bundle '{model}'")
+    src_manifest = _contained(src, "manifest.json")
     manifest_bytes = src_manifest.read_bytes()
     digests = _digests(json.loads(manifest_bytes))
     destination = manifest_path(model)
@@ -13656,8 +13778,8 @@ with tempfile.TemporaryDirectory(prefix='model-integrity-', dir=settings.upload_
         models.install_model(pkg, model)
         assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
         print('PASS already-present real blobs reused unchanged', flush=True)
-        name, _ = models.split_ref(model)
-        damaged = pkg / 'models' / name / 'blobs' / digests[-1].replace(':', '-')
+        name, tag = models.split_ref(model)
+        damaged = pkg / 'models' / name / tag / 'blobs' / digests[-1].replace(':', '-')
         damaged.write_bytes(b'ordinary mismatched review bytes')
         try:
             models.install_model(pkg, model)
@@ -13828,7 +13950,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the seven controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13872,6 +13994,56 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
+had no check. It runs four controlled tests, then live checks on a collection of its own.
+`scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
+missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
+a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
+top-level directories, and a package with no manifest, a manifest that isn't JSON or a newer
+`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). Through `importer._run`, with Weaviate and the
+model checks mocked, a digest-valid package naming a collection Weaviate can't use is
+`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
+above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
+`abort` and `rename`. `scripts/tests/test_transfer_paths.py` (API container, through the app)
+checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
+import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
+`JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,
+`GET /packages` with a readable and an unreadable package, the help page's "its own number of"
+fallback when the embedding probe fails and `HELP_RENDER_FAILED` for a missing partial or an
+unsubstituted placeholder, 409 `TUNE_IN_PROGRESS` for a second tune start under either
+spelling, and a re-chunk that produces no chunks failing `SOURCES_REQUIRED` before any rebuild.
+`scripts/tests/test_retrieve_script.py` (API container) renders `retrieve.py` with the exporter
+and runs it with `python -I -S` against a stub API: standard-library imports only, the baked
+defaults sent, every flag overriding its default, and the exit codes of
+`RAG_EXPORT_SPECIFICATIONS.md` section 5.1 (2 bad usage; 3 refused connection, 502/503/504 and
+timeout; 4 enveloped `COLLECTION_NOT_FOUND`; 5 bare 404, other errors and non-JSON), each
+failure one `error:` sentence and a hint. `scripts/tests/test_distribution.py` (host, standard
+library) builds `package.sh`'s zip and `package-offline.sh`'s bundle from a copy of the tracked
+tree with excluded files planted and reads them back, runs `package-offline.sh` and
+`install-offline.sh` with `docker` and `sleep` replaced by logging stubs (nothing is saved,
+loaded or started), and checks the bundled image list against
+`docker compose config --images`. The copy is a real git repository with the tracked files
+committed (git ignoring the user's and the system's configuration), because both scripts
+archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
+real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
+such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+
+The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
+`ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
+`transfer_packages.py` (one per refusal above) and a missing file, each refused with its code
+and no collection created, a malformed copy refused by `replace` with the collection intact,
+the package's bytes, size and mtime unchanged by a `rename` import, the same chunks and scores
+from the original and the import for vector, hybrid and near-text retrieval (E11; `/query`
+rewrites the question with the LLM first, so answers are not compared), an export with models
+requested and the model store setting pointed at a missing folder (warning,
+`models_bundled: false`, no `models/`), the packaged `retrieve.py` exiting 3 against a closed
+port (E10) and, unless `RAG_SKIP_SLOW=1`, answering with the baked top-k and with `--top-k 2`
+(E8, E9) and from the import, and a re-chunk after the retained original is replaced with blank
+text failing `SOURCES_REQUIRED`. `sweep_stale_workdirs` (TR:C30) is covered by
+`test_startup_sweep.py`.
+
 `scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
 an import job of a digest-valid package embedded with another model is refused
 `EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
@@ -13880,6 +14052,20 @@ no promise of re-embedding; a same-name package of another width is refused too.
 It also checks that a model installed from a package is confirmed through Ollama's
 model list: reported, not reported, and Ollama unreachable. Only Ollama is
 replaced. `05_transfer.sh` runs it in the verify project's API container.
+
+`scripts/tests/test_import_guard.py` (#391) runs concurrent import jobs with
+Weaviate mocked: two spellings of one package file (`./x.tar.gz`, `a/../x.tar.gz`)
+answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
+building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
+`on_conflict`, never builds, and leaves the first job's in-progress marker in place;
+imports into different targets run side by side; a `rename` claims its new name and
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -14114,9 +14300,11 @@ note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields ans
 `SOURCES_REQUIRED` with no job (#328).
 
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
-refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
-(on the verify project, with the exports from `stack.sh up`, as above):
+refused before backend, model or staging work, with every backend mocked.
+`07_settings.sh` runs it in the API image with the repository mounted read-only
+and no network (#386). Its embedded-source check reads `IMPLEMENTATION.md`, so
+to run it by hand mount the whole repository (on the verify project, with the
+exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -14201,7 +14389,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
-| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
@@ -14232,11 +14420,22 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
+| `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
+| `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
+| `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
+| `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
+| `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
+| `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
-| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
 | `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
@@ -14292,8 +14491,11 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On the verify project (`bash scripts/verify/stack.sh up`, then paste the
-`export` lines it prints), whose model copy holds the embedding model, run:
+`05_transfer.sh` runs `model_integrity.py` in the verify project's API
+container, and `test_model_bundle.py` in the API image with the repository
+mounted (#386). To run them by hand, on the verify project
+(`bash scripts/verify/stack.sh up`, then paste the `export` lines it prints),
+whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
@@ -16225,6 +16427,8 @@ check "OTel embedded implementation stays synchronized" $?
 # Both distribution scripts in a scratch git repository, docker stubbed (#384).
 python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
 check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
@@ -17132,6 +17336,13 @@ import json; d=json.load(open('/tmp/vfy_job.json')); import sys
 sys.exit(0 if d['chunks_stored'] == 1 else 1)"
 check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
 
+# Chunker limits and insert batching (#386), with the backends mocked, in an
+# isolated container with the repository mounted.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_chunk_limits.py)
+check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
+check "chunk inserts are batched and retried while the index isn't ready" $?
+
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
@@ -17654,6 +17865,9 @@ cd "$(dirname "$0")" && . ./lib.sh
 proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
+section "Collection list rows and retrieval-mode dispatch, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_retrieval_controls.py)
+check "test_retrieval_controls.py registered regression checks" $?
 section "Physical index and effective query controls"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
 check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
@@ -18572,10 +18786,18 @@ check "retained-source index boundary regressions" $?
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
 check "E12 embedding mismatch and post-install Ollama check regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_guard.py)
+check "concurrent imports of one package or one target refused (#391)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# Bundled models (#386): install safety, E21 and E22 with a temporary store,
+# then the real pulled embedding model copied through a temporary package.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_model_bundle.py)
+check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
+check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
@@ -19783,7 +20005,443 @@ drop_collection "$C"
 cleanup_prefixed
 bash ./10_validity.sh
 check "retained-session validity acceptance suite" $?
+
+# -- transfer and tuning paths with no check before (#387) --------------------
+# Import refusals, on_conflict, unknown job ids, /packages, export without the
+# model store, retrieve.py (E8-E10), E11 and the distribution scripts; its own
+# collection and packages, removed again.
+bash ./15_transfer_paths.sh
+check "transfer and tuning paths suite (#387)" $?
 summary
+```
+
+### scripts/verify/15_transfer_paths.sh
+
+```bash
+#!/usr/bin/env bash
+# Transfer and tuning paths with no check before (#387): import refusals, on_conflict,
+# unknown job ids, /packages, the package file left alone, export without the model store,
+# retrieve.py (E8-E10), equivalent retrieval after import (E11) and a re-chunk that produces
+# no chunks. Run by 05_transfer.sh.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}Paths"
+SLUG=$(printf '%s' "$C" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/-/g')
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
+QUESTION="who approves overtime?"
+
+section "Transfer and tuning paths (#387)"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_package_refusals.py)
+check "package refusal regressions (checks 1 and 2, collection name, chunk records)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_transfer_paths.py)
+check "transfer and tuning route regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieve_script.py)
+check "retrieve.py flag and exit-code regressions (E8-E10)" $?
+python3 "$REPO_ROOT/scripts/tests/test_distribution.py"
+check "package.sh, package-offline.sh and install-offline.sh regressions" $?
+
+count_of() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p_job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_p_imp.json
+  local j; j=$(jfield "['job_id']" < /tmp/vfy_p_imp.json)
+  # No job (a refused request): record that instead of polling a job that isn't there.
+  if [ -z "$j" ] || [ "$j" = None ]; then cp /tmp/vfy_p_imp.json /tmp/vfy_p_job.json; return; fi
+  wait_for_job "/import/job/$j" 900 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_p_job.json
+}
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
+check_eq "the suite's collection is ingested" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_p_ing.json)" 900)" "completed"
+chunks=$(count_of "$C")
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
+check_eq "... and exported" \
+  "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" 1800)" "completed"
+PKG=$(api_get "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" | jfield "['filename']")
+
+# -- unknown job ids (TR:A10, TR:C5, TU:34) -----------------------------------
+for kind in export import tune; do
+  code=$(api_code "$API/$kind/job/vfy-no-such-job")
+  ecode=$(api_get "/$kind/job/vfy-no-such-job" | jfield "['error']['code']")
+  [ "$code" = 404 ] && [ "$ecode" = JOB_NOT_FOUND ]
+  check "an unknown $kind job id is 404 JOB_NOT_FOUND" $? "HTTP $code, code '$ecode'"
+done
+
+# -- on_conflict is required and checked (TR:C2) ------------------------------
+for body in "{\"filename\":\"$PKG\"}" "{\"filename\":\"$PKG\",\"on_conflict\":null}" \
+            "{\"filename\":\"$PKG\",\"on_conflict\":\"merge\"}"; do
+  code=$(api_post_code "/import" "$body")
+  ecode=$(api_post "/import" "$body" | jfield "['error']['code']")
+  [ "$code" = 422 ] && [ "$ecode" = INVALID_PARAMETER ]
+  check "POST /import $body is 422 INVALID_PARAMETER" $? "HTTP $code, code '$ecode'"
+done
+
+# -- GET /packages, readable and not (TR:D1) ----------------------------------
+JUNK="ragpkg-$SLUG-junk.tar.gz"
+printf 'not a package\n' > "$EXPORTS/.$JUNK.part" && mv "$EXPORTS/.$JUNK.part" "$EXPORTS/$JUNK"
+api_get "/packages" > /tmp/vfy_p_list.json
+python3 - "$EXPORTS" "$PKG" "$JUNK" "$C" "$chunks" <<'ENDPY'
+import json, os, sys
+exports, pkg, junk, coll, chunks = sys.argv[1:6]
+listed = {p["filename"]: p for p in json.load(open("/tmp/vfy_p_list.json"))["packages"]}
+want = {pkg: {"filename": pkg, "size_bytes": os.path.getsize(os.path.join(exports, pkg)),
+              "collection": coll, "chunk_count": int(chunks), "fidelity": "with-sources",
+              "readable": True},
+        junk: {"filename": junk, "size_bytes": os.path.getsize(os.path.join(exports, junk)),
+               "collection": None, "chunk_count": None, "fidelity": None, "created_at": None,
+               "readable": False}}
+bad = [name for name, fields in want.items()
+       if name not in listed or any(listed[name].get(k) != v for k, v in fields.items())]
+bad += [] if (listed.get(pkg) or {}).get("created_at") else [pkg + " has no created_at"]
+print("    listed:", json.dumps({k: listed.get(k) for k in want}))
+sys.exit(1 if bad else 0)
+ENDPY
+check "GET /packages lists the package readable, with its fields, and junk as readable: false" $?
+rm -f "$EXPORTS/$JUNK"
+
+# -- import refusals (TR:C7-C10, C16, C34) ------------------------------------
+# Each crafted copy of the package is refused with its code, and no collection appears.
+names_before=$(collection_names)
+run_import "ragpkg-$SLUG-absent.tar.gz" rename
+check_eq "a package that does not exist is refused as PACKAGE_UNREADABLE" \
+  "$(jfield "['error_code']" < /tmp/vfy_p_job.json)" "PACKAGE_UNREADABLE"
+for spec in nongzip:PACKAGE_UNREADABLE truncated:PACKAGE_UNREADABLE symlink:PACKAGE_UNREADABLE \
+            hardlink:PACKAGE_UNREADABLE dotdot:PACKAGE_UNREADABLE twodirs:PACKAGE_UNREADABLE \
+            nomanifest:PACKAGE_FORMAT_UNSUPPORTED badmanifest:PACKAGE_FORMAT_UNSUPPORTED \
+            newformat:PACKAGE_FORMAT_UNSUPPORTED badname:PACKAGE_FORMAT_UNSUPPORTED \
+            badline:PACKAGE_CORRUPT baduuid:PACKAGE_CORRUPT badprops:PACKAGE_CORRUPT \
+            novector:PACKAGE_CORRUPT wrongwidth:PACKAGE_CORRUPT countup:PACKAGE_CORRUPT \
+            countdown:PACKAGE_CORRUPT; do
+  kind=${spec%%:*}; want=${spec#*:}
+  P=$(python3 ./transfer_packages.py "$EXPORTS/$PKG" "$kind")
+  run_import "$P" rename
+  got=$(jfield "['error_code']" < /tmp/vfy_p_job.json)
+  names_after=$(collection_names)
+  [ "$got" = "$want" ] && [ "$names_after" = "$names_before" ]
+  check "a $kind package is refused as $want and creates no collection" $? \
+    "code '$got': $(jfield "['error']" < /tmp/vfy_p_job.json | cut -c1-120)"
+  rm -f "$EXPORTS/$P"
+done
+P=$(python3 ./transfer_packages.py "$EXPORTS/$PKG" badline -replace)
+run_import "$P" replace
+check_eq "replace with a malformed chunk record is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_p_job.json)" "PACKAGE_CORRUPT"
+check_eq "... and leaves the existing collection's chunks alone" "$(count_of "$C")" "$chunks"
+rm -f "$EXPORTS/$P"
+
+# -- the package file is left unchanged (TR:C28) ------------------------------
+package_state() { python3 - "$EXPORTS/$PKG" <<'ENDPY'
+import hashlib, os, sys
+st = os.stat(sys.argv[1])
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), st.st_size, st.st_mtime_ns)
+ENDPY
+}
+state_before=$(package_state)
+run_import "$PKG" rename
+read -r istat IMP <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_p_job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "the package imports under a new name" "$istat" "completed"
+check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
+
+# -- E11: the import retrieves what the original does -------------------------
+# /query rewrites each question with the LLM first, so two answers can differ even for
+# identical collections; retrieval is compared directly, for each path /query uses.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
+import asyncio, sys
+from services import ollama_client
+from services import weaviate_client as wc
+original, imported, question = sys.argv[1:4]
+
+async def retrieve(name, vector):
+    return {"vector": await wc.near_vector_query(name, vector, 6),
+            "hybrid": await wc.hybrid_query(name, question, 0.5, 6),
+            "near-text": await wc.near_text_query(name, question, 6)}
+
+async def main():
+    vector = await ollama_client.embed(question)
+    return await retrieve(original, vector), await retrieve(imported, vector)
+
+try:
+    a, b = asyncio.run(main())
+finally:
+    wc.close_client()
+ok = True
+for path in a:
+    key = lambda rows: sorted((r["source_file"], r["chunk_index"], r["score"]) for r in rows)
+    x, y = key(a[path]), key(b[path])
+    same = len(x) == len(y) > 0 and all(
+        p[:2] == q[:2] and abs(p[2] - q[2]) < 1e-4 for p, q in zip(x, y))
+    print(f"    {path}: {len(x)} and {len(y)} chunk(s), {'the same' if same else 'DIFFERENT'}")
+    ok = ok and same
+sys.exit(0 if ok else 1)
+ENDPY
+check "E11: the imported collection retrieves the same chunks and scores as the original" $?
+
+# -- export without the model store (TR:A19) ----------------------------------
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_p_models.json 2>/tmp/vfy_p_models.err <<'ENDPY'
+import json, sys, tarfile
+from unittest.mock import patch
+from config import settings
+from services import packager
+from services import weaviate_client as wc
+try:
+    with patch.object(settings, "ollama_models_dir", "/nonexistent-ollama-store-387"):
+        result = packager.build(sys.argv[1], include_models=True)
+finally:
+    wc.close_client()
+with tarfile.open(packager.exports_dir() / result["filename"]) as tar:
+    names = tar.getnames()
+    manifest = json.load(tar.extractfile(next(n for n in names if n.endswith("/manifest.json"))))
+print(json.dumps({"filename": result["filename"], "models_bundled": result["models_bundled"],
+                  "warnings": result["warnings"], "manifest": [manifest["models_bundled"],
+                                                               manifest["bundled_models"]],
+                  "models": [n for n in names if "/models" in n]}))
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_models.json"))
+except ValueError:
+    print("    " + open("/tmp/vfy_p_models.err").read()[-300:]); sys.exit(1)
+ok = (d["models_bundled"] is False and d["manifest"] == [False, []] and d["models"] == []
+      and "models were requested but the Ollama model store is not mounted; the package was "
+          "built without them" in d["warnings"])
+print("    " + json.dumps(d))
+sys.exit(0 if ok else 1)
+ENDPY
+check "export with models but no model store warns, bundles nothing and says so in the manifest" $?
+NOSTORE=$(jfield "['filename']" < /tmp/vfy_p_models.json)
+[ -n "$NOSTORE" ] && [ "$NOSTORE" != "None" ] && rm -f "$EXPORTS/$NOSTORE"
+
+# -- retrieve.py from the package (E8-E10) ------------------------------------
+RTMP=$(mktemp -d)
+python3 - "$EXPORTS/$PKG" "$RTMP" <<'ENDPY'
+import pathlib, sys, tarfile
+with tarfile.open(sys.argv[1]) as tar:
+    member = next(m for m in tar.getmembers() if m.isfile() and m.name.endswith("/retrieve.py"))
+    pathlib.Path(sys.argv[2], "retrieve.py").write_bytes(tar.extractfile(member).read())
+ENDPY
+check "the package carries retrieve.py" $?
+python3 -I -S "$RTMP/retrieve.py" --api-url "http://127.0.0.1:9/api" "$QUESTION" \
+  > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+rc=$?
+[ "$rc" = 3 ] && grep -q '^error: Cannot reach the API at http://127.0.0.1:9/api' /tmp/vfy_p_r.err \
+  && ! grep -q Traceback /tmp/vfy_p_r.err
+check "E10: retrieve.py exits 3 with one sentence when nothing answers" $? \
+  "exit $rc: $(head -1 /tmp/vfy_p_r.err)"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "E8/E9/E11: retrieve.py answers from the original and the import" "RAG_SKIP_SLOW=1"
+else
+  want_citations=$(( chunks < 6 ? chunks : 6 ))
+  for run in "default:$want_citations" "top2:2"; do
+    name=${run%%:*}; want=${run#*:}
+    args=(--api-url "$API" --json --citations)
+    [ "$name" = top2 ] && args+=(--top-k 2)
+    python3 -I -S "$RTMP/retrieve.py" "${args[@]}" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - "$want" <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+ENDPY
+    answered=$?
+    [ "$rc" = 0 ] && [ "$answered" = 0 ]
+    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+      "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  done
+  python3 -I -S "$RTMP/retrieve.py" --api-url "$API" --collection "$IMP" "$QUESTION" \
+    > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+  rc=$?
+  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
+  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+fi
+rm -rf "$RTMP"
+
+# -- a re-chunk that produces no chunks (TU:16) -------------------------------
+# The retained original is replaced with blank text; its stored chunks stay.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+sources.store(c, "policies.txt", b"   \n\n   \n", replace=True)
+docs = sources.load_index(c)["documents"]
+sys.exit(0 if [e["filenames"] for e in docs.values()] == [["policies.txt"]] else 1)
+ENDPY
+check "the retained policies.txt is replaced with blank text" $?
+api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_p_tune.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_p_tune.json)
+if [ -n "$tjob" ] && [ "$tjob" != None ]; then
+  tstatus=$(wait_for_job "/tune/job/$tjob" 900)
+  api_get "/tune/job/$tjob" > /tmp/vfy_p_tjob.json
+else
+  tstatus="not started: $(head -c 200 /tmp/vfy_p_tune.json)"; echo '{}' > /tmp/vfy_p_tjob.json
+fi
+[ "$tstatus" = failed ] && [ "$(jfield "['error_code']" < /tmp/vfy_p_tjob.json)" = SOURCES_REQUIRED ] \
+  && jfield "['error']" < /tmp/vfy_p_tjob.json | grep -q "produced no chunks"
+check "a re-chunk that produces no chunks fails SOURCES_REQUIRED" $? \
+  "status '$tstatus': $(jfield "['error']" < /tmp/vfy_p_tjob.json)"
+check_eq "... and leaves the collection's chunks alone" "$(count_of "$C")" "$chunks"
+
+[ "$IMP" != "-" ] && [ "$IMP" != "$C" ] && drop_collection "$IMP"
+drop_collection "$C"
+rm -f "$EXPORTS/$PKG"
+summary
+```
+
+### scripts/verify/transfer_packages.py
+
+```python
+#!/usr/bin/env python3
+"""Write one damaged copy of an export package, for the import refusal checks (#387).
+
+    python3 transfer_packages.py <package.tar.gz> <kind> [suffix]
+
+Writes `<stem>-<kind><suffix>.tar.gz` beside the package and prints its name. The copy is
+written under a `.part` name and renamed into place: on Docker Desktop the API can read a
+freshly written bind-mounted file as empty (#184). Standard library only; run on the host by
+`15_transfer_paths.sh`.
+
+Kinds, by the import check that refuses them:
+  check 1, PACKAGE_UNREADABLE:  nongzip truncated symlink hardlink dotdot twodirs
+  check 2, PACKAGE_FORMAT_UNSUPPORTED:  nomanifest badmanifest newformat badname
+  records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
+The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
+the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+"""
+import hashlib
+import io
+import json
+import pathlib
+import sys
+import tarfile
+import tempfile
+
+KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "nomanifest",
+         "badmanifest", "newformat", "badname", "badline", "baduuid", "badprops", "novector",
+         "wrongwidth", "countup", "countdown")
+
+
+def extract(src, work):
+    with tarfile.open(src) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(work, filter="data")
+        else:                                   # the suite's own package, before 3.9.17
+            tar.extractall(work)
+    return next(p for p in work.iterdir() if p.is_dir())
+
+
+def edit_records(root, change):
+    path = root / "chunks.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    lines = [json.dumps(row) for row in rows]
+    change(rows, lines)
+    path.write_text("\n".join(lines) + "\n")
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["files"]["chunks.jsonl"] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def edit_manifest(root, change):
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text())
+    change(manifest)
+    path.write_text(json.dumps(manifest, indent=2))
+
+
+def record(index, change):
+    def apply(rows, lines):
+        row = rows[index]
+        change(row)
+        lines[index] = json.dumps(row)
+    return apply
+
+
+def member(tar, name, **fields):
+    info = tarfile.TarInfo(name)
+    data = b"" if fields else b"written outside the package\n"
+    info.size = len(data)
+    for key, value in fields.items():
+        setattr(info, key, value)
+    tar.addfile(info, io.BytesIO(data))
+
+
+def write(src, kind, out):
+    if kind == "nongzip":
+        out.write_text("this is not a gzip archive\n")
+        return
+    if kind == "truncated":
+        data = src.read_bytes()
+        out.write_bytes(data[: len(data) // 2])
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = extract(src, pathlib.Path(td))
+        if kind == "nomanifest":
+            (root / "manifest.json").unlink()
+        elif kind == "badmanifest":
+            (root / "manifest.json").write_text("{not json")
+        elif kind == "newformat":
+            edit_manifest(root, lambda m: m.update(package_format=m["package_format"] + 1))
+        elif kind == "badname":
+            edit_manifest(root, lambda m: m["collection"].update(name="1bad-name"))
+        elif kind == "countup":
+            edit_manifest(root, lambda m: m["collection"].update(chunk_count=m["collection"]["chunk_count"] + 1))
+        elif kind == "countdown":
+            edit_manifest(root, lambda m: m["collection"].update(chunk_count=m["collection"]["chunk_count"] - 1))
+        elif kind == "badline":
+            edit_records(root, lambda rows, lines: lines.__setitem__(1, "{not json"))
+        elif kind == "baduuid":
+            edit_records(root, record(0, lambda r: r.update(id="not-a-uuid")))
+        elif kind == "badprops":
+            edit_records(root, record(0, lambda r: r.update(properties=["content"])))
+        elif kind == "novector":
+            edit_records(root, record(0, lambda r: r.pop("vector")))
+        elif kind == "wrongwidth":
+            edit_records(root, record(0, lambda r: r.update(vector=r["vector"][:-1])))
+        with tarfile.open(out, "w:gz") as tar:
+            tar.add(root, arcname=root.name)
+            if kind == "symlink":
+                member(tar, root.name + "/link", type=tarfile.SYMTYPE, linkname="/etc/passwd")
+            elif kind == "hardlink":
+                member(tar, root.name + "/hard", type=tarfile.LNKTYPE,
+                       linkname=root.name + "/manifest.json")
+            elif kind == "dotdot":
+                member(tar, "../escape-387.txt")
+            elif kind == "twodirs":
+                member(tar, "second/extra.txt")
+
+
+def main(argv):
+    if len(argv) not in (3, 4) or argv[2] not in KINDS:
+        sys.exit(__doc__)
+    src, kind = pathlib.Path(argv[1]), argv[2]
+    suffix = argv[3] if len(argv) == 4 else ""
+    out = src.parent / (src.name[: -len(".tar.gz")] + f"-{kind}{suffix}.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        write(src, kind, part)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
 ```
 
 ### scripts/verify/batch_recovery.py
@@ -21987,7 +22645,7 @@ Dockerfile
 
 ### package.sh
 
-Source-only archive (~150 KB). The target machine rebuilds the images and
+Source-only archive (~1.3 MB). The target machine rebuilds the images and
 re-downloads the models, so it needs internet.
 
 ```bash
@@ -22063,7 +22721,7 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #
 #   bash package-offline.sh [output.tar]
 #
-# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
 # this bundle contains everything required to run with NO network access:
 #
 #   * the source tree: the files git tracks in the current commit (HEAD),
@@ -22228,6 +22886,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ('package.sh', 'package-offline.sh')
@@ -22235,6 +22894,9 @@ REFUSAL = 'not the top level of a git checkout'
 COMMITTED_README = 'Scratch project.\n'
 GIT = ['git', '-c', 'user.name=Package Test', '-c', 'user.email=package-test@example.invalid',
        '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=develop']
+# The scratch repository and both scripts read no system or global (or XDG) git
+# config, so a user's core.hooksPath or attributes can't change the result (#447).
+GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 
 # Answers what package-offline.sh asks of docker, and logs each call.
 STUB_DOCKER = r'''#!/usr/bin/env bash
@@ -22272,6 +22934,7 @@ class PackageArchiveTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.tmp = Path(temp.name).resolve()
+        self.git_env = dict(os.environ, **GIT_ISOLATION)
         self.repo = self.tmp / 'project'
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
@@ -22295,11 +22958,11 @@ class PackageArchiveTests(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         write(bin_dir / 'docker', STUB_DOCKER, 0o755)
         self.log = self.tmp / 'docker.log'
-        self.env = dict(os.environ, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
-                        STUB_DOCKER_LOG=str(self.log), GIT_CONFIG_NOSYSTEM='1')
+        self.env = dict(self.git_env, PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}',
+                        STUB_DOCKER_LOG=str(self.log))
 
     def git(self, *args, cwd=None):
-        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, check=True,
+        return subprocess.run(GIT + list(args), cwd=cwd or self.repo, env=self.git_env, check=True,
                               capture_output=True, text=True).stdout
 
     def run_script(self, directory, script, out):
@@ -22308,6 +22971,20 @@ class PackageArchiveTests(unittest.TestCase):
 
     def assert_ran(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def expected_bundle(self):
+        return ({'rag-docker/' + name for name in self.tracked}
+                | {'rag-docker/offline/images.tar.gz', 'rag-docker/offline/ollama_models.tar.gz'})
+
+    def assert_archives_hold_the_tracked_files(self, directory):
+        zip_out, bundle_out = self.tmp / 'check.zip', self.tmp / 'check.tar'
+        self.assert_ran(self.run_script(directory, 'package.sh', zip_out))
+        self.assert_ran(self.run_script(directory, 'package-offline.sh', bundle_out))
+        with zipfile.ZipFile(zip_out) as archive:
+            self.assertEqual({i.filename for i in archive.infolist() if not i.filename.endswith('/')},
+                             self.tracked)
+        with tarfile.open(bundle_out) as archive:
+            self.assertEqual({m.name for m in archive.getmembers() if m.isfile()}, self.expected_bundle())
 
     def test_zip_holds_exactly_the_tracked_files(self):
         out = self.tmp / 'out.zip'
@@ -22348,6 +23025,27 @@ class PackageArchiveTests(unittest.TestCase):
                     self.assertFalse(out.exists())
         calls = self.log.read_text() if self.log.exists() else ''
         self.assertEqual(calls, '', 'docker was called before the refusal')
+
+    def test_runs_in_a_checkout_reached_through_a_symlink(self):
+        link = self.tmp / 'linked'
+        link.symlink_to(self.repo, target_is_directory=True)
+        self.assert_archives_hold_the_tracked_files(link)
+
+    def test_ignores_the_users_git_config(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        hostile = Path(temp.name).resolve()
+        marker = hostile / 'hook-ran'
+        write(hostile / 'hooks' / 'pre-commit', f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', 0o755)
+        write(hostile / 'attributes', 'README.md export-ignore\n')
+        write(hostile / 'gitconfig', f'[core]\n\thooksPath = {hostile / "hooks"}\n'
+                                     f'\tattributesFile = {hostile / "attributes"}\n')
+        with mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(hostile / 'gitconfig')):
+            # A fresh scratch repository, built while the caller's global config is hostile.
+            self.setUp()
+            self.assert_archives_hold_the_tracked_files(self.repo)
+        self.assertIn('README.md', self.tracked)
+        self.assertFalse(marker.exists(), 'the global pre-commit hook ran')
 
 
 class EmbeddedCopyTests(unittest.TestCase):
@@ -23177,6 +23875,9 @@ section "Concurrent settings publication and failed-write preservation"
 check "controlled retrieval/ingest concurrency and publication failures" $?
 (cd ../.. && python3 scripts/tests/test_settings_implementation.py)
 check "settings embedded implementation copies match runtime" $?
+section "Settings refused before work, backends mocked (#386)"
+(cd ../.. && docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_settings_validation.py)
+check "test_settings_validation.py registered regression checks" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -25709,8 +26410,10 @@ if __name__ == "__main__":
 ```python
 """Controlled package preflight and generated-script trust-boundary regressions."""
 import ast
+import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -25722,7 +26425,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from models.schemas import SaveRetrievalConfigBody
-from services import importer, packager, retrieval_config
+from services import importer, model_bundle, packager, retrieval_config
 
 
 INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
@@ -25993,37 +26696,110 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
 
-    def build_with_models(self, failing):
-        """Export with both models requested; models named in `failing` cannot bundle."""
+    def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
+                          store_available=True, broken_copy=(), fail_mid_write=()):
+        """Export with both models requested; models named in `failing` cannot bundle.
+
+        Models named in `broken_copy` resolve, but their second file's copy fails.
+        Models named in `fail_mid_write` resolve, but their second file's copy
+        fails after writing part of it. `self.exported` records each resolution."""
         blob = self.root / 'model-blob'
         blob.write_text('inert model bytes')
+        torn = self.root / 'torn-blob'
+        torn.write_text('bytes that never finish copying')
+        self.exported = []
+        copyfile = packager.shutil.copyfile
 
         def export_model(model, stage):
+            self.exported.append(model)
             if model in failing:
                 raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
-            return [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+            folder = 'models/' + '/'.join(model_bundle.split_ref(model))
+            files = [(f"{folder}/manifest.json", blob)]
+            if model in broken_copy:
+                files.append((f"{folder}/blobs/sha256-gone",
+                              self.root / 'missing-blob'))
+            if model in fail_mid_write:
+                files.append((f"{folder}/blobs/sha256-torn", torn))
+            return files
+
+        def copy_or_tear(source, target):
+            if Path(source) == torn:
+                Path(target).write_text('bytes that')
+                raise OSError(28, 'No space left on device')
+            return copyfile(source, target)
 
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
-            mocks.enter_context(patch.object(settings, 'llm_model', 'chat:v2'))
+            mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
             mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
             mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
             mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
-            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=True))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=store_available))
             mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
-            result = packager.build('Corpus', include_models=True)
+            mocks.enter_context(patch.object(packager.shutil, 'copyfile', side_effect=copy_or_tear))
+            result = packager.build('Corpus', include_models=include_models)
         with tarfile.open(self.exports / result['filename']) as archive:
             member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
                           and m.name.count('/') == 1)
             manifest = json.load(archive.extractfile(member))
         return result, manifest
 
+    def extracted(self, result):
+        """The package as import reads it: `open_package` into a fresh directory."""
+        dest = Path(tempfile.mkdtemp(dir=self.root))
+        return packager.open_package(self.exports / result['filename'], dest)
+
+    def test_a_failed_model_copy_leaves_no_part_of_that_model(self):
+        for broken in ({'broken_copy': {'chat:v2'}}, {'fail_mid_write': {'chat:v2'}}):
+            with self.subTest(**broken):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), **broken)
+                pkg, _ = self.extracted(result)
+                self.assertFalse((pkg / 'models' / 'chat').exists())
+                self.assertFalse(any(k.startswith('models/chat/') for k in manifest['files']))
+                self.assertIn('models/embed/v1/manifest.json', manifest['files'])
+                self.assertTrue((pkg / 'models' / 'embed' / 'v1' / 'manifest.json').is_file())
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed:v1'])
+                self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                                    for w in manifest['warnings']))
+
+    def test_a_model_shared_by_embedding_and_llm_is_copied_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(self.exported, ['embed:v1'])
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+
+    def test_manifest_lists_no_models_when_none_were_requested_or_the_store_is_missing(self):
+        for include, store in [(False, True), (True, False)]:
+            with self.subTest(include_models=include, store_available=store):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), include_models=include,
+                                                          store_available=store)
+                self.assertEqual(manifest['bundled_models'], [])
+                self.assertIs(manifest['models_bundled'], False)
+                self.assertIs(result['models_bundled'], False)
+                self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+
+    def test_manifest_lists_a_model_shared_by_embedding_and_llm_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+        self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
+        result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+        self.assertIs(manifest['models_bundled'], True)
+        self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                            for w in manifest['warnings']))
+
     def test_manifest_lists_only_models_actually_bundled(self):
-        for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
-                                  (set(), ['chat', 'embed']), ({'embed:v1', 'chat:v2'}, [])]:
+        for failing, expected in [({'chat:v2'}, ['embed:v1']), ({'embed:v1'}, ['chat:v2']),
+                                  (set(), ['chat:v2', 'embed:v1']), ({'embed:v1', 'chat:v2'}, [])]:
             with self.subTest(failing=sorted(failing)):
                 for leftover in self.exports.iterdir():
                     leftover.unlink()
@@ -26031,9 +26807,10 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(manifest['bundled_models'], expected)
                 self.assertEqual(manifest['models_bundled'], bool(expected))
                 self.assertEqual(result['models_bundled'], bool(expected))
-                for name in ('embed', 'chat'):
-                    self.assertEqual(f'models/{name}/manifest.json' in manifest['files'],
-                                     name in expected)
+                for ref in ('embed:v1', 'chat:v2'):
+                    folder = ref.replace(':', '/')
+                    self.assertEqual(f'models/{folder}/manifest.json' in manifest['files'],
+                                     ref in expected)
                 for model in sorted(failing):
                     self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
                                         for w in manifest['warnings']))
@@ -26124,6 +26901,135 @@ class RetrievalImportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
 
+
+class ModelTagFolderTests(unittest.TestCase):
+    """Two tags of one model name, and a folder used only for its own tag (#487).
+
+    Uses the real model_bundle export and install against temporary Ollama
+    stores holding inert bytes; only Ollama's own listing is stubbed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.store = self.root / 'store'
+        self.target = self.root / 'target'
+        (self.target / 'models').mkdir(parents=True)
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.root / 'uploads'), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.object(importer, '_log'))
+        self.manifests = {model: self.put_model(model) for model in ('foo:a', 'foo:b', 'bar:x')}
+
+    def put_model(self, model):
+        """An Ollama manifest and blobs with bytes of this model's own."""
+        name, tag = model.split(':')
+        blobs = self.store / 'models' / 'blobs'
+        blobs.mkdir(parents=True, exist_ok=True)
+        digests = []
+        for part in ('config', 'weights'):
+            data = f'{part} of {model}'.encode()
+            digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+            (blobs / digest.replace(':', '-')).write_bytes(data)
+            digests.append(digest)
+        manifest = json.dumps({'config': {'digest': digests[0]},
+                               'layers': [{'digest': digests[1]}]}).encode()
+        path = self.store / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(manifest)
+        return manifest
+
+    def export(self, embed, llm):
+        with ExitStack() as mocks:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+                mocks.enter_context(patch.object(settings, key, str(value)))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            result = packager.build('Corpus', include_models=True)
+        return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
+
+    def ensure(self, pkg, manifest, embed, llm):
+        with patch.object(settings, 'ollama_models_dir', str(self.target)), \
+             patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(importer, '_ollama_reports', lambda model: True):
+            return importer._ensure_models(pkg, manifest)
+
+    def installed(self, model):
+        name, tag = model.split(':')
+        path = self.target / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        return path.read_bytes() if path.is_file() else None
+
+    def legacy_package(self, folder_model, manifest_models):
+        """A package in the pre-#487 layout: `models/<name>/` holding `folder_model`."""
+        pkg = self.root / 'legacy'
+        name, tag = folder_model.split(':')
+        source = json.loads(self.manifests[folder_model])
+        (pkg / 'models' / name / 'blobs').mkdir(parents=True)
+        (pkg / 'models' / name / 'manifest.json').write_bytes(self.manifests[folder_model])
+        for digest in [source['config']['digest']] + [layer['digest'] for layer in source['layers']]:
+            blob = self.store / 'models' / 'blobs' / digest.replace(':', '-')
+            (pkg / 'models' / name / 'blobs' / blob.name).write_bytes(blob.read_bytes())
+        embed, llm = manifest_models
+        return pkg, {'embedding': {'model': embed}, 'llm': {'model': llm}}
+
+    # Each test checks the import outcome first, so on develop it fails on the
+    # wrong install itself rather than on the new layout or signature.
+    def test_two_tags_of_one_name_are_bundled_apart_and_each_installed_as_itself(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])  # develop: foo:b's
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+        for model in ('foo:a', 'foo:b'):
+            folder = 'models/' + model.replace(':', '/')
+            self.assertIn(f'{folder}/manifest.json', manifest['files'])
+            self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_bundled_tag_is_never_installed_under_another_tag(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
+
+    def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
+        pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
+
+    def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
+        # The pre-#487 export wrote both tags into models/foo/, the LLM's last.
+        pkg, manifest = self.legacy_package('foo:b', ('foo:a', 'foo:b'))
+        with self.assertRaises(packager.PackageError) as caught:  # develop: installs foo:b as foo:a
+            self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertIsNone(self.installed('foo:a'))
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), [])
+
+    def test_an_old_package_folder_is_not_installed_under_another_tag(self):
+        pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
 
 if __name__ == '__main__':
     unittest.main()
@@ -28953,7 +29859,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session, safe_attributes
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
@@ -29671,7 +30577,7 @@ class TelemetryTests(unittest.TestCase):
         from contextlib import asynccontextmanager
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, Mock
-        api=Path(os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+        api=Path(os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
         tree=ast.parse((api/'main.py').read_text())
         function=next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name=='lifespan')
         namespace={'asynccontextmanager':asynccontextmanager,'FastAPI':object}
