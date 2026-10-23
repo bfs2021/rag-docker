@@ -274,12 +274,62 @@ class RetrievalConfigFileTests(ApiTestCase):
         self.saved_file().mkdir()
         self.assert_falls_back()
 
-    @unittest.expectedFailure
     def test_a_file_of_json_that_is_not_an_object_falls_back_to_the_defaults(self):
-        # QR:25, found by #399: resolve() says it never raises, but a saved file holding
-        # a JSON array raises TypeError there and the route answers 500 INTERNAL_ERROR.
+        # QR:25, found by #399 and fixed by #439: a saved JSON array made resolve() raise
+        # TypeError and the route answer 500 INTERNAL_ERROR.
         self.saved_file().write_text("[1, 2]")
         self.assert_falls_back()
+
+    def test_other_json_that_is_not_an_object_falls_back_to_the_defaults(self):
+        # #439: a number, a string or a boolean, like the array above.
+        for text in ("3", '"settings"', "true"):
+            with self.subTest(saved=text):
+                self.saved_file().write_text(text)
+                self.assert_falls_back()
+
+    def test_a_field_of_the_wrong_type_falls_back_to_the_defaults(self):
+        # #439: a value the GET response can't carry made the route answer 500.
+        saved = {"collection": "Coll", "retrieval_mode": "hybrid", "top_k": 9, "alpha": 0.4,
+                 "ef": None, "response_format": "engineer"}
+        for field, value in (("top_k", "x"), ("retrieval_mode", None), ("alpha", "x"),
+                             ("ef", "x"), ("response_format", ["engineer"])):
+            with self.subTest(field=field, value=value):
+                self.saved_file().write_text(json.dumps({**saved, field: value}))
+                self.assert_falls_back()
+
+    def test_coercible_and_out_of_range_values_are_still_served_as_saved(self):
+        # #439 falls back only for what can't be served; these were served before it.
+        self.saved_file().write_text(json.dumps({"top_k": "7"}))
+        self.assertEqual(self.get_config(), {**DEFAULTS, "top_k": 7, "is_default": False})
+        self.saved_file().write_text(json.dumps({"top_k": 0, "ef": 513}))
+        self.assertEqual(self.get_config(), {**DEFAULTS, "top_k": 0, "ef": 513,
+                                             "is_default": False})
+
+    def test_a_fractional_or_nested_value_falls_back_to_the_defaults(self):
+        # #439: other values the GET response can't carry; each answered 500 before it.
+        for value in (1.5, {"a": 1}, [7]):
+            with self.subTest(top_k=value):
+                self.saved_file().write_text(json.dumps({"top_k": value}))
+                self.assert_falls_back()
+
+    def test_a_saved_is_default_key_falls_back_to_the_defaults(self):
+        # #477: a hand-edited file holding the response-only key `is_default` passed
+        # resolve()'s check, then the router's RetrievalConfigResponse(is_default=...,
+        # **cfg) got the keyword twice and the route answered 500 INTERNAL_ERROR.
+        for value in (True, False):
+            with self.subTest(is_default=value):
+                self.saved_file().write_text(json.dumps({"top_k": 9, "is_default": value}))
+                self.assert_falls_back()
+
+    def test_a_non_finite_alpha_falls_back_to_the_defaults(self):
+        # #477: JSON has no NaN or Infinity, so the response sent `"alpha": null` with
+        # `is_default: false`; a finite alpha out of range is still served as saved.
+        for text in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(alpha=text):
+                self.saved_file().write_text('{"alpha": %s}' % text)
+                self.assert_falls_back()
+        self.saved_file().write_text(json.dumps({"alpha": 1.5}))
+        self.assertEqual(self.get_config(), {**DEFAULTS, "alpha": 1.5, "is_default": False})
 
 
 # ── GET /metrics/latency (PL:B1, PL:B2, PL:B3) ───────────────────────────────

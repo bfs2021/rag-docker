@@ -1236,4 +1236,11 @@ drop_collection "$C"
 cleanup_prefixed
 bash ./10_validity.sh
 check "retained-session validity acceptance suite" $?
+
+# -- transfer and tuning paths with no check before (#387) --------------------
+# Import refusals, on_conflict, unknown job ids, /packages, export without the
+# model store, retrieve.py (E8-E10), E11 and the distribution scripts; its own
+# collection and packages, removed again.
+bash ./15_transfer_paths.sh
+check "transfer and tuning paths suite (#387)" $?
 summary

@@ -1,4 +1,6 @@
-"""The collection registry is written atomically and kept when it can't be read (issue #388).
+"""The collection registry is written atomically and kept when it can't be read (issue #388);
+its folder is fsynced after the replace and startup removes the temporary files of
+interrupted saves (issue #445).
 
 Runs with the API's dependencies, in the built API image with no network
 (`01_infrastructure.sh`):
@@ -8,7 +10,8 @@ Runs with the API's dependencies, in the built API image with no network
 
 Each test points UPLOAD_DIR, and the registry with it, at a fresh temporary folder.
 Requests go through `main.app` with FastAPI's TestClient, without the lifespan, with
-Weaviate mocked; nothing reaches a backend.
+Weaviate mocked; nothing reaches a backend. The lifespan case runs in a child process,
+with the backend sweeps mocked, so this process's module state stays untouched.
 """
 import asyncio
 import errno
@@ -16,6 +19,7 @@ import json
 import logging
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,7 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
 
 from fastapi.testclient import TestClient
 
@@ -269,6 +274,175 @@ class ReadableRegistryTests(RegistryTestCase):
             asyncio.run(run())
         self.assertEqual(set(self.read()), set(OLD) | set(names))
         self.assertEqual(self.leftovers(), [])
+
+
+def same_file(fd, path):
+    """Whether descriptor `fd` is open on `path`."""
+    opened, named = os.fstat(fd), os.stat(path)
+    return (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+
+
+class FolderSyncTests(RegistryTestCase):
+    """The folder is fsynced after the replace, so the rename survives a power loss (#445)."""
+
+    def record(self, events, fail_folder_sync=False):
+        """Patches recording replace, open, fsync and close of the router's os module.
+        With fail_folder_sync, an fsync of a folder fails as on a broken volume."""
+        real = {name: getattr(route.os, name) for name in ("replace", "open", "fsync", "close")}
+
+        def replace(source, target):
+            events.append(("replace", Path(target)))
+            return real["replace"](source, target)
+
+        def open_(path, flags, *args):
+            fd = real["open"](path, flags, *args)
+            events.append(("open", fd))
+            return fd
+
+        def fsync(fd):
+            folder = stat.S_ISDIR(os.fstat(fd).st_mode)
+            events.append(("fsync folder" if folder else "fsync file", fd))
+            if folder and fail_folder_sync:
+                raise OSError(errno.EIO, "I/O error")
+            return real["fsync"](fd)
+
+        def close(fd):
+            events.append(("close", fd))
+            return real["close"](fd)
+
+        return [patch.object(route.os, "replace", side_effect=replace),
+                patch.object(route.os, "open", side_effect=open_),
+                patch.object(route.os, "fsync", side_effect=fsync),
+                patch.object(route.os, "close", side_effect=close)]
+
+    def run_save(self, events, fail_folder_sync=False):
+        patches = self.record(events, fail_folder_sync)
+        for patcher in patches:
+            patcher.start()
+        try:
+            route._save_registry({"New": "2026-03-03T00:00:00+00:00"})
+        finally:
+            for patcher in reversed(patches):
+                patcher.stop()
+
+    def test_the_folder_is_fsynced_after_the_replace(self):
+        self.write(OLD)
+        events = []
+        self.run_save(events)
+        names = [name for name, _ in events]
+        self.assertIn("replace", names, events)
+        after = events[names.index("replace") + 1:]
+        self.assertEqual([name for name, _ in after], ["open", "fsync folder", "close"], events)
+        fd = after[0][1]
+        self.assertEqual(after[1][1], fd)
+        self.assertEqual(after[2][1], fd)
+        self.assertEqual(events[names.index("replace")][1], self.path)
+        self.assertEqual(self.read(), {"New": "2026-03-03T00:00:00+00:00"})
+        self.assertEqual(self.leftovers(), [])
+
+    def test_the_synced_folder_is_the_registry_folder(self):
+        seen = []
+        real = route.os.fsync
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                seen.append(same_file(fd, self.dir))
+            return real(fd)
+
+        with patch.object(route.os, "fsync", side_effect=fsync):
+            route._save_registry({"New": "2026-03-03T00:00:00+00:00"})
+        self.assertEqual(seen, [True])
+
+    def test_a_failed_folder_sync_raises_with_the_new_file_in_place(self):
+        self.write(OLD)
+        events = []
+        with self.assertRaises(OSError):
+            self.run_save(events, fail_folder_sync=True)
+        self.assertEqual(self.read(), {"New": "2026-03-03T00:00:00+00:00"})
+        self.assertEqual(self.leftovers(), [])
+        names = [name for name, _ in events]
+        after = events[names.index("replace") + 1:]
+        self.assertEqual([name for name, _ in after], ["open", "fsync folder", "close"], events)
+        self.assertEqual(after[2][1], after[0][1], "the folder's descriptor was left open")
+
+
+class SweepTests(RegistryTestCase):
+    """Startup removes the temporary files of saves a crash interrupted (#445)."""
+
+    def test_leftovers_are_removed_and_everything_else_is_kept(self):
+        self.write(OLD)
+        before = self.path.read_bytes()
+        (self.dir / f".{NAME}.abc123.tmp").write_bytes(b"")
+        (self.dir / f".{NAME}.def456.tmp").write_bytes(b'{"Kept": "2026-01-01T0')
+        kept = [".metrics.jsonl.x1.tmp", f"{NAME}.tmp", f".{NAME}.x2", f".{NAME}.tmp.x3",
+                "notes.txt"]
+        for name in kept:
+            (self.dir / name).write_text("keep")
+        (self.dir / "jobs").mkdir()
+        (self.dir / "jobs" / f".{NAME}.x4.tmp").write_text("keep")
+        with self.assertNoLogs("routers.collections", "WARNING"):
+            route.remove_interrupted_saves()
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), sorted([NAME, "jobs"] + kept))
+        self.assertEqual((self.dir / "jobs" / f".{NAME}.x4.tmp").read_text(), "keep")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_a_link_is_removed_without_following_it(self):
+        target = self.dir / "target"
+        target.write_text("keep")
+        (self.dir / f".{NAME}.abc.tmp").symlink_to(target)
+        route.remove_interrupted_saves()
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["target"])
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_a_leftover_that_cannot_be_removed_is_logged_and_the_rest_removed(self):
+        folder = self.dir / f".{NAME}.a.tmp"
+        folder.mkdir()
+        (folder / "inside").write_text("keep")
+        (self.dir / f".{NAME}.b.tmp").write_bytes(b"")
+        with self.assertLogs("routers.collections", "ERROR") as logs:
+            route.remove_interrupted_saves()
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [folder.name])
+        self.assertEqual((folder / "inside").read_text(), "keep")
+        self.assertIn(str(folder), logged(logs))
+
+    def test_a_missing_folder_sweeps_nothing_and_is_not_created(self):
+        missing = self.dir / "uploads" / NAME
+        with patch.object(route, "_REGISTRY_FILE", missing):
+            route.remove_interrupted_saves()
+        self.assertFalse(missing.parent.exists())
+
+
+class LifespanTests(RegistryTestCase):
+    def test_startup_removes_leftovers_and_leaves_the_registry_alone(self):
+        self.write(OLD)
+        before = self.path.read_bytes()
+        leftover = self.dir / f".{NAME}.k1x9.tmp"
+        leftover.write_bytes(b'{"Kept": "2026-01-01T0')
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            pass
+asyncio.run(run())
+"""
+        exports = self.dir / "exports"
+        env = {**os.environ, "UPLOAD_DIR": str(self.dir), "EXPORTS_DIR": str(exports),
+               "SOURCES_DIR": str(self.dir / "sources")}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True,
+                                text=True, timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(leftover.exists(), "startup left the interrupted registry write")
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual([p.name for p in self.dir.glob(f".{NAME}*")], [])
 
 
 class ImplementationCopyTests(unittest.TestCase):

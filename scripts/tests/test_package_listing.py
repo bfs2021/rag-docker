@@ -1,4 +1,5 @@
-"""The package listing reads each manifest without decompressing the package (issue #383).
+"""The package listing reads each manifest without decompressing the package (issue #383),
+and lists a package whose manifest has wrongly typed fields as unreadable (issue #451).
 
 Runs with the API's dependencies, in the built API image with no network
 (`05_transfer.sh`):
@@ -179,6 +180,45 @@ class ListingTestCase(unittest.TestCase):
                 self.assertEqual(listed[path.name], dict(
                     filename=path.name, size_bytes=path.stat().st_size, readable=False, **NULLS))
 
+    def test_wrongly_typed_manifest_fields_are_listed_unreadable(self):
+        # Each case replaces one listed value with a wrong JSON type (#451).
+        good = manifest_first(self.exports / f"{STEM}.tar.gz")
+        collection = MANIFEST["collection"]
+        bad = {
+            "collection-string": dict(MANIFEST, collection="Policies"),
+            "name-number": dict(MANIFEST, collection=dict(collection, name=5)),
+            "count-string": dict(MANIFEST, collection=dict(collection, chunk_count="12")),
+            "count-fraction": dict(MANIFEST, collection=dict(collection, chunk_count=1.5)),
+            "count-float": dict(MANIFEST, collection=dict(collection, chunk_count=12.0)),
+            "count-boolean": dict(MANIFEST, collection=dict(collection, chunk_count=True)),
+            "fidelity-number": dict(MANIFEST, fidelity=1),
+            "created-at-number": dict(MANIFEST, created_at=20260918),
+        }
+        for name, manifest in bad.items():
+            manifest_first(self.exports / f"ragpkg-{name}.tar.gz", manifest=manifest)
+        listed = self.listing()
+        self.assertEqual(set(listed), {good.name} | {f"ragpkg-{n}.tar.gz" for n in bad})
+        self.assert_readable(listed[good.name])
+        for name in bad:
+            path = self.exports / f"ragpkg-{name}.tar.gz"
+            with self.subTest(file=name):
+                self.assertEqual(listed[path.name], dict(
+                    filename=path.name, size_bytes=path.stat().st_size, readable=False, **NULLS))
+
+    def test_null_or_absent_fields_list_as_null(self):
+        cases = {
+            "collection-null": dict(MANIFEST, collection=None, fidelity=None, created_at=None),
+            "fields-absent": {"package_format": 1, "files": {}},
+        }
+        for name, manifest in cases.items():
+            manifest_first(self.exports / f"ragpkg-{name}.tar.gz", manifest=manifest)
+        listed = self.listing()
+        for name in cases:
+            path = self.exports / f"ragpkg-{name}.tar.gz"
+            with self.subTest(file=name):
+                self.assertEqual(listed[path.name], dict(
+                    filename=path.name, size_bytes=path.stat().st_size, readable=True, **NULLS))
+
     def test_new_archives_put_the_manifest_first(self):
         stage = Path(self.tmp.name) / "stage"
         (stage / "goldstandard").mkdir(parents=True)
@@ -218,11 +258,12 @@ class ListingTestCase(unittest.TestCase):
 
     def test_embedded_copy_matches(self):
         document = (ROOT / "IMPLEMENTATION.md").read_text()
-        name = "api/services/packager.py"
-        header = "### " + name + "\n\n```"
-        start = document.index("\n", document.index(header) + len(header)) + 1
-        end = document.index("\n```\n", start)
-        self.assertEqual(document[start:end], (ROOT / name).read_text().rstrip("\n"))
+        for name in ("api/services/packager.py", "api/routers/transfer.py"):
+            with self.subTest(file=name):
+                header = "### " + name + "\n\n```"
+                start = document.index("\n", document.index(header) + len(header)) + 1
+                end = document.index("\n```\n", start)
+                self.assertEqual(document[start:end], (ROOT / name).read_text().rstrip("\n"))
 
 
 if __name__ == "__main__":
