@@ -1020,6 +1020,53 @@ class RechunkTests(unittest.TestCase):
                 self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
                                  (set(), []))
 
+    def test_the_rechunk_check_503_reaches_the_client_over_http_at_each_tune_start(self):
+        # #409: the 503 a re-chunk, and a re-embed with chunking fields, give when
+        # their re-chunk coverage check can't read Weaviate (#340), through the
+        # app as a client calls it: the JSON 503 reaches the client, whether the
+        # walk fails or the connection does, with no job and the guards released.
+        from fastapi.testclient import TestClient
+        from main import app
+        from services import collection_writes
+        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        self.addCleanup(client.close)
+        sources.store("Coll", "a.txt", b"one", replace=True)
+
+        def broken(**_):
+            raise ConnectionError("weaviate down")
+
+        coll = SimpleNamespace(iterator=broken)
+        requests = {
+            "rechunk": ("/tune/rechunk", {"collection": "Coll"}),
+            "reembed with chunking": ("/tune/reembed", {
+                "collection": "Coll", "chunking_strategy": "fixed", "chunk_size": 80}),
+        }
+        failures = {
+            "walk": {"return_value": SimpleNamespace(
+                collections=SimpleNamespace(get=lambda name: coll))},
+            "connection": {"side_effect": ConnectionError("weaviate down")},
+        }
+        before = set(tuning._jobs)
+        for failure, effect in failures.items():
+            for case, (path, body) in requests.items():
+                with self.subTest(failure=failure, case=case), \
+                        patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                        patch.object(wc, "get_client", **effect), \
+                        self.assertLogs(tuning._log, "ERROR"):
+                    response = client.post(path, json=body)
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertTrue(response.headers["content-type"].startswith("application/json"))
+                    self.assertEqual(response.json()["error"], {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": "Cannot check whether 'Coll' can be re-chunked: Weaviate "
+                                   "could not be read. No job was started; try again when "
+                                   "Weaviate is available.",
+                        "detail": {"collection": "Coll"}})
+                    self.assertNotIn("weaviate down", response.text)
+                    self.assertEqual(set(tuning._jobs), before)
+                    self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")),
+                                     (set(), []))
+
     def test_a_missing_collection_is_still_404_at_tune_starts_and_options(self):
         # #349 (reviewer): the existence check now sits in a try; a collection
         # Weaviate reports as missing is still COLLECTION_NOT_FOUND, with no job.
