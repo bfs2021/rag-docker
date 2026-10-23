@@ -113,6 +113,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -124,7 +129,9 @@ needs no stack.
 With API dependencies installed, run
 `python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
 retrieval save contention, unique temporary paths, first-save directory races,
-and failed serialization/create/write/close/replace preservation. The test also
+failed serialization/create/write/close/replace preservation, and the folder
+fsync after the replacement, including import publication and a failed folder
+fsync (#445). The test also
 checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
 directories and does not connect to Weaviate or Ollama.
 
@@ -142,7 +149,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the seven controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -186,6 +193,56 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
+had no check. It runs four controlled tests, then live checks on a collection of its own.
+`scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
+missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
+a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
+top-level directories, and a package with no manifest, a manifest that isn't JSON or a newer
+`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). Through `importer._run`, with Weaviate and the
+model checks mocked, a digest-valid package naming a collection Weaviate can't use is
+`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
+above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
+`abort` and `rename`. `scripts/tests/test_transfer_paths.py` (API container, through the app)
+checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
+import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
+`JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,
+`GET /packages` with a readable and an unreadable package, the help page's "its own number of"
+fallback when the embedding probe fails and `HELP_RENDER_FAILED` for a missing partial or an
+unsubstituted placeholder, 409 `TUNE_IN_PROGRESS` for a second tune start under either
+spelling, and a re-chunk that produces no chunks failing `SOURCES_REQUIRED` before any rebuild.
+`scripts/tests/test_retrieve_script.py` (API container) renders `retrieve.py` with the exporter
+and runs it with `python -I -S` against a stub API: standard-library imports only, the baked
+defaults sent, every flag overriding its default, and the exit codes of
+`RAG_EXPORT_SPECIFICATIONS.md` section 5.1 (2 bad usage; 3 refused connection, 502/503/504 and
+timeout; 4 enveloped `COLLECTION_NOT_FOUND`; 5 bare 404, other errors and non-JSON), each
+failure one `error:` sentence and a hint. `scripts/tests/test_distribution.py` (host, standard
+library) builds `package.sh`'s zip and `package-offline.sh`'s bundle from a copy of the tracked
+tree with excluded files planted and reads them back, runs `package-offline.sh` and
+`install-offline.sh` with `docker` and `sleep` replaced by logging stubs (nothing is saved,
+loaded or started), and checks the bundled image list against
+`docker compose config --images`. The copy is a real git repository with the tracked files
+committed (git ignoring the user's and the system's configuration), because both scripts
+archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
+real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
+such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+
+The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
+`ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
+`transfer_packages.py` (one per refusal above) and a missing file, each refused with its code
+and no collection created, a malformed copy refused by `replace` with the collection intact,
+the package's bytes, size and mtime unchanged by a `rename` import, the same chunks and scores
+from the original and the import for vector, hybrid and near-text retrieval (E11; `/query`
+rewrites the question with the LLM first, so answers are not compared), an export with models
+requested and the model store setting pointed at a missing folder (warning,
+`models_bundled: false`, no `models/`), the packaged `retrieve.py` exiting 3 against a closed
+port (E10) and, unless `RAG_SKIP_SLOW=1`, answering with the baked top-k and with `--top-k 2`
+(E8, E9) and from the import, and a re-chunk after the retained original is replaced with blank
+text failing `SOURCES_REQUIRED`. `sweep_stale_workdirs` (TR:C30) is covered by
+`test_startup_sweep.py`.
+
 `scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
 an import job of a digest-valid package embedded with another model is refused
 `EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
@@ -194,6 +251,20 @@ no promise of re-embedding; a same-name package of another width is refused too.
 It also checks that a model installed from a package is confirmed through Ollama's
 model list: reported, not reported, and Ollama unreachable. Only Ollama is
 replaced. `05_transfer.sh` runs it in the verify project's API container.
+
+`scripts/tests/test_import_guard.py` (#391) runs concurrent import jobs with
+Weaviate mocked: two spellings of one package file (`./x.tar.gz`, `a/../x.tar.gz`)
+answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
+building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
+`on_conflict`, never builds, and leaves the first job's in-progress marker in place;
+imports into different targets run side by side; a `rename` claims its new name and
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -361,10 +432,13 @@ names, and only a real directory or regular file as the name says: completed pac
 anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
 removed directory, and sizes don't count what links point at. A failed removal is logged and
 not reported as removed, and a missing exports folder is not created. A real lifespan run in a
-child process removes both kinds and logs them by name and size. `02_ingest.sh` runs it in the
-API container. With `RAG_ALLOW_RESTART=1`, `05_transfer.sh` checks after its export restart
-that the interrupted export's build directory and temporary archive are gone, without removing
-anything itself, and that the completed package from the top of the suite is still there.
+child process removes both kinds and logs them by name and size. A second one, whose export
+sweep fails, logs the error and still starts, with the ingest staging removed (#423).
+`02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
+that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+directory and temporary archive are gone, without removing anything itself, and that the
+completed package from the top of the suite is still there.
 
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
@@ -403,7 +477,7 @@ sent, and nothing run, created or saved; a collection Weaviate reports missing i
 `COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
 create (#366).
 Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
-the JSON 503 reaches the client (#369).
+the JSON 503 reaches the client (#369), also the tune starts' re-chunk check one (#409).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
@@ -516,7 +590,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
-| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged; registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -543,13 +617,19 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
-| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`; run in the API image with no network, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
+| `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
+| `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
+| `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -734,7 +814,15 @@ answers every `/api/` call from the Gold Standard page by request interception
 safe and shortened to 128 characters as the API's default is; that Export opens the
 download URL with the filename encoded; that a review row expands to the first 300
 characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
-an empty field disables Generate with a message and sends no request. A second
+an empty field disables Generate with a message and sends no request. Its #380 half
+checks how a generation ends and the guards on actions in flight: the outcome shown for a
+completed, partially failed, failed, cancelled and empty-collection session (headline, failed
+pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
+the message, enables Generate and is cleared by Load / refresh; a second Generate click in the
+window before the first poll sends no request and asks no confirm; Regenerate is disabled for
+the running pair only and repeated clicks send one request; and a refused edit (422) keeps the
+modal open with the typed values and the message, and each edit sends only the changed fields.
+A second
 Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
 real: a save answered in 1 s opens the download tab, and a control answered after
 6 s (past Chromium's user-activation window) opens none. That tab sends one
@@ -834,7 +922,12 @@ JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logge
 `POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
 200 with `created_at` `null`, with updates resuming once the file is readable again. It also
 checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
-the `IMPLEMENTATION.md` copy of `api/routers/collections.py`.
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`. It also checks (#445) that a save
+fsyncs the registry's folder after the replace and closes it, that a failed folder fsync fails
+the save with the new file in place and no temporary file, and that API startup (the lifespan,
+in a child process with the backend sweeps mocked) removes `.collection_registry.json.*.tmp`
+leftovers while keeping the registry, other files, files in subfolders and what a link points
+to, logging a leftover it can't remove.
 
 Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
 runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
@@ -846,9 +939,12 @@ with only `question` and `collection` reaches the pipeline with the defaults (`h
 search with the end-user prompt; the reformulation, end-user and engineer prompts and their
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
-from the defaults, and one that isn't JSON or can't be read gives the defaults with
-`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
-instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type (also a fractional
+or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
+and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
+and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
+finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -865,9 +961,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
