@@ -1620,7 +1620,8 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from models.schemas import (SEARCH_EF_MAX, SEARCH_EF_MIN, RetrievalConfigResponse,
+                            SaveRetrievalConfigBody)
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1668,16 +1669,35 @@ def load(collection: str) -> dict | None:
         return None
 
 
-def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+def merged(collection: str) -> tuple[dict, bool]:
+    """Return (saved settings over the defaults, is_default), as saved.
+
+    Raises TypeError when the saved JSON is not an object. Export uses this rather
+    than resolve(), so it can refuse bad saved settings with a next step.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
     # Fill in any key added since the file was written, so an older config does
     # not lose a field that callers now expect.
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
-    return merged, False
+    config = {"collection": collection, **DEFAULTS, **saved}
+    config["collection"] = collection
+    return config, False
+
+
+def resolve(collection: str) -> tuple[dict, bool]:
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object or a field of
+    the wrong type (#439), are logged and give the defaults, like an unreadable file.
+    """
+    try:
+        config, is_default = merged(collection)
+        RetrievalConfigResponse.model_validate({**config, "is_default": is_default})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid retrieval config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
+    return config, is_default
 
 
 def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
@@ -6067,9 +6087,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -12506,6 +12526,30 @@ function defaultExportName(collection: string, now = new Date()): string {
   return safe.slice(0, 128 - suffix.length) + suffix
 }
 
+type Outcome = { tone: 'ok' | 'warn' | 'error'; lines: string[]; reasons: string[] }
+
+// What a settled session ended as (#380): its status, the pairs that failed and
+// why. null while it is still generating.
+function outcomeOf(s: Session): Outcome | null {
+  if (s.status === 'generating') return null
+  const failed = s.pairs_failed ?? 0
+  const failedLine = `${failed} of ${s.pairs_total} pairs failed.`
+  const counts = new Map<string, number>()
+  for (const reason of s.errors ?? []) counts.set(reason, (counts.get(reason) ?? 0) + 1)
+  const all = [...counts].map(([reason, n]) => n > 1 ? `${reason} (x${n})` : reason)
+  const reasons = all.slice(0, 5)
+  if (all.length > 5) reasons.push(`and ${all.length - 5} more reasons`)
+  if (s.status === 'completed') {
+    if (s.pairs_total === 0) return { tone: 'warn', lines: ['No pairs were generated: the collection has no chunks.'], reasons }
+    const lines = [`Generation completed: ${s.pairs_completed} of ${s.pairs_total} pairs generated.`]
+    if (failed > 0) lines.push(`${failed} pairs failed and are missing from the review list.`)
+    return { tone: failed > 0 ? 'warn' : 'ok', lines, reasons }
+  }
+  if (s.status === 'failed') return { tone: 'error', lines: ['Generation failed.', ...(failed > 0 ? [failedLine] : [])], reasons }
+  if (s.status === 'cancelled') return { tone: 'warn', lines: ['Generation was cancelled.', ...(failed > 0 ? [failedLine] : [])], reasons }
+  return { tone: 'warn', lines: [`Generation ended with status ${s.status}.`], reasons }
+}
+
 export default function GoldStandardPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -12527,6 +12571,13 @@ export default function GoldStandardPage() {
   const [editQuestion, setEditQuestion] = useState('')
   const [editAnswer, setEditAnswer] = useState('')
   const [editGroundTruth, setEditGroundTruth] = useState('')
+  // A poll that failed stops polling and says so (#380).
+  const [pollError, setPollError] = useState('')
+  // Pairs whose regenerate request is running, as `sessionId/pairId` (#380).
+  const [regenerating, setRegenerating] = useState<string[]>([])
+  const regeneratingRef = useRef(new Set<string>())
+  // A failed edit keeps the modal open and says why (#380).
+  const [editError, setEditError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
@@ -12548,7 +12599,11 @@ export default function GoldStandardPage() {
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
-      } catch { /* ignore */ }
+      } catch (e: unknown) {
+        if (!active || activeSessionRef.current !== sessionId) return
+        clearInterval(pollRef.current!)
+        setPollError(`Could not read the generation's progress: ${e instanceof Error ? e.message : String(e)}. Polling stopped; use Load / refresh session to check again.`)
+      }
     }, 2000)
     return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
@@ -12562,7 +12617,7 @@ export default function GoldStandardPage() {
     if (!id || exportPendingRef.current) return
     activeSessionRef.current = ''
     setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
-    setError(''); setSaveResult(''); setLoading(true)
+    setError(''); setPollError(''); setSaveResult(''); setLoading(true)
     try {
       const loaded = await api.getSession(id)
       activeSessionRef.current = loaded.session_id
@@ -12574,9 +12629,10 @@ export default function GoldStandardPage() {
   }
 
   async function generate() {
-    if (!sampleSizeValid) return
+    if (!sampleSizeValid || loading || running) return
     if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
+    setPollError('')
     setLoading(true)
     setSaveResult('')
     try {
@@ -12593,12 +12649,14 @@ export default function GoldStandardPage() {
     }
   }
 
-  async function patchPair(pairId: string, status: string, updates?: { question?: string; answer?: string; ground_truth?: string }) {
+  function applyPair(pairId: string, updated: GoldPair) {
+    setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+  }
+
+  async function patchPair(pairId: string, status: string) {
     if (!sessionId) return
-    const body = { status, ...updates }
     try {
-      const updated = await api.patchPair(sessionId, pairId, body)
-      setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+      applyPair(pairId, await api.patchPair(sessionId, pairId, { status }))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -12606,11 +12664,15 @@ export default function GoldStandardPage() {
 
   async function regenerate(pairId: string) {
     if (!sessionId) return
+    const key = `${sessionId}/${pairId}`
+    if (regeneratingRef.current.has(key)) return
+    regeneratingRef.current.add(key); setRegenerating(Array.from(regeneratingRef.current))
     try {
-      const updated = await api.regeneratePair({ session_id: sessionId, pair_id: pairId })
-      setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
+      applyPair(pairId, await api.regeneratePair({ session_id: sessionId, pair_id: pairId }))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      regeneratingRef.current.delete(key); setRegenerating(Array.from(regeneratingRef.current))
     }
   }
 
@@ -12632,16 +12694,23 @@ export default function GoldStandardPage() {
     setEditQuestion(pair.question)
     setEditAnswer(pair.answer)
     setEditGroundTruth(pair.ground_truth)
+    setEditError('')
   }
 
+  // Only the fields that changed are sent; a refused edit keeps the modal open
+  // with what was typed (#380).
   async function submitEdit() {
-    if (!editingPair) return
-    await patchPair(editingPair.pair_id, 'edited', {
-      question: editQuestion,
-      answer: editAnswer,
-      ground_truth: editGroundTruth,
-    })
-    setEditingPair(null)
+    if (!editingPair || !sessionId) return
+    const updates: { question?: string; answer?: string; ground_truth?: string } = {}
+    if (editQuestion !== editingPair.question) updates.question = editQuestion
+    if (editAnswer !== editingPair.answer) updates.answer = editAnswer
+    if (editGroundTruth !== editingPair.ground_truth) updates.ground_truth = editGroundTruth
+    try {
+      applyPair(editingPair.pair_id, await api.patchPair(sessionId, editingPair.pair_id, { status: 'edited', ...updates }))
+      setEditingPair(null)
+    } catch (e: unknown) {
+      setEditError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   const approved = session?.pairs.filter(p => p.status === 'approved').length ?? 0
@@ -12651,6 +12720,9 @@ export default function GoldStandardPage() {
   // An empty field reads as 0, so it is refused too (#393).
   const sampleSizeValid = Number.isInteger(sampleSize) && sampleSize >= 1 && sampleSize <= 100
   const historical = Boolean(session?.stale || session?.orphaned)
+  // A start or generation is running until the session settles, unless polling stopped on an error (#380).
+  const running = !pollError && Boolean(sessionId) && (session === null || session.status === 'generating')
+  const outcome = session ? outcomeOf(session) : null
   const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
@@ -12670,19 +12742,30 @@ export default function GoldStandardPage() {
             <label htmlFor="sample-size" className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
             <input id="sample-size" type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading || exportPending || !sampleSizeValid} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || running || exportPending || !sampleSizeValid} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
         {!sampleSizeValid && <p role="alert" className="text-red-600 text-sm mt-3">Sample size must be a whole number from 1 to 100.</p>}
         {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
-        {session && session.status === 'generating' && (
+        {session && session.status === 'generating' && !pollError && (
           <div className="mt-3">
             <p className="text-sm text-blue-600">Generating… {session.pairs_attempted ?? session.pairs_completed}/{session.pairs_total} pairs</p>
             <div className="w-full bg-gray-200 rounded h-2 mt-1">
               <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${session.pairs_total > 0 ? ((session.pairs_attempted ?? session.pairs_completed) / session.pairs_total) * 100 : 0}%` }} />
             </div>
+          </div>
+        )}
+        {pollError && <p role="alert" className="text-red-600 text-sm mt-3">{pollError}</p>}
+        {outcome && (
+          <div role={outcome.tone === 'ok' ? 'status' : 'alert'} className={`mt-3 border rounded p-3 text-sm ${outcome.tone === 'ok' ? 'border-green-300 bg-green-50 text-green-800' : outcome.tone === 'warn' ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-red-300 bg-red-50 text-red-800'}`}>
+            {outcome.lines.map(line => <p key={line}>{line}</p>)}
+            {outcome.reasons.length > 0 && (
+              <ul className="list-disc ml-5 mt-1 text-xs">
+                {outcome.reasons.map(reason => <li key={reason}>{reason}</li>)}
+              </ul>
+            )}
           </div>
         )}
       </div>
@@ -12728,7 +12811,7 @@ export default function GoldStandardPage() {
                   <button onClick={e => { e.preventDefault(); patchPair(pair.pair_id, 'approved') }} className="text-green-600 hover:text-green-800 text-lg leading-none" title="Approve">✓</button>
                   <button onClick={e => { e.preventDefault(); openEdit(pair) }} className="text-blue-500 hover:text-blue-700 text-sm" title="Edit">✎</button>
                   <button onClick={e => { e.preventDefault(); patchPair(pair.pair_id, 'rejected') }} className="text-red-500 hover:text-red-700 text-sm" title="Reject">✕</button>
-                  <button onClick={e => { e.preventDefault(); regenerate(pair.pair_id) }} className="text-gray-400 hover:text-gray-600 text-sm" title="Regenerate">↺</button>
+                  <button onClick={e => { e.preventDefault(); regenerate(pair.pair_id) }} disabled={regenerating.includes(`${sessionId}/${pair.pair_id}`)} className="text-gray-400 hover:text-gray-600 text-sm disabled:opacity-50" title={regenerating.includes(`${sessionId}/${pair.pair_id}`) ? 'Regenerating...' : 'Regenerate'}>↺</button>
                 </summary>
                 <div className="px-3 pb-3 space-y-2 text-xs text-gray-600">
                   <div><strong>Answer:</strong> {pair.answer}</div>
@@ -12769,6 +12852,7 @@ export default function GoldStandardPage() {
             <textarea value={editAnswer} onChange={e => setEditAnswer(e.target.value)} rows={2} className="w-full border rounded px-2 py-1 text-sm mb-3" />
             <label className="block text-xs text-gray-600 mb-1">Ground Truth</label>
             <textarea value={editGroundTruth} onChange={e => setEditGroundTruth(e.target.value)} rows={2} className="w-full border rounded px-2 py-1 text-sm mb-4" />
+            {editError && <p role="alert" className="text-red-600 text-sm mb-3">{editError}</p>}
             <div className="flex justify-end gap-2">
               <button onClick={() => setEditingPair(null)} className="text-sm text-gray-500">Cancel</button>
               <button onClick={submitEdit} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Save</button>
@@ -13668,6 +13752,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -13916,10 +14005,13 @@ names, and only a real directory or regular file as the name says: completed pac
 anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
 removed directory, and sizes don't count what links point at. A failed removal is logged and
 not reported as removed, and a missing exports folder is not created. A real lifespan run in a
-child process removes both kinds and logs them by name and size. `02_ingest.sh` runs it in the
-API container. With `RAG_ALLOW_RESTART=1`, `05_transfer.sh` checks after its export restart
-that the interrupted export's build directory and temporary archive are gone, without removing
-anything itself, and that the completed package from the top of the suite is still there.
+child process removes both kinds and logs them by name and size. A second one, whose export
+sweep fails, logs the error and still starts, with the ingest staging removed (#423).
+`02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
+that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+directory and temporary archive are gone, without removing anything itself, and that the
+completed package from the top of the suite is still there.
 
 `scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
 same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
@@ -13958,7 +14050,7 @@ sent, and nothing run, created or saved; a collection Weaviate reports missing i
 `COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
 create (#366).
 Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
-the JSON 503 reaches the client (#369).
+the JSON 503 reaches the client (#369), also the tune starts' re-chunk check one (#409).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
@@ -14279,7 +14371,15 @@ answers every `/api/` call from the Gold Standard page by request interception
 safe and shortened to 128 characters as the API's default is; that Export opens the
 download URL with the filename encoded; that a review row expands to the first 300
 characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
-an empty field disables Generate with a message and sends no request. A second
+an empty field disables Generate with a message and sends no request. Its #380 half
+checks how a generation ends and the guards on actions in flight: the outcome shown for a
+completed, partially failed, failed, cancelled and empty-collection session (headline, failed
+pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
+the message, enables Generate and is cleared by Load / refresh; a second Generate click in the
+window before the first poll sends no request and asks no confirm; Regenerate is disabled for
+the running pair only and repeated clicks send one request; and a refused edit (422) keeps the
+modal open with the typed values and the message, and each edit sends only the changed fields.
+A second
 Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
 real: a save answered in 1 s opens the download tab, and a control answered after
 6 s (past Chromium's user-activation window) opens none. That tab sends one
@@ -14391,9 +14491,10 @@ with only `question` and `collection` reaches the pipeline with the defaults (`h
 search with the end-user prompt; the reformulation, end-user and engineer prompts and their
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
-from the defaults, and one that isn't JSON or can't be read gives the defaults with
-`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
-instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type gives the
+defaults with `is_default: true` and a warning, while coercible and out-of-range values are
+still served as saved (#439). `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -14410,9 +14511,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -15299,6 +15404,30 @@ restart_refusal_reason() {
   elif [ "$project" = "rag-docker" ]; then
     printf 'restarts never run against the live rag-docker project (#152)'
   fi
+}
+
+# Prints why removing the project's volumes (`docker compose down -v`) must not
+# run here, or nothing (#465). Only the verify project as stack.sh sets it up:
+# COMPOSE_PROJECT_NAME rag-verify and a COMPOSE_FILE that includes the overlay
+# docker-compose.verify.yml, whose model volume is external and so kept. Any
+# other project would lose all its volumes, models included.
+volume_removal_refusal_reason() {
+  local reason sep="${COMPOSE_PATH_SEPARATOR:-:}" rest entry
+  reason=$(restart_refusal_reason)
+  if [ -n "$reason" ]; then printf '%s' "$reason"; return 0; fi
+  if [ "$COMPOSE_PROJECT_NAME" != rag-verify ]; then
+    printf "volumes are removed only on the verify project rag-verify, not '%s'; run it through scripts/verify/stack.sh" "$COMPOSE_PROJECT_NAME"
+    return 0
+  fi
+  # Split as compose splits COMPOSE_FILE; only that exact file name counts.
+  rest="${COMPOSE_FILE:-}"
+  while [ -n "$rest" ]; do
+    entry="${rest%%"$sep"*}"
+    [ "${entry##*/}" = docker-compose.verify.yml ] && return 0
+    [ "$entry" = "$rest" ] && break
+    rest="${rest#*"$sep"}"
+  done
+  printf 'COMPOSE_FILE does not include docker-compose.verify.yml, whose model volume is kept; run it through scripts/verify/stack.sh'
 }
 
 # Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
@@ -16569,19 +16698,26 @@ ENDPY
     fi
 
     # First start: no volumes but the model copy, which is external and kept by
-    # `down -v`. The model pull isn't timed: the verify project copies the models.
-    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
-    started=$(python3 -c "import time;print(time.time())")
-    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
-    up_ok=$?
-    took=$(python3 -c "import time;print(int(time.time()-$started))")
-    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
-    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
-      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
-    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
-    # It started from nothing: the collection made above is gone with its volume.
-    check_eq "that first start began with no collections" \
-      "$(api_get "/collections" | jfield "['collections']")" "[]"
+    # `down -v`, so the models are already present, as SPECIFICATIONS.md's
+    # criterion says; the pull from empty is a recorded manual measurement (#465).
+    # Only on the verify project: elsewhere `down -v` would remove every volume.
+    removal_refusal=$(volume_removal_refusal_reason)
+    if [ -n "$removal_refusal" ]; then
+      check "a first start from empty volumes brings every service healthy within 300s" 1 "$removal_refusal"
+    else
+      (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+      started=$(python3 -c "import time;print(time.time())")
+      (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+      up_ok=$?
+      took=$(python3 -c "import time;print(int(time.time()-$started))")
+      [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+      check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+        "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+      wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # It started from nothing: the collection made above is gone with its volume.
+      check_eq "that first start began with no collections" \
+        "$(api_get "/collections" | jfield "['collections']")" "[]"
+    fi
   fi
 fi
 
@@ -17367,9 +17503,17 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     none_job=$(jfield "['job_id']" < /tmp/vfy_restart_none_start.json)
     sleep 2
     api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
+    # The running jobs' upload staging, which the restart kills in place (#377).
+    staged=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/ingest-* 2>/dev/null' | sort)
+    check "the interrupted ingests have ingest-* staging for the restart to sweep" \
+      "$([ -n "$staged" ] && echo 0 || echo 1)" "no /app/uploads/ingest-* while the jobs ran"
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@"; do if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi; done; echo checked' sh $staged)
+    check "the restart removes the interrupted ingests' upload staging" \
+      "$([ -n "$staged" ] && [ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
     api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done_after.json
     python3 -c "
 import json,sys
@@ -26503,7 +26647,10 @@ if (require.main === module) (async () => {
 ```javascript
 // Gold Standard page details (#393): the default export name, the encoded
 // download URL with the popup blocker on, the review row preview and the sample
-// size bounds. Every /api/ call from the page is answered here; no backend writes.
+// size bounds. Generation outcomes and the guards on actions in flight (#380):
+// the final status, failed pairs and reasons, a stopped poll, Generate and
+// Regenerate while they run, and a refused edit. Every /api/ call from the page
+// is answered here; no backend writes.
 const { sleep, setValue, clickByText, bodyText, makeReporter } = require('./lib');
 
 const SESSION = 'gs_0393abcd';
@@ -26518,19 +26665,29 @@ const LONG = 'L'.repeat(140);
 const pair = { pair_id: 'p1', question: 'Fixture question 393', answer: 'Fixture answer', contexts: [CONTEXT], ground_truth: 'Fixture answer', source_file: 'fixture.txt', chunk_index: 0, status: 'approved' };
 const sessionBody = collection => ({ session_id: SESSION, collection, status: 'completed', pairs_total: 1, pairs_completed: 1, pairs: [pair] });
 const json = (request, status, body) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(body) });
+const apiError = (status, message) => ({ status, body: { error: { code: 'FIXTURE', message, detail: null } } });
+const pair2 = { ...pair, pair_id: 'p2', question: 'Second question 380', status: 'pending' };
 
 // A page whose /api/ calls are all answered by `opts`; window.open is recorded
 // (and opens nothing) unless realOpen is set.
 async function fixture(browser, base, opts = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
-  const errors = [], generates = [];
+  const errors = [], generates = [], polls = [], patches = [], regenerates = [], dialogs = [];
   page.on('pageerror', e => errors.push(e.message));
+  page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
   await page.evaluateOnNewDocument(realOpen => {
     sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     window.__opened = [];
     if (!realOpen) window.open = url => { window.__opened.push(String(url)); return null; };
   }, !!opts.realOpen);
+  if (opts.pollMs) {
+    // The page polls every 2 s; a case that needs more polls asks for a shorter delay.
+    await page.evaluateOnNewDocument(ms => {
+      const si = window.setInterval.bind(window);
+      window.setInterval = (fn, delay, ...rest) => si(fn, delay === 2000 ? ms : delay, ...rest);
+    }, opts.pollMs);
+  }
   await page.setRequestInterception(true);
   page.on('request', async request => {
     const path = new URL(request.url()).pathname;
@@ -26540,9 +26697,29 @@ async function fixture(browser, base, opts = {}) {
     }
     if (path === '/api/goldstandard/generate') {
       generates.push(JSON.parse(request.postData() || '{}'));
+      if (opts.generateDelay) await sleep(opts.generateDelay);
       return json(request, 200, { session_id: SESSION, status: 'generating', pairs_total: 1 });
     }
-    if (path === '/api/goldstandard/session/' + SESSION) return json(request, 200, sessionBody(opts.collection || 'FixtureGold'));
+    if (path === '/api/goldstandard/session/' + SESSION && request.method() === 'GET') {
+      polls.push(Date.now());
+      const answer = opts.session ? opts.session(polls.length) : null;
+      if (answer) return json(request, answer.status || 200, answer.body);
+      return json(request, 200, sessionBody(opts.collection || 'FixtureGold'));
+    }
+    if (path.startsWith('/api/goldstandard/session/' + SESSION + '/pair/') && request.method() === 'PATCH') {
+      const body = JSON.parse(request.postData() || '{}');
+      patches.push(body);
+      const answer = opts.patch ? opts.patch(patches.length) : null;
+      if (answer) return json(request, answer.status, answer.body);
+      const target = [pair, pair2].find(x => x.pair_id === path.split('/').pop());
+      return json(request, 200, { ...target, ...body });
+    }
+    if (path === '/api/goldstandard/regenerate') {
+      const body = JSON.parse(request.postData() || '{}');
+      regenerates.push(body);
+      if (opts.regenerateDelay) await sleep(opts.regenerateDelay);
+      return json(request, 200, { ...[pair, pair2].find(x => x.pair_id === body.pair_id), question: 'Regenerated question 380', status: 'pending' });
+    }
     if (path === '/api/goldstandard/save') {
       if (opts.saveDelay) await sleep(opts.saveDelay);
       return json(request, 200, { filename: SAVED, pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/' + SAVED, historical: false, session_validity: { stale: false } });
@@ -26551,7 +26728,7 @@ async function fixture(browser, base, opts = {}) {
   });
   await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
   await sleep(300);
-  return { ctx, page, errors, generates };
+  return { ctx, page, errors, generates, polls, patches, regenerates, dialogs };
 }
 
 const filenameValue = page => page.evaluate(() => document.querySelector('input[placeholder="filename.json"]')?.value ?? null);
@@ -26560,6 +26737,34 @@ async function lookup(page) {
   await setValue(page, '() => document.getElementById("retained-session")', SESSION);
   await sleep(100); await clickByText(page, 'Load / refresh session'); await sleep(400);
 }
+
+// Polls the page until fn(arg) is true, for up to 8 s.
+async function until(page, fn, arg) {
+  for (let i = 0; i < 80; i++) {
+    if (await page.evaluate(fn, arg)) return true;
+    await sleep(100);
+  }
+  return false;
+}
+const button = (page, text) => page.evaluate(t => {
+  const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === t);
+  return b ? { disabled: b.disabled } : null;
+}, text);
+const generateState = page => button(page, 'Generate Pairs');
+// A row's action button, found by the row's question and the button's title.
+const rowButton = (page, question, title) => page.evaluate((q, t) => {
+  const d = [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q);
+  const b = d && [...d.querySelectorAll('summary button')].find(x => x.title === t || x.title === 'Regenerating...' && t === 'Regenerate');
+  return b ? { disabled: b.disabled, title: b.title } : null;
+}, question, title);
+const clickRow = (page, question, title) => page.evaluate((q, t) => {
+  const d = [...document.querySelectorAll('details')].find(x => x.querySelector('summary .font-medium')?.textContent.trim() === q);
+  const b = d && [...d.querySelectorAll('summary button')].find(x => x.title === t || x.title === 'Regenerating...' && t === 'Regenerate');
+  if (!b) return false; b.click(); return true;
+}, question, title);
+const page_modalAlert = page => page.evaluate(() => document.querySelector('.fixed [role=alert]')?.textContent.trim() ?? null);
+const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(x => x.textContent.replace(/\s+/g, ' ').trim()));
+const fields = page => page.evaluate(() => [...document.querySelectorAll('.fixed textarea')].map(t => t.value));
 
 async function runGoldStandardPageTests(browser, base, r) {
   r.section('Gold Standard page details (#393)');
@@ -26629,6 +26834,123 @@ async function runGoldStandardPageTests(browser, base, r) {
     await setValue(s.page, '() => document.querySelector("input[type=number]")', '100'); await sleep(100);
     const ok = await state();
     r.check('sample size 100 enables Generate and removes the message', !ok.disabled && !ok.message, JSON.stringify(ok));
+  });
+
+  r.section('Gold Standard outcomes and in-flight guards (#380)');
+  const settled = over => ({ ...sessionBody('FixtureGold'), pairs_attempted: 1, pairs_failed: 0, errors: [], ...over });
+  const distinct = n => Array.from({ length: n }, (_, i) => `PAIR_GENERATION_FAILED: reason ${i + 1}`);
+
+  const outcomes = [
+    ['completed', settled({ pairs_total: 3, pairs_completed: 3 }),
+      ['Generation completed: 3 of 3 pairs generated.'], ['failed', 'no chunks'], false],
+    ['completed with failed pairs', settled({ pairs_total: 4, pairs_completed: 1, pairs_failed: 3, errors: ['TimeoutError: slow model', 'TimeoutError: slow model', 'ValueError: bad json'] }),
+      ['Generation completed: 1 of 4 pairs generated.', '3 pairs failed and are missing from the review list.', 'TimeoutError: slow model (x2)', 'ValueError: bad json'], ['no chunks'], true],
+    ['failed', settled({ status: 'failed', pairs_total: 7, pairs_completed: 0, pairs_failed: 7, pairs: [], errors: distinct(7) }),
+      ['Generation failed.', '7 of 7 pairs failed.', 'reason 1', 'reason 5', 'and 2 more reasons'], ['reason 6', 'Generation completed'], true],
+    ['cancelled', settled({ status: 'cancelled', pairs_total: 5, pairs_completed: 0, pairs_failed: 0, pairs: [] }),
+      ['Generation was cancelled.'], ['Generation completed'], true],
+    ['empty collection', settled({ pairs_total: 0, pairs_completed: 0, pairs: [] }),
+      ['No pairs were generated: the collection has no chunks.'], ['Generation failed'], true],
+  ];
+  for (const [name, body, want, notWant, isAlert] of outcomes) {
+    await run('outcome ' + name, { session: () => ({ body }) }, async s => {
+      await lookup(s.page);
+      const text = await bodyText(s.page);
+      const missing = want.filter(w => !text.includes(w)), extra = notWant.filter(w => text.includes(w));
+      r.check(`outcome, ${name}: the page shows it`, missing.length === 0 && extra.length === 0, JSON.stringify({ missing, extra, text: text.slice(0, 300) }));
+      const roles = await alerts(s.page);
+      r.check(`outcome, ${name}: it is ${isAlert ? 'an alert' : 'a status, not an alert'}`, roles.some(a => a.includes(want[0])) === isAlert, JSON.stringify(roles));
+    });
+  }
+
+  await run('generate guard', {
+    pollMs: 700, generateDelay: 100,
+    session: n => ({ body: n < 3 ? settled({ status: 'generating', pairs_total: 2, pairs_attempted: 0, pairs_completed: 0, pairs: [] }) : settled({ pairs_total: 2, pairs_completed: 2 }) }),
+  }, async s => {
+    await clickByText(s.page, 'Generate Pairs');
+    await sleep(350); // the start is answered; the first poll is still due
+    r.check('Generate is disabled between the start being accepted and the first poll', (await generateState(s.page)).disabled === true, JSON.stringify(await generateState(s.page)));
+    await s.page.evaluate(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').click());
+    await sleep(100);
+    r.check('a click in that window starts no second session and asks no confirm', s.generates.length === 1 && s.dialogs.length === 0, JSON.stringify({ generates: s.generates.length, dialogs: s.dialogs }));
+    r.check('while the session is generating the progress shows and Generate stays disabled', await until(s.page, () => document.body.innerText.includes('Generating') && [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').disabled));
+    r.check('when it completes the outcome shows and Generate is enabled again', await until(s.page, () => document.body.innerText.includes('Generation completed: 2 of 2 pairs generated.') && ![...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').disabled), JSON.stringify(await generateState(s.page)));
+  });
+
+  await run('generating session loaded by id', {
+    session: () => ({ body: settled({ status: 'generating', pairs_total: 2, pairs_attempted: 0, pairs_completed: 0, pairs: [] }) }),
+  }, async s => {
+    await lookup(s.page);
+    r.check('a retained session still generating disables Generate', (await generateState(s.page)).disabled === true, JSON.stringify(await generateState(s.page)));
+  });
+
+  for (const [label, failure] of [['an outage', apiError(503, 'Synthetic outage.')], ['a missing session', apiError(404, 'Synthetic missing session.')]]) {
+    const ctl = { fail: true };
+    await run('poll error, ' + label, {
+      pollMs: 150,
+      session: n => (n >= 2 && ctl.fail) ? failure : { body: n >= 2 ? settled({ pairs_total: 2, pairs_completed: 2 }) : settled({ status: 'generating', pairs_total: 2, pairs_attempted: 0, pairs_completed: 0, pairs: [] }) },
+    }, async s => {
+      await lookup(s.page);
+      const shown = await until(s.page, () => document.body.innerText.includes('Could not read the generation'));
+      const message = (await alerts(s.page)).find(a => a.includes('Could not read the generation')) || '';
+      r.check(`${label} while polling is shown with its reason and the way back`, shown && message.includes(failure.body.error.message) && message.includes('Polling stopped; use Load / refresh session to check again.'), message);
+      const count = s.polls.length;
+      await sleep(900);
+      r.check(`${label} stops the polling`, s.polls.length === count, `${count} -> ${s.polls.length}`);
+      r.check(`${label} releases Generate and drops the stale progress`, (await generateState(s.page)).disabled === false && !(await bodyText(s.page)).includes('Generating'), JSON.stringify(await generateState(s.page)));
+      ctl.fail = false;
+      await clickByText(s.page, 'Load / refresh session');
+      r.check(`Load / refresh after ${label} clears the message and shows the outcome`, await until(s.page, () => document.body.innerText.includes('Generation completed: 2 of 2 pairs generated.') && !document.body.innerText.includes('Could not read the generation')));
+    });
+  }
+
+  await run('regenerate guard', {
+    regenerateDelay: 700, session: () => ({ body: settled({ pairs_total: 2, pairs_completed: 2, pairs: [pair, pair2] }) }),
+  }, async s => {
+    await lookup(s.page);
+    await clickRow(s.page, pair.question, 'Regenerate');
+    await sleep(150);
+    await clickRow(s.page, pair.question, 'Regenerate');
+    const busy = await rowButton(s.page, pair.question, 'Regenerate'), other = await rowButton(s.page, pair2.question, 'Regenerate');
+    r.check('while a pair regenerates its Regenerate button is disabled and says so', busy && busy.disabled && busy.title === 'Regenerating...', JSON.stringify(busy));
+    r.check('another pair\'s Regenerate button stays enabled', other && !other.disabled, JSON.stringify(other));
+    await sleep(100);
+    r.check('repeated clicks send one regenerate request', s.regenerates.length === 1, JSON.stringify(s.regenerates));
+    r.check('when it ends the pair is replaced and its button is enabled again', await until(s.page, () => document.body.innerText.includes('Regenerated question 380')) && (await rowButton(s.page, 'Regenerated question 380', 'Regenerate')).disabled === false);
+  });
+
+  await run('refused edit', {
+    session: () => ({ body: settled({ pairs_total: 2, pairs_completed: 2, pairs: [pair, pair2] }) }),
+    patch: n => n === 1 ? apiError(422, 'Request parameters are invalid.') : null,
+  }, async s => {
+    await lookup(s.page);
+    await clickRow(s.page, pair.question, 'Edit');
+    await sleep(200);
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[0]', 'Typed question 380');
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[1]', '');
+    await clickByText(s.page, 'Save'); await sleep(500);
+    const open = (await bodyText(s.page)).includes('Edit Pair');
+    r.check('a refused edit keeps the modal open with the typed values', open && JSON.stringify(await fields(s.page)) === JSON.stringify(['Typed question 380', '', pair.ground_truth]), JSON.stringify(await fields(s.page)));
+    const inModal = await page_modalAlert(s.page);
+    r.check('the refusal is shown inside the modal', inModal === 'Request parameters are invalid.', String(inModal));
+    r.check('a refused edit sets no page-level error', await s.page.evaluate(() => ![...document.querySelectorAll('p.text-red-600')].some(x => !x.closest('.fixed'))));
+    r.check('the first edit sent only the changed fields', JSON.stringify(s.patches[0]) === JSON.stringify({ status: 'edited', question: 'Typed question 380', answer: '' }), JSON.stringify(s.patches));
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[1]', 'Typed answer 380');
+    await clickByText(s.page, 'Save');
+    r.check('a retry with the typed values saves, closes the modal and updates the row', await until(s.page, () => !document.body.innerText.includes('Edit Pair') && document.body.innerText.includes('Typed question 380')));
+    r.check('the retry sent the changed fields only', JSON.stringify(s.patches[1]) === JSON.stringify({ status: 'edited', question: 'Typed question 380', answer: 'Typed answer 380' }), JSON.stringify(s.patches));
+  });
+
+  await run('edit of one field', {
+    session: () => ({ body: settled({ pairs_total: 2, pairs_completed: 2, pairs: [pair, pair2] }) }),
+  }, async s => {
+    await lookup(s.page);
+    await clickRow(s.page, pair2.question, 'Edit');
+    await sleep(200);
+    await setValue(s.page, '() => document.querySelectorAll(".fixed textarea")[2]', 'Only the truth changed');
+    await clickByText(s.page, 'Save');
+    await until(s.page, () => !document.body.innerText.includes('Edit Pair'));
+    r.check('an edit of one field sends that field and the status only', JSON.stringify(s.patches) === JSON.stringify([{ status: 'edited', ground_truth: 'Only the truth changed' }]), JSON.stringify(s.patches));
   });
 
   // Puppeteer starts Chromium with --disable-popup-blocking; turn the blocker back
@@ -27404,9 +27726,9 @@ function goldCases() {
     } },
     (() => {
       const h = hold();
-      return { name: 'Generate sends the chosen collection and sample size once and is disabled until the start is answered', open: gold({
+      return { name: 'Generate sends the chosen collection and sample size once and is disabled until the start is answered and the session settles', open: gold({
         'POST /api/goldstandard/generate': () => h,
-        ['GET ' + SESSION]: json(200, session([], { status: 'generating', pairs_total: 4, pairs_attempted: 0, pairs_completed: 0 })) }), async run(s) {
+        ['GET ' + SESSION]: json(200, session(reviewPairs())) }, { fastPolls: true }), async run(s) {
         await waitSelected(s.page, 0);
         await fillNth(s.page, 'select', 0, B);
         await fill(s.page, 'input[type=number]', 5);

@@ -265,9 +265,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"

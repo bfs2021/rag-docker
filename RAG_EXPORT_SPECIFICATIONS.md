@@ -148,7 +148,9 @@ carry the corpus's parameters.
 ### 3.2 Endpoints
 
 - `GET /retrieval/config/{collection}` → the saved config, or the defaults above
-  with `is_default: true`, matching how `/ingest/config/{collection}` behaves.
+  with `is_default: true`, matching how `/ingest/config/{collection}` behaves. A saved
+  file that can't be read, isn't JSON, isn't a JSON object or has a field of the wrong
+  type is logged and also answered with the defaults (#439); export still refuses it (§5).
 - `POST /retrieval/config` → upsert; collection in the **body**, not the path.
 
 The path shape deliberately mirrors ingest config, including the asymmetry that
@@ -717,6 +719,23 @@ or when a step fails before the original is deleted. If marking gold-standard
 sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
 the original collection is unchanged, and the retained copy is discarded.
 
+### 7.5 Weaviate unreadable at a tune route
+
+A tune route that can't read Weaviate answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON
+error, with `detail` `{"collection": "<name>"}`; the cause is logged, not returned. Two checks
+can fail this way:
+
+- **The existence check** (#349): `POST /tune/rechunk`, `POST /tune/reembed`,
+  `POST /tune/reindex` and `GET /tune/{collection}` read Weaviate to check that the
+  collection exists. No job is created and nothing is registered.
+- **The re-chunk coverage check** (#340): `POST /tune/rechunk` and `POST /tune/reembed`
+  with chunking fields read the stored chunks to check that there is something to rebuild
+  (§13 E17), and `GET /tune/{collection}`, for a collection with retained originals, reads them to
+  decide whether to offer re-chunking. For a start, no job is created and its guards are released.
+
+A re-embed without chunking fields and a re-index don't run the coverage check. Try again
+when Weaviate is available.
+
 ---
 
 ## 8. Lifecycle Rules
@@ -787,7 +806,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SERVICE_UNAVAILABLE` | HTTP 503 from `POST /export`: Weaviate can't be read to check whether the collection exists; no job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (#366) |
+| `SERVICE_UNAVAILABLE` | HTTP 503: Weaviate can't be read to check whether the collection exists, from `POST /export` (#366) and from `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/{collection}` (#349); or can't be read for the re-chunk coverage check, from `POST /tune/rechunk`, `POST /tune/reembed` with chunking fields and `GET /tune/{collection}` (#340). No job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (§7.5) |
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
