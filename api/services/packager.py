@@ -471,7 +471,7 @@ def build(
                         b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        bundled.append(model.split(":")[0])
+                        bundled.append(model_bundle.model_ref(model))
         models_bundled = bool(bundled)
 
         if unresolved:

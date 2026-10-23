@@ -156,7 +156,7 @@ class PostInstallTests(unittest.TestCase):
         (self.store / 'models').mkdir(parents=True)
         self.pkg = self.root / 'package'
         self.model = 'review-model:latest'
-        src = self.pkg / 'models' / 'review-model'
+        src = self.pkg / 'models' / 'review-model' / 'latest'  # a folder per name and tag (#487)
         (src / 'blobs').mkdir(parents=True)
         contents = [b'ordinary config bytes', b'ordinary layer bytes']
         digests = ['sha256:' + hashlib.sha256(data).hexdigest() for data in contents]

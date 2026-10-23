@@ -6297,7 +6297,7 @@ def build(
                         b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        bundled.append(model.split(":")[0])
+                        bundled.append(model_bundle.model_ref(model))
         models_bundled = bool(bundled)
 
         if unresolved:
@@ -7616,7 +7616,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
     embed_model = settings.embed_model
     llm_model = settings.llm_model
-    bundled = model_bundle.bundled_models(pkg)
+    # `name:tag`; a folder counts only for the tag it holds (#487).
+    bundled = model_bundle.bundled_models(pkg, manifest)
 
     for model, required in ((embed_model, True), (llm_model, False)):
         if not model_bundle.supports_name(model):
@@ -7669,7 +7670,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {name}`, then import again.",
                 {"model": name})
-        if name not in bundled:
+        if model_bundle.model_ref(model) not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -7684,7 +7685,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
-            model_bundle.install_model(pkg, model)
+            model_bundle.install_model(pkg, model, manifest)
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
@@ -8142,6 +8143,11 @@ The manifest names every blob the model needs, so bundling resolves blobs
 2.3 GB across 9 blobs for two models; a naive copy would sweep up unrelated
 weights, and on a machine with other models pulled it would be far worse.
 
+In a package each model gets its own folder, `models/<name>/<tag>/`, so two
+tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+files. Packages built before #487 used `models/<name>/`; such a folder is used
+only for the one tag the package manifest gives that name.
+
 Copying the files verbatim is deliberate. Offline there is no registry to pull
 from, and rebuilding a model through Ollama's HTTP API would mean reconstructing
 its template, params and license from the config blob — a reproduction, not the
@@ -8180,6 +8186,12 @@ def split_ref(model: str) -> tuple[str, str]:
     if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
         raise ValueError("Model name and tag must be simple path components")
     return name, tag
+
+
+def model_ref(model: str) -> str:
+    """'phi3.5' -> 'phi3.5:latest': the name and tag a package folder holds."""
+    name, tag = split_ref(model)
+    return f"{name}:{tag}"
 
 
 def manifest_path(model: str) -> Path:
@@ -8287,9 +8299,10 @@ def is_installed(model: str) -> bool:
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
-    """Files to place under `models/<model>/`, as (relative path, source).
+    """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
-    Returns them rather than copying so the caller can digest each file into the
+    Each tag has its own folder, so two tags of one name never overwrite each
+    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
     package manifest as it is written.
     """
     mp = manifest_path(model)
@@ -8297,22 +8310,66 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
         raise FileNotFoundError(f"Ollama has no manifest for '{model}' at {mp}")
     manifest = json.loads(mp.read_text())
 
-    name, _ = split_ref(model)
-    files: list[tuple[str, Path]] = [(f"models/{name}/manifest.json", mp)]
+    name, tag = split_ref(model)
+    files: list[tuple[str, Path]] = [(f"models/{name}/{tag}/manifest.json", mp)]
     for digest in _digests(manifest):
         blob = blob_path(digest)
         if not blob.is_file():
             raise FileNotFoundError(
                 f"Model '{model}' references blob {digest} which is not in the store")
-        files.append((f"models/{name}/blobs/{digest.replace(':', '-')}", blob))
+        files.append((f"models/{name}/{tag}/blobs/{digest.replace(':', '-')}", blob))
     return files
 
 
-def bundled_models(pkg: Path) -> list[str]:
+def _legacy_tag(name: str, package_manifest) -> str | None:
+    """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
+
+    Those packages didn't record it. The package manifest names the embedding
+    model and the LLM; when exactly one tag of `name` is among them, the folder
+    holds that tag. Two tags of one name shared the folder, the last copy
+    overwriting the first's manifest, so the folder can't be trusted for either.
+    """
+    if not isinstance(package_manifest, dict):
+        return None
+    tags = set()
+    for section in ("embedding", "llm"):
+        entry = package_manifest.get(section)
+        model = entry.get("model") if isinstance(entry, dict) else None
+        if isinstance(model, str) and supports_name(model):
+            model_name, tag = split_ref(model)
+            if model_name == name:
+                tags.add(tag)
+    return tags.pop() if len(tags) == 1 else None
+
+
+def bundled_source(pkg: Path, model: str, package_manifest=None) -> Path | None:
+    """The package folder holding exactly this name and tag, or None."""
+    name, tag = split_ref(model)
+    folder = _contained(pkg, "models", name, tag)
+    if _contained(folder, "manifest.json").is_file():
+        return folder
+    legacy = _contained(pkg, "models", name)
+    if _contained(legacy, "manifest.json").is_file() and _legacy_tag(name, package_manifest) == tag:
+        return legacy
+    return None
+
+
+def bundled_models(pkg: Path, package_manifest=None) -> list[str]:
+    """`name:tag` of each model the package bundles, by the rules of `bundled_source`."""
     d = pkg / "models"
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
+    refs = set()
+    for folder in d.iterdir():
+        if not folder.is_dir():
+            continue
+        if (folder / "manifest.json").is_file():
+            tag = _legacy_tag(folder.name, package_manifest)
+            if tag is not None:
+                refs.add(f"{folder.name}:{tag}")
+        refs.update(f"{folder.name}:{sub.name}" for sub in folder.iterdir()
+                    if sub.is_dir() and (sub / "manifest.json").is_file())
+    return sorted(refs)
 
 
 def _publish(path: Path, write, *, replace: bool = True) -> None:
@@ -8341,19 +8398,20 @@ def _publish(path: Path, write, *, replace: bool = True) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def install_model(pkg: Path, model: str) -> None:
+def install_model(pkg: Path, model: str, package_manifest=None) -> None:
     """Verify all referenced bytes before publishing the captured manifest.
 
     Existing content is checked and reused unchanged. A corrupt existing blob
     is refused rather than replacing shared content behind other model names.
     An interrupted install can leave valid unreferenced blobs, never a newly
-    published manifest whose bytes were not checked.
+    published manifest whose bytes were not checked. Only a folder holding this
+    exact name and tag is installed (#487); `package_manifest` tells which tag
+    a pre-#487 folder holds.
     """
-    name, _ = split_ref(model)
-    src = _contained(pkg, "models", name)
-    src_manifest = _contained(src, "manifest.json")
-    if not src_manifest.is_file():
+    src = bundled_source(pkg, model, package_manifest)
+    if src is None:
         raise FileNotFoundError(f"Package does not bundle '{model}'")
+    src_manifest = _contained(src, "manifest.json")
     manifest_bytes = src_manifest.read_bytes()
     digests = _digests(json.loads(manifest_bytes))
     destination = manifest_path(model)
@@ -13714,8 +13772,8 @@ with tempfile.TemporaryDirectory(prefix='model-integrity-', dir=settings.upload_
         models.install_model(pkg, model)
         assert {p: p.stat().st_mtime_ns for p in stamps} == stamps
         print('PASS already-present real blobs reused unchanged', flush=True)
-        name, _ = models.split_ref(model)
-        damaged = pkg / 'models' / name / 'blobs' / digests[-1].replace(':', '-')
+        name, tag = models.split_ref(model)
+        damaged = pkg / 'models' / name / tag / 'blobs' / digests[-1].replace(':', '-')
         damaged.write_bytes(b'ordinary mismatched review bytes')
         try:
             models.install_model(pkg, model)
@@ -26245,8 +26303,10 @@ if __name__ == "__main__":
 ```python
 """Controlled package preflight and generated-script trust-boundary regressions."""
 import ast
+import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -26547,12 +26607,13 @@ class RetrievalImportTests(unittest.TestCase):
             self.exported.append(model)
             if model in failing:
                 raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
-            files = [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+            folder = 'models/' + '/'.join(model_bundle.split_ref(model))
+            files = [(f"{folder}/manifest.json", blob)]
             if model in broken_copy:
-                files.append((f"models/{model.split(':')[0]}/blobs/sha256-gone",
+                files.append((f"{folder}/blobs/sha256-gone",
                               self.root / 'missing-blob'))
             if model in fail_mid_write:
-                files.append((f"models/{model.split(':')[0]}/blobs/sha256-torn", torn))
+                files.append((f"{folder}/blobs/sha256-torn", torn))
             return files
 
         def copy_or_tear(source, target):
@@ -26594,16 +26655,16 @@ class RetrievalImportTests(unittest.TestCase):
                 pkg, _ = self.extracted(result)
                 self.assertFalse((pkg / 'models' / 'chat').exists())
                 self.assertFalse(any(k.startswith('models/chat/') for k in manifest['files']))
-                self.assertIn('models/embed/manifest.json', manifest['files'])
-                self.assertTrue((pkg / 'models' / 'embed' / 'manifest.json').is_file())
-                self.assertEqual(model_bundle.bundled_models(pkg), ['embed'])
+                self.assertIn('models/embed/v1/manifest.json', manifest['files'])
+                self.assertTrue((pkg / 'models' / 'embed' / 'v1' / 'manifest.json').is_file())
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed:v1'])
                 self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
                                     for w in manifest['warnings']))
 
     def test_a_model_shared_by_embedding_and_llm_is_copied_once(self):
         result, manifest = self.build_with_models(set(), llm_model='embed:v1')
         self.assertEqual(self.exported, ['embed:v1'])
-        self.assertEqual(manifest['bundled_models'], ['embed'])
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
 
     def test_manifest_lists_no_models_when_none_were_requested_or_the_store_is_missing(self):
         for include, store in [(False, True), (True, False)]:
@@ -26619,19 +26680,19 @@ class RetrievalImportTests(unittest.TestCase):
 
     def test_manifest_lists_a_model_shared_by_embedding_and_llm_once(self):
         result, manifest = self.build_with_models(set(), llm_model='embed:v1')
-        self.assertEqual(manifest['bundled_models'], ['embed'])
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
         self.assertIs(manifest['models_bundled'], True)
 
     def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
         result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
-        self.assertEqual(manifest['bundled_models'], ['embed'])
+        self.assertEqual(manifest['bundled_models'], ['embed:v1'])
         self.assertIs(manifest['models_bundled'], True)
         self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
                             for w in manifest['warnings']))
 
     def test_manifest_lists_only_models_actually_bundled(self):
-        for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
-                                  (set(), ['chat', 'embed']), ({'embed:v1', 'chat:v2'}, [])]:
+        for failing, expected in [({'chat:v2'}, ['embed:v1']), ({'embed:v1'}, ['chat:v2']),
+                                  (set(), ['chat:v2', 'embed:v1']), ({'embed:v1', 'chat:v2'}, [])]:
             with self.subTest(failing=sorted(failing)):
                 for leftover in self.exports.iterdir():
                     leftover.unlink()
@@ -26639,9 +26700,10 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertEqual(manifest['bundled_models'], expected)
                 self.assertEqual(manifest['models_bundled'], bool(expected))
                 self.assertEqual(result['models_bundled'], bool(expected))
-                for name in ('embed', 'chat'):
-                    self.assertEqual(f'models/{name}/manifest.json' in manifest['files'],
-                                     name in expected)
+                for ref in ('embed:v1', 'chat:v2'):
+                    folder = ref.replace(':', '/')
+                    self.assertEqual(f'models/{folder}/manifest.json' in manifest['files'],
+                                     ref in expected)
                 for model in sorted(failing):
                     self.assertTrue(any(w.startswith(f"model '{model}' could not be bundled")
                                         for w in manifest['warnings']))
@@ -26732,6 +26794,135 @@ class RetrievalImportTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
 
+
+class ModelTagFolderTests(unittest.TestCase):
+    """Two tags of one model name, and a folder used only for its own tag (#487).
+
+    Uses the real model_bundle export and install against temporary Ollama
+    stores holding inert bytes; only Ollama's own listing is stubbed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.store = self.root / 'store'
+        self.target = self.root / 'target'
+        (self.target / 'models').mkdir(parents=True)
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.root / 'uploads'), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.object(importer, '_log'))
+        self.manifests = {model: self.put_model(model) for model in ('foo:a', 'foo:b', 'bar:x')}
+
+    def put_model(self, model):
+        """An Ollama manifest and blobs with bytes of this model's own."""
+        name, tag = model.split(':')
+        blobs = self.store / 'models' / 'blobs'
+        blobs.mkdir(parents=True, exist_ok=True)
+        digests = []
+        for part in ('config', 'weights'):
+            data = f'{part} of {model}'.encode()
+            digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+            (blobs / digest.replace(':', '-')).write_bytes(data)
+            digests.append(digest)
+        manifest = json.dumps({'config': {'digest': digests[0]},
+                               'layers': [{'digest': digests[1]}]}).encode()
+        path = self.store / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(manifest)
+        return manifest
+
+    def export(self, embed, llm):
+        with ExitStack() as mocks:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+                mocks.enter_context(patch.object(settings, key, str(value)))
+            mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
+            mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+            mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
+            mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
+            mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
+            result = packager.build('Corpus', include_models=True)
+        return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
+
+    def ensure(self, pkg, manifest, embed, llm):
+        with patch.object(settings, 'ollama_models_dir', str(self.target)), \
+             patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(importer, '_ollama_reports', lambda model: True):
+            return importer._ensure_models(pkg, manifest)
+
+    def installed(self, model):
+        name, tag = model.split(':')
+        path = self.target / 'models' / 'manifests' / model_bundle.REGISTRY / model_bundle.NAMESPACE / name / tag
+        return path.read_bytes() if path.is_file() else None
+
+    def legacy_package(self, folder_model, manifest_models):
+        """A package in the pre-#487 layout: `models/<name>/` holding `folder_model`."""
+        pkg = self.root / 'legacy'
+        name, tag = folder_model.split(':')
+        source = json.loads(self.manifests[folder_model])
+        (pkg / 'models' / name / 'blobs').mkdir(parents=True)
+        (pkg / 'models' / name / 'manifest.json').write_bytes(self.manifests[folder_model])
+        for digest in [source['config']['digest']] + [layer['digest'] for layer in source['layers']]:
+            blob = self.store / 'models' / 'blobs' / digest.replace(':', '-')
+            (pkg / 'models' / name / 'blobs' / blob.name).write_bytes(blob.read_bytes())
+        embed, llm = manifest_models
+        return pkg, {'embedding': {'model': embed}, 'llm': {'model': llm}}
+
+    # Each test checks the import outcome first, so on develop it fails on the
+    # wrong install itself rather than on the new layout or signature.
+    def test_two_tags_of_one_name_are_bundled_apart_and_each_installed_as_itself(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])  # develop: foo:b's
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+        for model in ('foo:a', 'foo:b'):
+            folder = 'models/' + model.replace(':', '/')
+            self.assertIn(f'{folder}/manifest.json', manifest['files'])
+            self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_bundled_tag_is_never_installed_under_another_tag(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
+
+    def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
+        pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
+
+    def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
+        # The pre-#487 export wrote both tags into models/foo/, the LLM's last.
+        pkg, manifest = self.legacy_package('foo:b', ('foo:a', 'foo:b'))
+        with self.assertRaises(packager.PackageError) as caught:  # develop: installs foo:b as foo:a
+            self.ensure(pkg, manifest, 'foo:a', 'foo:b')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertIsNone(self.installed('foo:a'))
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), [])
+
+    def test_an_old_package_folder_is_not_installed_under_another_tag(self):
+        pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
+        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
+        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
 
 if __name__ == '__main__':
     unittest.main()
