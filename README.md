@@ -708,13 +708,13 @@ Raise it in **Docker Desktop → Settings → Resources → Memory**, then resta
 
 | You send | Result |
 |---|---|
-| create `myDocs` | stored and listed as **`MyDocs`** |
+| create `myDocs` | stored and listed as **`MyDocs`**; the API answers `MyDocs` |
 | reference `myDocs` | accepted — the first letter is normalised for you |
 | reference `MyDocs` | accepted — the stored name |
 | reference `mydocs` | **404 `COLLECTION_NOT_FOUND`** — interior case must match |
 | reference `MYDOCS` | **404 `COLLECTION_NOT_FOUND`** |
 
-So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. If you get a 404 for a collection you are sure exists, run `curl http://localhost:8080/api/collections` and copy the name exactly as listed.
+So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. The API applies the same rule to every collection name it receives, so the collection's settings, retained originals, gold-standard sessions and query metrics are all kept under `MyDocs` whichever of the two spellings you use (#372). State saved under a lowercase-first spelling before that change is not migrated: re-ingest the documents and save the settings again to put them under the stored name. If you get a 404 for a collection you are sure exists, run `curl http://localhost:8080/api/collections` and copy the name exactly as listed.
 
 To check the behaviour yourself without waiting on the LLM, use the ingest endpoint — it validates the collection name and returns immediately:
 

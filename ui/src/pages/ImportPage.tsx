@@ -79,19 +79,21 @@ export default function ImportPage() {
 
   async function createCollection() {
     if (!newColName.trim()) return
+    // The name as the API stored it, which is the one the list shows: a typed
+    // lowercase first letter matched no option (#372).
+    let created: string
     try {
-      await api.createCollection({
+      created = (await api.createCollection({
         name: newColName,
         index_type: newColIndexType,
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
-      })
+      })).name
     } catch (e: unknown) {
       setNewColError(e instanceof Error ? e.message : String(e))
       return
     }
     // The create succeeded, so a failed reload is a list error, not a refusal.
-    const created = newColName
     setShowNewColModal(false)
     setNewColName('')
     setNewColError('')
