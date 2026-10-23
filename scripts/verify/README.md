@@ -403,7 +403,7 @@ sent, and nothing run, created or saved; a collection Weaviate reports missing i
 `COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
 create (#366).
 Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
-the JSON 503 reaches the client (#369).
+the JSON 503 reaches the client (#369), also the tune starts' re-chunk check one (#409).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
