@@ -494,6 +494,13 @@ bundle unrelated weights. Ollama writes blob filenames with a hyphen
 Every model file appears in the package manifest's `files` map and is digest
 verified on import like any other file.
 
+A model is bundled whole or not at all. If any of its files can't be copied,
+the files of that model already copied are removed from the package and from
+`files`, and a warning names the model (#449). Import takes a model with a
+`models/<model-name>/manifest.json` as bundled, so a partly copied model must
+never be left behind. A model used for both embedding and the LLM is copied
+once.
+
 **The API service must mount the Ollama model volume** (`ollama_models:/ollama`)
 for any of this to work. Installing a model means writing its exact manifest and
 blobs: offline there is no registry to pull from, and rebuilding the model

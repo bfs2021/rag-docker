@@ -6026,6 +6026,20 @@ class _Builder:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
 
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
     """Expand `@@INCLUDE:name@@` from templates/partials/<name>.md.
@@ -6263,17 +6277,24 @@ def build(
         # 5b. bundled models, resolved through each model's manifest
         bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # A model shared by embedding and the LLM is copied once, so removing
+            # a failed copy can never remove a copy that succeeded.
+            wanted = list(dict.fromkeys([settings.embed_model, settings.llm_model]))
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
                 for model in wanted:
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
                         bundled.append(model.split(":")[0])
@@ -25551,7 +25572,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from models.schemas import SaveRetrievalConfigBody
-from services import importer, packager, retrieval_config
+from services import importer, model_bundle, packager, retrieval_config
 
 
 INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
@@ -25822,33 +25843,105 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(manifest['warnings'].count(warning), 1)
         self.assertEqual(saved.read_bytes(), before)
 
-    def build_with_models(self, failing):
-        """Export with both models requested; models named in `failing` cannot bundle."""
+    def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
+                          store_available=True, broken_copy=(), fail_mid_write=()):
+        """Export with both models requested; models named in `failing` cannot bundle.
+
+        Models named in `broken_copy` resolve, but their second file's copy fails.
+        Models named in `fail_mid_write` resolve, but their second file's copy
+        fails after writing part of it. `self.exported` records each resolution."""
         blob = self.root / 'model-blob'
         blob.write_text('inert model bytes')
+        torn = self.root / 'torn-blob'
+        torn.write_text('bytes that never finish copying')
+        self.exported = []
+        copyfile = packager.shutil.copyfile
 
         def export_model(model, stage):
+            self.exported.append(model)
             if model in failing:
                 raise FileNotFoundError(f"Ollama has no manifest for '{model}'")
-            return [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+            files = [(f"models/{model.split(':')[0]}/manifest.json", blob)]
+            if model in broken_copy:
+                files.append((f"models/{model.split(':')[0]}/blobs/sha256-gone",
+                              self.root / 'missing-blob'))
+            if model in fail_mid_write:
+                files.append((f"models/{model.split(':')[0]}/blobs/sha256-torn", torn))
+            return files
+
+        def copy_or_tear(source, target):
+            if Path(source) == torn:
+                Path(target).write_text('bytes that')
+                raise OSError(28, 'No space left on device')
+            return copyfile(source, target)
 
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
-            mocks.enter_context(patch.object(settings, 'llm_model', 'chat:v2'))
+            mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
             mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
             mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
             mocks.enter_context(patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}))
-            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=True))
+            mocks.enter_context(patch.object(packager.model_bundle, 'store_available', return_value=store_available))
             mocks.enter_context(patch.object(packager.model_bundle, 'export_model', side_effect=export_model))
-            result = packager.build('Corpus', include_models=True)
+            mocks.enter_context(patch.object(packager.shutil, 'copyfile', side_effect=copy_or_tear))
+            result = packager.build('Corpus', include_models=include_models)
         with tarfile.open(self.exports / result['filename']) as archive:
             member = next(m for m in archive.getmembers() if m.name.endswith('/manifest.json')
                           and m.name.count('/') == 1)
             manifest = json.load(archive.extractfile(member))
         return result, manifest
+
+    def extracted(self, result):
+        """The package as import reads it: `open_package` into a fresh directory."""
+        dest = Path(tempfile.mkdtemp(dir=self.root))
+        return packager.open_package(self.exports / result['filename'], dest)
+
+    def test_a_failed_model_copy_leaves_no_part_of_that_model(self):
+        for broken in ({'broken_copy': {'chat:v2'}}, {'fail_mid_write': {'chat:v2'}}):
+            with self.subTest(**broken):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), **broken)
+                pkg, _ = self.extracted(result)
+                self.assertFalse((pkg / 'models' / 'chat').exists())
+                self.assertFalse(any(k.startswith('models/chat/') for k in manifest['files']))
+                self.assertIn('models/embed/manifest.json', manifest['files'])
+                self.assertTrue((pkg / 'models' / 'embed' / 'manifest.json').is_file())
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed'])
+                self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                                    for w in manifest['warnings']))
+
+    def test_a_model_shared_by_embedding_and_llm_is_copied_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(self.exported, ['embed:v1'])
+        self.assertEqual(manifest['bundled_models'], ['embed'])
+
+    def test_manifest_lists_no_models_when_none_were_requested_or_the_store_is_missing(self):
+        for include, store in [(False, True), (True, False)]:
+            with self.subTest(include_models=include, store_available=store):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), include_models=include,
+                                                          store_available=store)
+                self.assertEqual(manifest['bundled_models'], [])
+                self.assertIs(manifest['models_bundled'], False)
+                self.assertIs(result['models_bundled'], False)
+                self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+
+    def test_manifest_lists_a_model_shared_by_embedding_and_llm_once(self):
+        result, manifest = self.build_with_models(set(), llm_model='embed:v1')
+        self.assertEqual(manifest['bundled_models'], ['embed'])
+        self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
+        result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
+        self.assertEqual(manifest['bundled_models'], ['embed'])
+        self.assertIs(manifest['models_bundled'], True)
+        self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
+                            for w in manifest['warnings']))
 
     def test_manifest_lists_only_models_actually_bundled(self):
         for failing, expected in [({'chat:v2'}, ['embed']), ({'embed:v1'}, ['chat']),
