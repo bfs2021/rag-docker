@@ -388,9 +388,10 @@ Also verified: validation runs in spec §6.2 order and stops at the first failur
 (missing file, non-archive, absent manifest, future `package_format`, bad digest,
 embedding mismatch, collision each produce their own code); `on_conflict` is
 rejected as missing or invalid with 422; `IMPORT_IN_PROGRESS` fires for a
-concurrent import of the same file; and a package containing
-`../../../../tmp/evil-escaped.txt` was refused `PACKAGE_UNREADABLE` with nothing
-written inside or outside the container.
+concurrent import of the same file (since #391 compared by its name in
+`./exports`, and also failing an import job whose target collection another import
+is building); and a package containing `../../../../tmp/evil-escaped.txt` was
+refused `PACKAGE_UNREADABLE` with nothing written inside or outside the container.
 
 **A defect this phase found and fixed:** a failed `replace` reported "The
 imported data is available as 'Policies__importing_d4ce4033'" when the staging

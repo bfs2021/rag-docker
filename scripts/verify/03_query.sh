@@ -102,6 +102,30 @@ done
 check "end_user answers are shorter than engineer on average" $? \
   "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
 
+# ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
+# The queries above wrote metrics records; a restart goes through the
+# lifespan's load_from_disk, so GET /metrics/latency must report the same records.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "query metrics reload after an API restart (#374)" 1 "$restart_refusal"
+  else
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_before.json
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_after.json
+    python3 -c "
+import json,sys
+b=json.load(open('/tmp/vfy_metrics_before.json')); a=json.load(open('/tmp/vfy_metrics_after.json'))
+sys.exit(0 if b['total_records'] > 0 and a['history'] == b['history'] else 1)"
+    check "query metrics reload after an API restart (#374)" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "query metrics reload after an API restart (#374)" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
 drop_collection "$C"
 cleanup_prefixed
 summary

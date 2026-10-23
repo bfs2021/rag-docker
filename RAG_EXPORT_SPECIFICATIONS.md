@@ -247,12 +247,17 @@ and on import.
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
+  "bundled_models": [],
   "files": {"chunks.jsonl": "sha256:...", "collection.json": "sha256:..."}
 }
 ```
 
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
+
+`bundled_models` lists each model the package carries whole, as `name:tag`
+(a name with no tag is `name:latest`), sorted; it is `[]` when none is, and
+`models_bundled` is true exactly when it isn't empty (§6.3, #425, #487).
 
 The package listing (`GET /packages`) shows `collection.name` and
 `collection.chunk_count`, `fidelity` and `created_at`, with the types above:
@@ -472,18 +477,21 @@ model, or a re-export from one (#390).
 
 `include_models` defaults to `false`. When `true`, `models/` contains the
 **embedding model and the LLM named in the manifest**, as the Ollama manifest and
-blob files required to serve them, under `models/<model-name>/`:
+blob files required to serve them, in a folder per name and tag,
+`models/<name>/<tag>/` (a name with no tag has tag `latest`):
 
 ```
 models/
 ├── nomic-embed-text/
-│   ├── manifest.json          the Ollama manifest, verbatim
-│   └── blobs/
-│       └── sha256-<hex>       config and layer blobs it names
+│   └── latest/
+│       ├── manifest.json      the Ollama manifest, verbatim
+│       └── blobs/
+│           └── sha256-<hex>   config and layer blobs it names
 └── phi3.5/
-    ├── manifest.json
-    └── blobs/
-        └── sha256-<hex>
+    └── latest/
+        ├── manifest.json
+        └── blobs/
+            └── sha256-<hex>
 ```
 
 Blobs are resolved **through each model's manifest**, never by copying the blob
@@ -493,6 +501,28 @@ bundle unrelated weights. Ollama writes blob filenames with a hyphen
 
 Every model file appears in the package manifest's `files` map and is digest
 verified on import like any other file.
+
+A model is bundled whole or not at all. If any of its files can't be copied,
+the files of that model already copied are removed from the package and from
+`files`, and a warning names the model (#449). Import takes a model with a
+`models/<name>/<tag>/manifest.json` as bundled, so a partly copied model must
+never be left behind. A model used for both embedding and the LLM is copied
+once.
+
+Two tags of one name (an embedding model `foo:a` and an LLM `foo:b`) are both
+bundled, each in its own folder (#487). Import uses a folder only for the name
+and tag it holds: a package that bundles `bar:x` doesn't bundle `bar:y`, so an
+instance whose LLM is `bar:y` gets the "absent, not bundled" outcome below,
+never `bar:x`'s files under the name `bar:y`.
+
+Packages built before #487 put a model in `models/<name>/`, without the tag.
+Import reads such a folder's tag from the package manifest: when
+`embedding.model` and `llm.model` name exactly one tag of that name, the folder
+holds that tag. When they name two tags of it, the two models shared the
+folder and one overwrote the other's manifest, so the folder counts as not
+bundled for either. An instance from before #487 that imports a newer package
+doesn't find its models, and gives its "absent, not bundled" outcome.
+`package_format` stays `1`.
 
 **The API service must mount the Ollama model volume** (`ollama_models:/ollama`)
 for any of this to work. Installing a model means writing its exact manifest and
@@ -812,7 +842,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
-| `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
+| `IMPORT_IN_PROGRESS` | HTTP 409 from `POST /import` for a concurrent import of the same package file (compared by its name in `./exports`), and an import job's failure when another import into the same target collection is running, whatever either job's `on_conflict`, with `error_detail` `{"collection": "<target>"}` (#391) |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
