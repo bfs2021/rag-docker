@@ -451,15 +451,23 @@ def build(
         # 5b. bundled models, resolved through each model's manifest
         bundled: list[str] = []
         if include_models:
-            # A model shared by embedding and the LLM is copied once, so removing
-            # a failed copy can never remove a copy that succeeded.
-            wanted = list(dict.fromkeys([settings.embed_model, settings.llm_model]))
+            # Models are compared by name and tag, so `x` and `x:latest` are one
+            # model, copied once (#494). Each copy then has its own
+            # models/<name>/<tag>/ folder (#487), so removing a failed copy
+            # never removes another model's files.
+            wanted: dict[str, str] = {}
+            for model in (settings.embed_model, settings.llm_model):
+                try:
+                    key = model_bundle.model_ref(model)
+                except ValueError:
+                    key = model  # no path in the store; export_model refuses it below
+                wanted.setdefault(key, model)
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
-                for model in wanted:
+                for model in wanted.values():
                     attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):

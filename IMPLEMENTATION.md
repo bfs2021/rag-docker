@@ -6277,15 +6277,23 @@ def build(
         # 5b. bundled models, resolved through each model's manifest
         bundled: list[str] = []
         if include_models:
-            # A model shared by embedding and the LLM is copied once, so removing
-            # a failed copy can never remove a copy that succeeded.
-            wanted = list(dict.fromkeys([settings.embed_model, settings.llm_model]))
+            # Models are compared by name and tag, so `x` and `x:latest` are one
+            # model, copied once (#494). Each copy then has its own
+            # models/<name>/<tag>/ folder (#487), so removing a failed copy
+            # never removes another model's files.
+            wanted: dict[str, str] = {}
+            for model in (settings.embed_model, settings.llm_model):
+                try:
+                    key = model_bundle.model_ref(model)
+                except ValueError:
+                    key = model  # no path in the store; export_model refuses it below
+                wanted.setdefault(key, model)
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
-                for model in wanted:
+                for model in wanted.values():
                     attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
@@ -14400,7 +14408,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E34; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -18726,7 +18734,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E33)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E34)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -26661,7 +26669,8 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(saved.read_bytes(), before)
 
     def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
-                          store_available=True, broken_copy=(), fail_mid_write=()):
+                          store_available=True, broken_copy=(), fail_mid_write=(),
+                          embed_model='embed:v1'):
         """Export with both models requested; models named in `failing` cannot bundle.
 
         Models named in `broken_copy` resolve, but their second file's copy fails.
@@ -26694,10 +26703,10 @@ class RetrievalImportTests(unittest.TestCase):
             return copyfile(source, target)
 
         with ExitStack() as mocks:
-            mocks.enter_context(patch.object(settings, 'embed_model', 'embed:v1'))
+            mocks.enter_context(patch.object(settings, 'embed_model', embed_model))
             mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
-            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': 'embed:v1'}))
+            mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed_model}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
             mocks.enter_context(patch.object(packager, '_goldstandard_sessions', return_value=[]))
             mocks.enter_context(patch.object(packager.sources, 'load_index', return_value={'documents': {}}))
@@ -26732,10 +26741,63 @@ class RetrievalImportTests(unittest.TestCase):
                 self.assertTrue(any(w.startswith("model 'chat:v2' could not be bundled")
                                     for w in manifest['warnings']))
 
+    def test_a_failed_first_model_leaves_the_next_one_whole(self):
+        result, manifest = self.build_with_models(set(), fail_mid_write={'embed:v1'})
+        pkg, _ = self.extracted(result)
+        self.assertFalse((pkg / 'models' / 'embed').exists())
+        self.assertFalse(any(k.startswith('models/embed/') for k in manifest['files']))
+        self.assertEqual(model_bundle.bundled_models(pkg), ['chat:v2'])
+        self.assertEqual(manifest['bundled_models'], ['chat:v2'])
+
+    def test_every_model_failing_leaves_no_models_directory(self):
+        result, manifest = self.build_with_models(
+            set(), broken_copy={'embed:v1'}, fail_mid_write={'chat:v2'})
+        pkg, _ = self.extracted(result)
+        self.assertFalse((pkg / 'models').exists())
+        self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+        self.assertEqual(manifest['bundled_models'], [])
+        self.assertIs(manifest['models_bundled'], False)
+        self.assertEqual(sum(w.startswith('model ') and 'could not be bundled' in w
+                             for w in manifest['warnings']), 2)
+
     def test_a_model_shared_by_embedding_and_llm_is_copied_once(self):
         result, manifest = self.build_with_models(set(), llm_model='embed:v1')
         self.assertEqual(self.exported, ['embed:v1'])
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
+
+    def test_a_model_named_with_and_without_its_tag_is_one_model(self):
+        # `embed` and `embed:latest` share models/embed/latest/; a second copy
+        # failing used to delete the first's files while the manifest kept
+        # listing the model (#494).
+        # The second spelling failing is the case that lost the first's files.
+        for failing in (set(), {'embed:latest'}):
+            with self.subTest(fail_mid_write=sorted(failing)):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(set(), embed_model='embed',
+                                                          llm_model='embed:latest',
+                                                          fail_mid_write=failing)
+                pkg, _ = self.extracted(result)
+                self.assertEqual(self.exported, ['embed'])
+                self.assertEqual(manifest['bundled_models'], ['embed:latest'])
+                self.assertIn('models/embed/latest/manifest.json', manifest['files'])
+                self.assertEqual(model_bundle.bundled_models(pkg), ['embed:latest'])
+                self.assertFalse(any('could not be bundled' in w for w in manifest['warnings']))
+        for leftover in self.exports.iterdir():
+            leftover.unlink()
+        with self.subTest(fail_mid_write=['embed']):
+            result, manifest = self.build_with_models(set(), embed_model='embed',
+                                                      llm_model='embed:latest',
+                                                      fail_mid_write={'embed'})
+            pkg, _ = self.extracted(result)
+            self.assertEqual(self.exported, ['embed'])
+            self.assertEqual(manifest['bundled_models'], [])
+            self.assertIs(manifest['models_bundled'], False)
+            self.assertFalse(any(k.startswith('models/') for k in manifest['files']))
+            self.assertFalse((pkg / 'models').exists())
+            failed = [w for w in manifest['warnings'] if 'could not be bundled' in w]
+            self.assertEqual(len(failed), 1, failed)
+            self.assertTrue(failed[0].startswith("model 'embed' could not be bundled"))
 
     def test_manifest_lists_no_models_when_none_were_requested_or_the_store_is_missing(self):
         for include, store in [(False, True), (True, False)]:
