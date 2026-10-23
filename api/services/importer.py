@@ -410,7 +410,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
     embed_model = settings.embed_model
     llm_model = settings.llm_model
-    bundled = model_bundle.bundled_models(pkg)
+    # `name:tag`; a folder counts only for the tag it holds (#487).
+    bundled = model_bundle.bundled_models(pkg, manifest)
 
     for model, required in ((embed_model, True), (llm_model, False)):
         if not model_bundle.supports_name(model):
@@ -463,7 +464,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {name}`, then import again.",
                 {"model": name})
-        if name not in bundled:
+        if model_bundle.model_ref(model) not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -478,7 +479,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
-            model_bundle.install_model(pkg, model)
+            model_bundle.install_model(pkg, model, manifest)
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
