@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import errno
 import gzip
@@ -499,6 +500,7 @@ def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
     return "\n\n".join(records), [Text(text=record) for record in records]
 
 
+@telemetry.traced("rag.parse")
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
     if _is_jsonl(path.name):
         return _parse_jsonl(path)
@@ -641,6 +643,7 @@ def _remove_earlier(collection: str, name: str, created_at: datetime,
         return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
 
 
+@telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -754,6 +757,7 @@ def _process_job_sync(
                 deleted = True
                 break
             except _StaleMarkFailed as exc:
+                telemetry.outcome("partial", exc)
                 job["files_failed"] += 1
                 job["errors"].append(
                     f"{label}: could not mark gold-standard sessions stale before replacing "
@@ -766,6 +770,7 @@ def _process_job_sync(
                     f"earlier chunks, so nothing was changed: {exc}")
                 _log.warning("ingest job %s: %r not replaced", job_id, label, exc_info=True)
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 # Name the file the way the user knows it (a ZIP member by its
                 # archive and path), and never leave the reason blank.
                 job["files_failed"] += 1
@@ -778,6 +783,7 @@ def _process_job_sync(
         collection_writes.end_job("ingest", job_id)
 
     if deleted:
+        telemetry.outcome("error")
         job["errors"].append(f"collection '{collection}' was deleted while this job was running")
         job["status"] = "failed"
         return
@@ -786,7 +792,9 @@ def _process_job_sync(
         job["status"] = "completed"
     elif job["files_failed"] == job["files_total"]:
         job["status"] = "failed"
+        telemetry.outcome("error")
     else:
+        telemetry.outcome("partial")
         job["status"] = "partial"
 
 
@@ -1220,6 +1228,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
+    @telemetry.admitted
     def _on_done(future: asyncio.Future) -> None:
         # The worker ends its registration itself; this covers a job cancelled
         # before it ran and an error that escaped the worker.
@@ -1228,20 +1237,22 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             return
         exc = future.exception()
         if exc is not None:
-            _log.error("ingest job %s failed: %s", job_id, exc)
-            job = _jobs.get(job_id)
-            # This write stays on the event loop (#309): a done callback is
-            # synchronous and can't await a thread, it runs only when an error
-            # escaped the worker, and it saves one record of about 1 KB.
-            if job and job["status"] not in ("completed", "partial", "failed"):
-                # The error first: the status change is the write that saves
-                # the record (#23), and an in-place append is not seen alone.
-                job["errors"].append(str(exc))
-                job["status"] = "failed"
+            with telemetry.span("rag.failure_report"):
+                telemetry.outcome("error", exc)
+                _log.error("ingest job %s failed: %s", job_id, exc)
+                job = _jobs.get(job_id)
+                # This write stays on the event loop (#309): a done callback is
+                # synchronous and can't await a thread, it runs only when an error
+                # escaped the worker, and it saves one record of about 1 KB.
+                if job and job["status"] not in ("completed", "partial", "failed"):
+                    # The error first: the status change is the write that saves
+                    # the record (#23), and an in-place append is not seen alone.
+                    job["errors"].append(str(exc))
+                    job["status"] = "failed"
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
-        _process_job_sync,
+        telemetry.admitted(_process_job_sync),
         job_id,
         file_paths,
         tmp_dir,

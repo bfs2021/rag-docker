@@ -1,5 +1,6 @@
 """Completed-batch checks with bounded, disk-backed record expectations."""
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -182,10 +183,10 @@ class ExpectedRecords:
 
         def stored_objects():
             if exact:
-                yield from collection.iterator(include_vector=True)
+                yield from telemetry.iterate(collection.iterator, include_vector=True)
             else:
                 for ids in self.id_batches():
-                    yield from collection.query.fetch_objects(
+                    yield from telemetry.call("weaviate.query", collection.query.fetch_objects,
                         filters=Filter.by_id().contains_any(ids), limit=len(ids), include_vector=True).objects
 
         for obj in stored_objects():
@@ -204,7 +205,7 @@ class ExpectedRecords:
             if stored_vector is None and vector is None:
                 if vectorless_allowed is None:
                     config = getattr(collection, "config", None)
-                    vectorizer = config.get().vectorizer if config is not None else None
+                    vectorizer = telemetry.call("weaviate.config", config.get).vectorizer if config is not None else None
                     vectorless_allowed = getattr(vectorizer, "value", None) == "none"
                 if not vectorless_allowed:
                     raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
@@ -224,10 +225,10 @@ class ExpectedRecords:
 
     def rollback(self, collection):
         for ids in self.id_batches():
-            result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+            result = telemetry.call("weaviate.query", collection.data.delete_many, where=Filter.by_id().contains_any(ids))
             if result.failed:
                 raise RuntimeError(f"Could not remove {result.failed} owned ingestion object(s)")
-            remaining = collection.query.fetch_objects(filters=Filter.by_id().contains_any(ids), limit=len(ids))
+            remaining = telemetry.call("weaviate.query", collection.query.fetch_objects, filters=Filter.by_id().contains_any(ids), limit=len(ids))
             if remaining.objects:
                 raise RuntimeError("Owned ingestion objects remain after cleanup")
 
@@ -270,20 +271,21 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
         expected.capture(factory, expected_count, generated_only=cleanup_owned)
         queued = accepted = 0
         try:
-            with collection.batch.dynamic() as batch:
-                for position, record in enumerate(factory()):
-                    record = expected.prepare(position, record)
-                    batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
-                    queued += 1
-                if queued != expected.count:
-                    raise ValueError("Record stream changed after preflight")
-            failed = collection.batch.failed_objects
-            accepted = queued - len(failed or ())
-            if failed:
-                detail = getattr(failed[0], "message", None)
-                raise RuntimeError(
-                    f"Weaviate rejected {len(failed)} batch object(s)"
-                    + (f": {detail}" if detail else ""))
+            with telemetry.span("weaviate.batch"):
+                with collection.batch.dynamic() as batch:
+                    for position, record in enumerate(factory()):
+                        record = expected.prepare(position, record)
+                        batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                        queued += 1
+                    if queued != expected.count:
+                        raise ValueError("Record stream changed after preflight")
+                failed = collection.batch.failed_objects
+                accepted = queued - len(failed or ())
+                if failed:
+                    detail = getattr(failed[0], "message", None)
+                    raise RuntimeError(
+                        f"Weaviate rejected {len(failed)} batch object(s)"
+                        + (f": {detail}" if detail else ""))
             return expected.verify(collection, exact=exact)
         except Exception as original:
             _record_counts(original, queued, accepted)

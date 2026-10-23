@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import logging
 import threading
@@ -49,7 +50,7 @@ def get_client() -> weaviate.WeaviateClient:
                     _client.close()
                 except Exception:
                     pass
-            _client = weaviate.connect_to_custom(
+            _client = telemetry.call("weaviate.connect", weaviate.connect_to_custom,
                 http_host=settings.weaviate_host,
                 http_port=settings.weaviate_port,
                 http_secure=False,
@@ -77,8 +78,12 @@ def _check_health_sync() -> bool:
     answers "ready" while every client call fails, so health reports green
     during a total outage of Weaviate functionality.
     """
-    client = get_client()
-    return bool(client.is_ready())
+    with telemetry.span("weaviate.health"):
+        client = get_client()
+        ready = bool(client.is_ready())
+        if not ready:
+            telemetry.outcome("error")
+        return ready
 
 
 async def check_health() -> bool:
@@ -118,7 +123,7 @@ def _create_collection_sync(
         vectorize_collection_name=False,
     )
 
-    client.collections.create(
+    telemetry.call("weaviate.create", client.collections.create,
         name=name,
         # Set only by import, to bind its in-progress marker to this instance.
         description=description,
@@ -140,7 +145,7 @@ async def create_collection(
 
 
 def _collection_exists_sync(name: str) -> bool:
-    return get_client().collections.exists(name)
+    return telemetry.call("weaviate.exists", get_client().collections.exists, name)
 
 
 async def collection_exists(name: str) -> bool:
@@ -151,9 +156,9 @@ async def collection_exists(name: str) -> bool:
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
-    canonical_name = coll.config.get().name
-    count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(canonical_name)
+    canonical_name = telemetry.call("weaviate.config", coll.config.get).name
+    count = telemetry.call("weaviate.aggregate", coll.aggregate.over_all, total_count=True).total_count
+    telemetry.call("weaviate.delete", client.collections.delete, canonical_name)
     collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
@@ -197,16 +202,16 @@ async def delete_collection_when_idle(name: str) -> int:
 
 def _get_collections_sync() -> list[dict]:
     client = get_client()
-    all_cols = client.collections.list_all()
+    all_cols = telemetry.call("weaviate.list", client.collections.list_all)
     result = []
     for col_name in all_cols:
         coll = client.collections.get(col_name)
-        count = coll.aggregate.over_all(total_count=True).total_count or 0
+        count = telemetry.call("weaviate.aggregate", coll.aggregate.over_all, total_count=True).total_count or 0
 
         # list_all() returns _CollectionConfigSimple, which does NOT carry
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
-        vector_config = coll.config.get().vector_index_config
+        vector_config = telemetry.call("weaviate.config", coll.config.get).vector_index_config
         index_name = type(vector_config).__name__.lower()
         hnsw_fields = tuple(
             getattr(vector_config, field, None)
@@ -257,7 +262,7 @@ async def sweep_staging() -> list[str]:
 def _meta_sync() -> dict:
     """Server metadata. `version` goes into the export manifest."""
     try:
-        return get_client().get_meta() or {}
+        return telemetry.call("weaviate.meta", get_client().get_meta) or {}
     except Exception:
         return {}
 
@@ -273,7 +278,7 @@ def _collection_config_sync(name: str) -> dict:
     recreate the collection by feeding this straight back in.
     """
     coll = get_client().collections.get(name)
-    cfg = coll.config.get()
+    cfg = telemetry.call("weaviate.config", coll.config.get)
     vi = cfg.vector_index_config
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
@@ -320,7 +325,7 @@ async def get_collection_config(name: str) -> dict:
 
 def _validate_reindex_vectorizer_sync(name: str) -> None:
     """Fail before staging if recreation would change the stored vector space."""
-    cfg = get_client().collections.get(name).config.get()
+    cfg = telemetry.call("weaviate.config", get_client().collections.get(name).config.get)
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
     model = getattr(vectorizer, "model", None)
@@ -361,6 +366,7 @@ _INSERT_ATTEMPTS = 3
 _INSERT_RETRY_DELAY = 1.0
 
 
+@telemetry.traced("rag.store")
 @collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
@@ -385,7 +391,7 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
 def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
     """Whether the collection holds any chunk stored under this logical name."""
     coll = get_client().collections.get(collection_name)
-    return bool(coll.query.fetch_objects(
+    return bool(telemetry.call("weaviate.query", coll.query.fetch_objects,
         filters=Filter.by_property("source_file").equal(source_file),
         limit=1, return_properties=[]).objects)
 
@@ -424,7 +430,7 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
     named = Filter.by_property("source_file").equal(source_file)
 
     def count(where) -> int:
-        return coll.aggregate.over_all(filters=where, total_count=True).total_count or 0
+        return telemetry.call("weaviate.aggregate", coll.aggregate.over_all, filters=where, total_count=True).total_count or 0
 
     found = count(named & Filter.by_property("created_at").equal(created_at))
     if found != expected:
@@ -433,7 +439,7 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
     earlier = named & Filter.by_property("created_at").not_equal(created_at)
     deleted = 0
     for _ in range(_REPLACE_DELETE_ROUNDS):
-        result = coll.data.delete_many(where=earlier)
+        result = telemetry.call("weaviate.delete", coll.data.delete_many, where=earlier)
         deleted += result.successful or 0
         if result.failed:
             raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
@@ -472,7 +478,7 @@ def _distance_to_score(coll):
     distance, or a config with no metric or a metric with no conversion, gives
     None. A failed config read raises, and the query answers the #373 503.
     """
-    vector_config = coll.config.get().vector_index_config
+    vector_config = telemetry.call("weaviate.config", coll.config.get).vector_index_config
     convert = _SIMILARITY.get(getattr(vector_config, "distance_metric", None))
 
     def to_score(distance: float | None) -> float | None:
@@ -488,7 +494,7 @@ def _near_vector_query_sync(
     client = get_client()
     coll = client.collections.get(collection_name)
     to_score = _distance_to_score(coll)
-    result = coll.query.near_vector(
+    result = telemetry.call("weaviate.query", coll.query.near_vector,
         near_vector=vector,
         limit=top_k,
         return_metadata=MetadataQuery(distance=True),
@@ -517,7 +523,7 @@ def _near_text_query_sync(
     client = get_client()
     coll = client.collections.get(collection_name)
     to_score = _distance_to_score(coll)
-    result = coll.query.near_text(
+    result = telemetry.call("weaviate.query", coll.query.near_text,
         query=query,
         limit=top_k,
         return_metadata=MetadataQuery(distance=True),
@@ -545,7 +551,7 @@ def _hybrid_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.hybrid(
+    result = telemetry.call("weaviate.query", coll.query.hybrid,
         query=query,
         alpha=alpha,
         limit=top_k,
@@ -579,14 +585,14 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
     from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
-    if not client.collections.exists(collection_name):
+    if not telemetry.call("weaviate.exists", client.collections.exists, collection_name):
         raise CollectionNotFoundError(collection_name)
     coll = client.collections.get(collection_name)
-    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    objects = telemetry.iterate(coll.iterator, include_vector=False, return_properties=[], cache_size=100)
     identities = select_chunk_ids(objects, request.sample_size, request.seed)
     if not identities:
         return []
-    payloads = coll.query.fetch_objects(
+    payloads = telemetry.call("weaviate.query", coll.query.fetch_objects,
         filters=Filter.by_id().contains_any(identities), limit=len(identities),
         include_vector=False, return_properties=["content", "source_file", "chunk_index"],
     ).objects

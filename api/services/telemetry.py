@@ -164,10 +164,24 @@ class Config:
 # Finite value vocabularies prevent sensitive values hidden under approved keys.
 ENUMS = {
     "rag.operation": frozenset(("startup", "query", "ingest", "export", "import", "tuning", "evaluation")),
-    "rag.outcome": frozenset(("ok", "error", "cancelled")),
+    "rag.outcome": frozenset(("ok", "error", "cancelled", "partial")),
     "error.type": frozenset(("timeout", "connection", "validation", "internal")),
 }
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
+
+# Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ENUMS.update({"http.route": ROUTES | {"unmatched"},
+              "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
+              "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
+SPAN_NAMES |= ROUTES | frozenset(("rag.request", "rag.reformulate", "rag.retrieval", "rag.synthesis",
+    "rag.parse", "rag.chunk", "rag.store", "rag.retain", "rag.package", "rag.validate",
+    "rag.rebuild", "rag.pair", "rag.regenerate", "rag.failure_report",
+    "ollama.chat", "ollama.embed", "ollama.models", "ollama.health",
+    "weaviate.connect", "weaviate.health", "weaviate.create", "weaviate.delete",
+    "weaviate.exists", "weaviate.list", "weaviate.meta", "weaviate.config",
+    "weaviate.aggregate", "weaviate.query", "weaviate.iterate", "weaviate.batch"))
+
 METRIC_NAMES = frozenset(("rag.telemetry.check",))
 
 
@@ -250,6 +264,9 @@ def sanitize_wire(data, signal, config):
                     dest.kind = record.kind
                     dest.status.code = record.status.code
                     attrs(record.attributes, dest.attributes)
+                    for link in record.links[:1]:
+                        if len(link.trace_id) == 16 and any(link.trace_id) and len(link.span_id) == 8 and any(link.span_id):
+                            dest.links.add(trace_id=link.trace_id, span_id=link.span_id, flags=link.flags & 1)
                 elif signal == "logs":
                     dest.time_unix_nano, dest.observed_time_unix_nano = record.time_unix_nano, record.observed_time_unix_nano
                     dest.trace_id, dest.span_id = record.trace_id, record.span_id
@@ -407,6 +424,7 @@ def bootstrap(env=None):
             clean = ReadableSpan(
                 name=span.name if span.name in SPAN_NAMES else "rag.operation",
                 context=clean_context(span.context), parent=clean_context(span.parent), resource=resource,
+                links=safe_links(span.links),
                 attributes=safe_attributes(span.attributes), kind=span.kind,
                 status=Status(span.status.status_code), start_time=span.start_time,
                 end_time=span.end_time, instrumentation_scope=scope)
@@ -470,7 +488,7 @@ def bootstrap(env=None):
         if config.traces:
             provider = TracerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter,
                                      sampler=TraceIdRatioBased(config.sample_ratio),
-                                     span_limits=SpanLimits(max_attributes=16, max_events=0, max_links=0,
+                                     span_limits=SpanLimits(max_attributes=16, max_events=0, max_links=1,
                                                             max_attribute_length=128))
             runtime._providers.append(provider)
             provider.add_span_processor(SafeBatchSpans(exporter(OTLPSpanExporter, "traces"), **batch))
@@ -494,3 +512,271 @@ def bootstrap(env=None):
         runtime.shutdown()
         raise TelemetryConfigError("Telemetry initialization failed") from None
     return runtime
+
+
+# App-scoped manual instrumentation. No global provider or request baggage.
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
+import inspect
+
+_runtime = ContextVar("rag_telemetry_runtime", default=None)
+
+
+def safe_links(links):
+    from opentelemetry.trace import Link, SpanContext, TraceFlags, TraceState
+    result = []
+    for link in links[:1]:
+        c = link.context
+        if c.is_valid:
+            clean = SpanContext(c.trace_id, c.span_id, c.is_remote,
+                                TraceFlags(int(c.trace_flags) & 1), TraceState())
+            result.append(Link(clean))
+    return result
+
+
+def capture():
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        return runtime, None
+    from opentelemetry.trace import get_current_span
+    try:
+        return runtime, get_current_span().get_span_context()
+    except Exception:
+        return runtime, None
+
+
+@contextmanager
+def bind(snapshot):
+    runtime, parent = snapshot
+    token = _runtime.set(runtime)
+    attached = None
+    try:
+        try:
+            if runtime is not None and runtime.tracer is not None:
+                from opentelemetry import context, trace
+                clean = context.Context()
+                if parent is not None and parent.is_valid:
+                    clean = trace.set_span_in_context(trace.NonRecordingSpan(parent), clean)
+                attached = context.attach(clean)
+        except Exception:
+            pass
+        yield
+    finally:
+        if attached is not None:
+            try:
+                context.detach(attached)
+            except Exception:
+                pass
+        _runtime.reset(token)
+
+
+def admitted(fn):
+    """Capture now, bind inside actual execution (including raw executors)."""
+    snapshot = capture()
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def run(*args, **kwargs):
+            with bind(snapshot):
+                return await fn(*args, **kwargs)
+    else:
+        @wraps(fn)
+        def run(*args, **kwargs):
+            with bind(snapshot):
+                return fn(*args, **kwargs)
+    return run
+
+
+def error_type(exc):
+    import asyncio
+    import httpx
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)) or isinstance(exc.__cause__, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if isinstance(exc, (ConnectionError, httpx.TransportError)):
+        return "connection"
+    if isinstance(exc, ValueError):
+        return "validation"
+    return "internal"
+
+
+def attribute(key, value, target=None):
+    if key not in ENUMS or value not in ENUMS[key]:
+        return
+    try:
+        if target is None:
+            runtime = _runtime.get()
+            if runtime is None or runtime.tracer is None:
+                return
+            from opentelemetry.trace import get_current_span
+            target = get_current_span()
+        target.set_attribute(key, value)
+    except Exception:
+        pass
+
+
+def outcome(value, exc=None, target=None):
+    if not isinstance(value, str) or value not in ENUMS["rag.outcome"]:
+        return
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        return
+    try:
+        from opentelemetry import trace
+        span = target if target is not None else trace.get_current_span()
+        span.set_attribute("rag.outcome", value)
+        if value != "ok":
+            span.set_status(trace.Status(trace.StatusCode.ERROR))
+        if exc is not None and value != "cancelled":
+            span.set_attribute("error.type", error_type(exc))
+    except Exception:
+        pass
+
+
+@contextmanager
+def span(name, *, links=(), server=False):
+    runtime = _runtime.get()
+    current = None
+    token = None
+    try:
+        if runtime is not None and runtime.tracer is not None:
+            from opentelemetry import trace, context
+            kind = trace.SpanKind.SERVER if server else (trace.SpanKind.CLIENT if name.startswith(("ollama.", "weaviate.")) else trace.SpanKind.INTERNAL)
+            current = runtime.tracer.start_span(name, kind=kind, links=links,
+                                                attributes={"rag.outcome": "ok"})
+            token = context.attach(trace.set_span_in_context(current))
+    except Exception:
+        pass
+    try:
+        yield current
+    except BaseException as exc:
+        import asyncio
+        outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
+        raise
+    finally:
+        if token is not None:
+            try:
+                context.detach(token)
+            except Exception:
+                pass
+        if current is not None:
+            try:
+                current.end()
+            except Exception:
+                pass
+
+
+def traced(name):
+    def decorate(fn):
+        if inspect.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def run(*args, **kwargs):
+                with span(name):
+                    return await fn(*args, **kwargs)
+        else:
+            @wraps(fn)
+            def run(*args, **kwargs):
+                with span(name):
+                    return fn(*args, **kwargs)
+        return run
+    return decorate
+
+
+def call(name, fn, /, *args, **kwargs):
+    with span(name):
+        return fn(*args, **kwargs)
+
+
+def iterate(fn, /, *args, **kwargs):
+    # Keep one bounded span for the iterator, but activate it only while pulling
+    # an item: generator yield must never leave context attached in its caller.
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        yield from fn(*args, **kwargs)
+        return
+    from opentelemetry import trace, context
+    try:
+        current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
+                                            attributes={"rag.outcome": "ok"})
+    except Exception:
+        yield from fn(*args, **kwargs)
+        return
+    iterator = None
+    try:
+        iterator = iter(fn(*args, **kwargs))
+        while True:
+            token = None
+            try:
+                token = context.attach(trace.set_span_in_context(current))
+            except Exception:
+                pass
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            finally:
+                if token is not None:
+                    try:
+                        context.detach(token)
+                    except Exception:
+                        pass
+            yield item
+    except BaseException as exc:
+        import asyncio
+        outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
+        raise
+    finally:
+        try:
+            current.end()
+        except Exception:
+            pass
+
+
+def remote_link(headers):
+    value = None
+    for key, candidate in headers:
+        if key.lower() == b"traceparent":
+            if value is not None or len(candidate) != 55:
+                return ()
+            value = candidate
+    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", value):
+        return ()
+    from opentelemetry.trace import SpanContext, TraceFlags, TraceState, Link
+    _, tid, sid, flags = value.split(b"-")
+    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16) & 1), TraceState())
+    return (Link(c),) if c.is_valid else ()
+
+
+class RequestTracing:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        runtime = getattr(getattr(scope.get("app"), "state", None), "telemetry", None)
+        if scope["type"] != "http" or runtime is None or runtime.tracer is None:
+            return await self.app(scope, receive, send)
+        # Always a local root. External IDs can correlate but cannot sample it.
+        with bind((runtime, None)):
+            with span("rag.request", links=remote_link(scope.get("headers", ())), server=True) as request_span:
+                async def traced_send(message):
+                    if message["type"] == "http.response.start":
+                        status = message["status"]
+                        if request_span is not None:
+                            attribute("http.status_class", str(status // 100) + "xx", request_span)
+                        if status >= 400:
+                            outcome("error")
+                    await send(message)
+                try:
+                    await self.app(scope, receive, traced_send)
+                except Exception:
+                    attribute("http.status_class", "5xx", request_span)
+                    raise
+                finally:
+                    route = getattr(scope.get("route"), "path", "")
+                    label = scope.get("method", "") + " " + route
+                    if request_span is not None:
+                        attribute("http.route", label if label in ROUTES else "unmatched", request_span)
+                        if label in ROUTES:
+                            try:
+                                request_span.update_name(label)
+                            except Exception:
+                                pass

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import json
 import logging
@@ -691,6 +692,7 @@ _GENERATION_ATTEMPTS = 3
 _REGENERATION_TIMEOUT_SECONDS = 1800
 
 
+@telemetry.traced("rag.pair")
 async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
     data = None
@@ -751,11 +753,13 @@ def _publish_generation_failure(session_id: str, exc: Exception, write_error: Ex
         _store_revision += 1
 
 
+@telemetry.traced("rag.failure_report")
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
     except Exception as write_error:
+        telemetry.outcome("error", write_error)
         log.exception("Could not durably report failed generation for %s", session_id)
         # Otherwise `generating` stays in the cache for as long as the fault
         # lasts, and the UI polls it forever. The cache runs ahead of disk;
@@ -767,6 +771,7 @@ async def _record_generation_failure(session_id: str, exc: Exception) -> None:
             log.exception("Could not publish failed generation for %s", session_id)
 
 
+@telemetry.traced("rag.evaluation")
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
     cancelled = False
     persistence_failure = None
@@ -778,6 +783,7 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
                 cancelled = True
                 raise
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
                 def failed(current):
@@ -813,6 +819,8 @@ async def _settle_generation(session_id: str, cancelled: bool,
         if current.get("status") == "generating":
             current["status"] = ("cancelled" if cancelled else
                 "failed" if not current["pairs"] and current.get("errors") else "completed")
+        if current.get("status") == "failed":
+            telemetry.outcome("error")
     await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
@@ -904,11 +912,13 @@ async def start_generation(
     session_id = session["session_id"]
 
     try:
-        task = asyncio.create_task(_run_generation(session_id, all_chunks))
+        task = asyncio.create_task(telemetry.admitted(_run_generation)(session_id, all_chunks))
     except BaseException:
         end_job("goldstandard", session_id)
         raise
     _tasks.add(task)
+
+    report_failure = telemetry.admitted(_record_generation_failure)
 
     def _on_task_done(t: asyncio.Task) -> None:
         # _run_generation ends it first; this covers a task that never ran it.
@@ -916,7 +926,7 @@ async def start_generation(
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            reporter = asyncio.create_task(report_failure(session_id, exc))
             _tasks.add(reporter)
             reporter.add_done_callback(_tasks.discard)
 
@@ -952,6 +962,7 @@ async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | No
     return await asyncio.to_thread(apply)
 
 
+@telemetry.traced("rag.regenerate")
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:

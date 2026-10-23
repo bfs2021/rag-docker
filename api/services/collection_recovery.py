@@ -5,6 +5,7 @@ allows startup to remove scratch; recovery records survive until explicit
 collection deletion or successful completion of their owning operation.
 """
 from __future__ import annotations
+from services import telemetry
 
 import json
 import logging
@@ -58,7 +59,7 @@ def begin(target: str, operation: str, client) -> dict:
     token = uuid.uuid4().hex
     marker = "__importing_" if operation == "import" else "__tuning_"
     staging = f"{target}{marker}{token}"
-    if client.collections.exists(staging):
+    if telemetry.call("weaviate.exists", client.collections.exists, staging):
         raise RuntimeError(f"Recovery name '{staging}' is already in use")
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
@@ -151,17 +152,17 @@ def _check_tuning_cutover(record: dict, client) -> None:
     """Check the owned target without deleting data based on mutable recovery."""
     from services import batch_write, goldstandard
     target, staging = record["target"], record["staging"]
-    if not client.collections.exists(staging):
+    if not telemetry.call("weaviate.exists", client.collections.exists, staging):
         log.warning("Tuning recovery %r is unavailable; target and journal preserved", staging)
         return
-    if client.collections.exists(target):
+    if telemetry.call("weaviate.exists", client.collections.exists, target):
         collection = client.collections.get(target)
-        if collection.config.get().description != cutover_description(record):
+        if telemetry.call("weaviate.config", collection.config.get).description != cutover_description(record):
             log.warning("Tuning target %r has another instance; preserved", target)
             _finish_cutover_check(record, "other-instance")
             return
         def expected():
-            for obj in client.collections.get(staging).iterator(include_vector=True):
+            for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True):
                 vector = obj.vector
                 if isinstance(vector, dict):
                     if set(vector) != {"default"}:
@@ -202,8 +203,8 @@ def discard(record: dict, client) -> None:
         _write(updated)
         record.update(updated)
     name = record["staging"]
-    if client.collections.exists(name):
-        client.collections.delete(name)
+    if telemetry.call("weaviate.exists", client.collections.exists, name):
+        telemetry.call("weaviate.delete", client.collections.delete, name)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")

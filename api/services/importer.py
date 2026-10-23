@@ -21,6 +21,7 @@ depending on whether there is anything to protect:
   is recoverable rather than lost.
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import json
@@ -207,7 +208,7 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        if col.config.get().description != _instance_description(data["instance"]):
+                        if telemetry.call("weaviate.config", col.config.get).description != _instance_description(data["instance"]):
                             # Created after the import stopped, for example while
                             # an earlier start could not resolve this marker.
                             _log.warning("Collection %r is not the one the interrupted import "
@@ -216,7 +217,7 @@ def sweep_interrupted_imports() -> list[str]:
                             try:
                                 expected.verify(col, exact=True)
                             except batch_write.BatchVerificationError:
-                                wc.get_client().collections.delete(collection)
+                                telemetry.call("weaviate.delete", wc.get_client().collections.delete, collection)
                                 removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
@@ -554,6 +555,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+@telemetry.traced("rag.validate")
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     """Check source identities after verify_digests, before any live mutation."""
     source_dir = pkg / "sources"
@@ -709,6 +711,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     return notes
 
 
+@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
@@ -718,7 +721,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
     except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
-            wc.get_client().collections.delete(target)
+            telemetry.call("weaviate.delete", wc.get_client().collections.delete, target)
         except Exception as cleanup:
             raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
                                f"partial target cleanup failed ({cleanup})",
@@ -726,6 +729,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+@telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -848,6 +852,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                    notes=notes)
 
     except PackageError as exc:
+        telemetry.outcome("error", exc)
         finish(status="failed", error_code=exc.code, error=exc.message,
                error_detail=exc.detail)
         if staged and temp_collection:
@@ -858,6 +863,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
+        telemetry.outcome("error", exc)
         _log.exception("Import of %r failed", filename)
         finish(status="failed", error_code="IMPORT_FAILED",
                error=f"{type(exc).__name__}: {exc}")
@@ -918,5 +924,5 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         with _lock:
             _active.discard(key)
         raise
-    asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
     return job_id

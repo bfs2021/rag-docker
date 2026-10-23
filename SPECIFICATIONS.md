@@ -3044,3 +3044,36 @@ loopback OTLP receiver with sentinel content and checks disabled behavior,
 configuration validation, resources, sampling/signals, overload, export failure,
 flush/shutdown, and embedded implementation consistency. It requires no collector
 or external provider. Full acceptance runs only in the disposable verify project.
+
+
+## Request and background tracing (#283)
+
+Optional manual instrumentation uses the private application runtime. Request
+spans cover ASGI execution including streaming and cancellation, with only
+registered method-and-route names and finite response status classes. Incoming
+version-00 traceparent supplies at most one sanitized link to a locally sampled
+root; no remote baggage, trace state, authentication or sampling authority is
+accepted. Invalid headers are ignored without altering the response.
+
+Query stages, ingest stages, export/import, tuning, gold-standard generation and
+regeneration, and actual application-owned Ollama/Weaviate calls produce finite
+spans. Iterator consumption and batch finalization are included; backend-internal
+model execution is not inferred. Worker admission captures runtime and local
+parent context before raw executor/task/thread scheduling. A job is a child of
+the initiating request even when it executes after the response; concurrent
+jobs and reused threads cannot inherit one another's spans. Generation failure
+reporters retain originating lineage. No content or job/session IDs are exported.
+
+Safe outcome/error categories include handled failures and partial work, with no
+exception text or events. Preserve task ownership, guards, callbacks, cancellation,
+timeouts, status transitions and persistence semantics. A cancelled thread waiter
+cannot imply that its running work ended. Existing shutdown does not drain jobs;
+unfinished work or forced process termination does not guarantee final export.
+
+Synthetic offline verification exercises real API/service launchers and actual
+thread/task transitions with fake dependencies: parentage after 202, concurrent
+isolation, cancellation/timeout, dependency errors/timing, batch/iterator calls,
+header trust, disabled/failing telemetry, and sentinel-free serialized OTLP.
+Infrastructure suite 01 registers these checks; full acceptance remains on the
+disposable verify project. Metrics/log correlation and collector setup remain
+separate stories.

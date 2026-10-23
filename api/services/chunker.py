@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import threading
 from typing import Any
 from models.schemas import IngestConfig
@@ -213,6 +214,7 @@ def chunk_semantic(
     return _enforce_min_chunk_size(chunks, max(min_chunk_size, MIN_SEMANTIC_CHUNK_CHARACTERS))
 
 
+@telemetry.traced("rag.chunk")
 def chunk(
     text: str,
     strategy: str,

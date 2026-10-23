@@ -13,6 +13,7 @@ replace=True, so a name ingested with new content leaves the digest it had, and 
 digest left with no names is removed with its blob.
 """
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -127,6 +128,7 @@ def _drop_blobs(collection: str, digests: list[str]) -> None:
                       digest[:12], collection, exc)
 
 
+@telemetry.traced("rag.retain")
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
           *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.

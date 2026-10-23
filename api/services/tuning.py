@@ -17,6 +17,7 @@ the collection `stale`, with a reason and a timestamp. Sessions are never
 deleted and never remapped (spec §7.3).
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import copy
@@ -57,7 +58,7 @@ def get_job(job_id: str) -> dict | None:
 def _existing_chunks(collection: str) -> list[dict]:
     """Stored properties, without vectors. Used when re-embedding chunk text."""
     col = wc.get_client().collections.get(collection)
-    return [dict(o.properties or {}) for o in col.iterator()]
+    return [dict(o.properties or {}) for o in telemetry.iterate(col.iterator)]
 
 
 def _existing_records(collection: str) -> list[dict]:
@@ -68,7 +69,7 @@ def _existing_records(collection: str) -> list[dict]:
 def _iter_existing_records(collection: str):
     seen = set()
     col = wc.get_client().collections.get(collection)
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         identity = str(obj.uuid)
         vector = obj.vector
         if isinstance(vector, dict):
@@ -89,12 +90,13 @@ def _iter_existing_records(collection: str):
 def _write_records(collection: str, records: list[dict]) -> None:
     """Supply exact records, drain the batch, then compare backend readback."""
     col = wc.get_client().collections.get(collection)
-    with col.batch.dynamic() as batch:
-        for record in records:
-            batch.add_object(properties=copy.deepcopy(record["properties"]),
-                             uuid=record["id"], vector=copy.deepcopy(record["vector"]))
-    if batch.number_errors:
-        raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+    with telemetry.span("weaviate.batch"):
+        with col.batch.dynamic() as batch:
+            for record in records:
+                batch.add_object(properties=copy.deepcopy(record["properties"]),
+                                 uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+        if batch.number_errors:
+            raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
     _verify_records(collection, records)
 
 
@@ -123,7 +125,7 @@ def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[s
     seen: dict[str, set] = {}
     uncovered = set()
     stored = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
+    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator):
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
@@ -245,6 +247,7 @@ def rechunk_refusal(collection: str) -> str | None:
     return RECHUNK_NOT_COVERED if uncovered else None
 
 
+@telemetry.traced("rag.chunk")
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -349,6 +352,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
@@ -377,7 +381,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             _verify_records(collection, records)
         else:
             wc._insert_chunks_sync(staging, properties)
-            staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+            staged_count = telemetry.call("weaviate.aggregate", client.collections.get(staging).aggregate.over_all, total_count=True).total_count
             if staged_count != len(properties):
                 raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
         if source_collection != collection:
@@ -388,7 +392,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             before_replace()
         collection_recovery.begin_cutover(ownership)
         cutover_started = True
-        client.collections.delete(collection)
+        telemetry.call("weaviate.delete", client.collections.delete, collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
                                    description=collection_recovery.cutover_description(ownership))
         if records is not None:
@@ -399,7 +403,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 return (
                     {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
                      "properties": dict(obj.properties or {})}
-                    for obj in client.collections.get(staging).iterator(include_vector=True)
+                    for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True)
                 )
             written = batch_write.insert(client.collections.get(collection), staged,
                                          expected_count=len(properties))
@@ -445,8 +449,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 _log.exception("Could not remove owned staging collection %r", staging)
 
 
+@telemetry.traced("rag.tuning")
 @collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    telemetry.attribute("rag.tuning_operation", operation)
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
@@ -529,9 +535,11 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         finish(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
+        telemetry.outcome("error", exc)
         finish(status="failed", error_code=exc.code, error=exc.message,
                error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
+        telemetry.outcome("error", exc)
         _log.exception("Tuning %r on %r failed", operation, collection)
         finish(status="failed", error_code="TUNE_FAILED",
                error=f"{type(exc).__name__}: {exc}")
@@ -583,7 +591,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         with _lock:
             _active.discard(collection)
         raise
-    task = asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, operation, params, source_collection=source_collection))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("tune", job_id))
     return job_id

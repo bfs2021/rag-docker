@@ -780,11 +780,12 @@ configuration interface for this private runtime.
 
 Disabled mode creates no providers, workers or exporters and does not read the
 secret or CA file. Invalid enabled configuration fails API startup with field-only
-errors. No global OTel provider or root logging handler is installed. Future
-instrumentation uses `app.state.telemetry.tracer`, `.logger` and `.meter`, with
-`force_flush()` and `shutdown()` for lifecycle. Raw SDK providers are internal
-implementation details and are not part of the supported runtime API. This
-encapsulation is not a security boundary against Python private-state access.
+errors. No global OTel provider or root logging handler is installed. Manual
+request, worker and dependency instrumentation uses `app.state.telemetry.tracer`,
+`.logger` and `.meter`, with `force_flush()` and `shutdown()` for lifecycle.
+Raw SDK providers are internal implementation details and are not part of the
+supported runtime API. This encapsulation is not a security boundary against
+Python private-state access.
 
 Before trace/log queueing and again at the final protobuf transport boundary,
 the runtime drops arbitrary text. Queue records use runtime-owned resources and
@@ -800,24 +801,29 @@ runtime-owned limits before SDK processing (16 attributes, 128 characters), so
 ambient `OTEL_LOGRECORD_ATTRIBUTE_*` and `OTEL_ATTRIBUTE_*` limits cannot truncate
 approved log attributes or cause emission errors.
 Wire resources contain only the three explicit
-service fields; scope is `rag.telemetry`. Span names are `rag.` plus startup,
-query, ingest, export, import, tuning or evaluation (unknown names become
-`rag.operation`). Allowed attributes are `rag.operation` with those operation
-values, `rag.outcome` with ok/error/cancelled, and `error.type` with
-timeout/connection/validation/internal. All other attributes, span events,
-links, trace state, status descriptions, log severity text and arbitrary log
-bodies are removed; log body becomes `rag.operation`. Trace/span IDs remain
-correlation fields, never authentication. The foundation metric allowlist is
-`rag.telemetry.check`; SDK views remove all metric dimensions before aggregation,
-and an explicit always-off exemplar filter prevents original measurement attributes
-from entering SDK exemplar reservoirs, even with ambient
-`OTEL_METRICS_EXEMPLAR_FILTER=always_on`. Export removes descriptions, units and
-exemplars. Export admits exactly one
-finite data point per metric; empty, malformed and multi-point metrics are
-rejected before consuming batch capacity. Multi-point input cannot be merged
-safely after removing dimensions. Histograms require at most 31 finite, strictly
-increasing boundaries, consistent bucket totals and finite optional sum/min/max
-with min no greater than max. Invalid histograms are dropped. Later stories extend this schema deliberately.
+service fields; scope is `rag.telemetry`. Request names use the fixed registered
+HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
+path values and query strings are never recorded. Other names are finite
+`rag.*` operation/stage names and `ollama.*` / `weaviate.*` dependency names
+listed in `api/services/telemetry.py`; unknown names become `rag.operation`.
+Attributes are finite operation, outcome (ok/error/cancelled/partial), error type
+(timeout/connection/validation/internal), registered method-and-route,
+HTTP status class (1xx–5xx) and tuning operation values. Raw exception messages,
+job/session identifiers, model names, customer names and content are excluded.
+All other attributes, span events, trace state, status descriptions, log severity
+text and arbitrary log bodies are removed; log body becomes `rag.operation`.
+At most one link survives, containing only fixed-size nonzero trace/span IDs and
+a sampled flag. Trace/span IDs remain correlation fields, never authentication.
+The foundation metric allowlist is `rag.telemetry.check`; SDK views remove all
+metric dimensions before aggregation. An explicit always-off exemplar filter
+prevents original measurement attributes from entering SDK exemplar reservoirs,
+even with ambient `OTEL_METRICS_EXEMPLAR_FILTER=always_on`. Export removes
+descriptions, units and exemplars. Export admits exactly one finite data point per metric; empty,
+malformed and multi-point metrics are rejected before consuming batch capacity.
+Multi-point input cannot be merged safely after removing dimensions. Histograms
+require at most 31 finite, strictly increasing boundaries, consistent bucket
+totals and finite optional sum/min/max with min no greater than max. Invalid
+histograms are dropped. Later stories extend this schema deliberately.
 Do not pass content into instrumentation even though the exporter excludes it:
 active SDK spans may retain inputs until completion.
 
@@ -832,4 +838,36 @@ repeated calls reuse it. Requests timeouts cannot cancel OS DNS resolution or
 force-stop a stalled system call, so a timed-out export may finish later. There
 are no additional workers per record or per repeated lifecycle call. API cleanup
 runs on both startup failure and normal shutdown. Collector provisioning and
-end-to-end application instrumentation remain separate work.
+deployed end-to-end acceptance remain separate work.
+
+
+### Request and worker tracing (#283)
+
+Each request starts a locally sampled trace. One strictly valid version-00 W3C
+`traceparent` can supply a correlation link; duplicated, malformed, oversized,
+zero-ID and unsupported-version headers are ignored. Caller sampled flags do
+not control local sampling. `tracestate` and `baggage` are ignored. Headers never
+change application identity, permissions, service metadata or response headers.
+
+Query spans cover reformulation, retrieval and synthesis. Ingest covers parsing,
+chunking, storage and source retention. Export/import, tuning and gold-standard
+generation/regeneration have operation spans and narrower stages. Explicit
+Ollama and Weaviate spans surround application-owned calls, iterator consumption
+and batch flushes. Weaviate-managed embedding remains part of its dependency
+latency; the API cannot report an internal model span for that work.
+
+At each job admission, the runtime and local parent span context are captured.
+The worker starts its child span during actual execution, including raw executor
+threads and async task/thread handoffs. This child may outlive its already-ended
+request parent; it retains the same trace ID after the 202 response. Concurrent
+jobs keep separate contexts, and thread context is restored after execution.
+Application job/session IDs are not exported. Caught and partial failures mark
+safe outcomes without changing existing responses or durable job accounting.
+
+Tracing preserves existing shutdown and cancellation behavior. Cancelling a
+waiter does not stop a running thread; that thread's span ends when its actual
+work exits. Async cancellation and existing timeouts close their spans. The API
+does not gain a worker drain, new retry or new deadline. Forced process death or
+workers surviving telemetry shutdown can lose their final spans; traces are not
+a durable execution ledger. Operational metrics/log correlation and a collector
+profile are subsequent stories.

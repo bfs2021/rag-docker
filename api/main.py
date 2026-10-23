@@ -96,6 +96,7 @@ async def request_validation_error(request, exc):
               for error in exc.errors()]
     return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
+from services.telemetry import RequestTracing
 
 _log = logging.getLogger(__name__)
 
@@ -132,6 +133,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestTracing)
 
 from routers import help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 

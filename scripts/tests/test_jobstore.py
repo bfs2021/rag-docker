@@ -890,7 +890,7 @@ class IngestFallbackTests(StoreTestCase):
             end = source.index("    future = asyncio.get_running_loop()", start)
             namespace = {"collection_writes": ingest_pipeline.collection_writes,
                          "_log": ingest_pipeline._log, "_jobs": store, "job_id": "ffff0001",
-                         "asyncio": asyncio}
+                         "asyncio": asyncio, "telemetry": ingest_pipeline.telemetry}
             exec("\n".join(line[4:] for line in source[start:end].splitlines()), namespace)
             loop = asyncio.new_event_loop()
             future = loop.create_future()

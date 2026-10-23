@@ -7,6 +7,7 @@ from drifting.
 Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 """
 from __future__ import annotations
+from services import telemetry
 
 import fnmatch
 import hashlib
@@ -159,7 +160,7 @@ def read_chunks(collection: str) -> Iterator[dict]:
         for name in entry.get("filenames", []):
             by_filename.setdefault(name, []).append(digest)
 
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         vector = obj.vector
         # Verified against the live stack: iterator() yields a dict keyed by
         # vector name, not a bare list. Code written for a list breaks here.
@@ -352,6 +353,7 @@ def _write_archive(stage: Path, stem: str, dest: Path) -> None:
                 tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
+@telemetry.traced("rag.package")
 def build(
     collection: str,
     include_models: bool = False,
@@ -695,6 +697,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     tar.extractall(dest)
 
 
+@telemetry.traced("rag.package")
 def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
@@ -760,6 +763,7 @@ def _contained_file_key(root: Path, rel: str) -> bool:
     return root in target.parents
 
 
+@telemetry.traced("rag.validate")
 def verify_digests(pkg: Path, manifest: dict) -> None:
     """Check 3 of spec §6.2. Names the first file that fails.
 
