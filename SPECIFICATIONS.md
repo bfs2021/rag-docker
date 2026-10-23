@@ -933,7 +933,11 @@ A saved file that can't be read, isn't JSON, holds JSON that isn't an object, or
 field of the wrong type (for example `"top_k": "x"`) is logged as a warning, and the
 response is the defaults with `is_default: true`, never an error (#439). Fields of the
 right type are returned as saved, missing fields are filled from the defaults, and an
-export still refuses such a file (RAG_EXPORT_SPECIFICATIONS.md §5).
+export still refuses such a file (RAG_EXPORT_SPECIFICATIONS.md §5). An `alpha` of
+`NaN` or `Infinity`, which JSON can't carry, counts as the wrong type, while a finite
+`alpha` outside 0.0-1.0 is returned as saved. A saved `is_default` key, the response's
+own field rather than a setting, also gives the defaults; export ignores it, as it
+does any unknown key (#477).
 
 Saved `ef` is a legacy inactive field, not a query override. `GET /collections` reports actual HNSW settings as `hnsw_config` (ef, efConstruction, maxConnections), or null for a Flat, Dynamic or unrecognized index configuration. An unavailable distance metric is reported as `unknown`. Both hnsw/flat query-mode names use the existing physical index.
 
@@ -2834,6 +2838,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): eight wrongly typed manifests are each listed `readable: false` beside a readable package, and `collection: null` and absent values list as `null`; both checks fail on the code before #451 (the listing answered 500).*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
+- [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
+      *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
       weaviate publish nothing; ollama and ui expose container ports only.*

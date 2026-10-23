@@ -151,6 +151,8 @@ carry the corpus's parameters.
   with `is_default: true`, matching how `/ingest/config/{collection}` behaves. A saved
   file that can't be read, isn't JSON, isn't a JSON object or has a field of the wrong
   type is logged and also answered with the defaults (#439); export still refuses it (§5).
+  A non-finite `alpha` counts as the wrong type, and a saved `is_default` key also gives
+  the defaults, though export ignores that key like any unknown one (#477).
 - `POST /retrieval/config` → upsert; collection in the **body**, not the path.
 
 The path shape deliberately mirrors ingest config, including the asymmetry that
