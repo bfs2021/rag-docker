@@ -208,6 +208,12 @@ ragpkg-.../
 └── models/                 present only when models are bundled
 ```
 
+In the archive, `manifest.json` comes right after the directory entry, before
+every other file, so a reader that wants only the manifest (the package listing)
+can stop there (#383). Readers MUST NOT rely on that order: packages built before
+#383 have `README.md`, `chunks.jsonl`, `collection.json`, `goldstandard/` and
+`ingest_config.json` before it.
+
 Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
 ### 4.3 Fidelity
@@ -355,7 +361,13 @@ completion, the written filename.
 - When Weaviate can't be read to check whether the collection exists, the export
   fails with HTTP 503 `SERVICE_UNAVAILABLE` before any job is created; `detail` is
   `{"collection": "<name>"}`. The cause is logged, not returned (#366).
-- Only one export per collection may run at a time; a second request while one is
+- The requested name is first replaced by the name as stored, its first character
+  upper-cased (`SPECIFICATIONS.md` §3.1, #372), so `policies` exports `Policies`
+  with its retained originals and gold-standard sessions. Originals and sessions
+  saved under the lowercase spelling before #372 are not migrated and are not
+  included.
+- Only one export per collection may run at a time, whichever first-letter spelling
+  each request uses (#372); a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
   concurrent exports would race on the temporary file described below. A request
   that arrives while that export is still storing its first record waits for it,

@@ -33,6 +33,9 @@ with tempfile.TemporaryDirectory() as td:
     check("archive expands to a single directory", len(tops) == 1, str(tops))
     check("that directory is the filename minus .tar.gz",
           tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    # §4.2 — the manifest comes right after the directory entry (#383)
+    check("§4.2 manifest.json is the archive's first file",
+          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
     pkg = root / archive.name[:-len(".tar.gz")]
 
     manifest = json.loads((pkg / "manifest.json").read_text())
