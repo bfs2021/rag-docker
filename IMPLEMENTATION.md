@@ -726,7 +726,9 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+
+from services.collection_writes import canonical
 
 
 def _numeric(value):
@@ -755,6 +757,10 @@ TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
+# A collection name as a caller sends it, replaced by the name Weaviate stores
+# (first character upper-cased), so every file, registry entry, session, metric
+# and guard is keyed by one spelling (#372).
+CollectionName = Annotated[str, AfterValidator(canonical)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -766,7 +772,7 @@ class HnswConfig(BaseModel):
 
 
 class CreateCollectionRequest(BaseModel):
-    name: str
+    name: CollectionName
     index_type: IndexType = "hnsw"
     distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
@@ -866,7 +872,7 @@ class IngestConfigResponse(BaseModel):
 # SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
 # export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -892,7 +898,7 @@ class HelpResponse(BaseModel):
 # ── Export / Import ───────────────────────────────────────────────────────────
 
 class ExportRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     include_models: bool = False
 
 
@@ -1021,16 +1027,16 @@ class _ChunkingFields(BaseModel):
 
 
 class RechunkRequest(_ChunkingFields):
-    collection: str
+    collection: CollectionName
 
 
 class ReembedRequest(_ChunkingFields):
     """Chunking fields are optional here, and only legal with `with-sources`."""
-    collection: str
+    collection: CollectionName
 
 
 class ReindexRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     index_type: Optional[IndexType] = None
     distance_metric: Optional[DistanceMetric] = None
 
@@ -1069,7 +1075,7 @@ class TuneOptionsResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -1095,7 +1101,7 @@ class QueryResponse(BaseModel):
 # ── Gold Standard ─────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     sample_size: int = 20
     seed: Optional[int] = None
 
@@ -1614,7 +1620,8 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from models.schemas import (SEARCH_EF_MAX, SEARCH_EF_MIN, RetrievalConfigResponse,
+                            SaveRetrievalConfigBody)
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1662,16 +1669,35 @@ def load(collection: str) -> dict | None:
         return None
 
 
-def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+def merged(collection: str) -> tuple[dict, bool]:
+    """Return (saved settings over the defaults, is_default), as saved.
+
+    Raises TypeError when the saved JSON is not an object. Export uses this rather
+    than resolve(), so it can refuse bad saved settings with a next step.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
     # Fill in any key added since the file was written, so an older config does
     # not lose a field that callers now expect.
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
-    return merged, False
+    config = {"collection": collection, **DEFAULTS, **saved}
+    config["collection"] = collection
+    return config, False
+
+
+def resolve(collection: str) -> tuple[dict, bool]:
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object or a field of
+    the wrong type (#439), are logged and give the defaults, like an unreadable file.
+    """
+    try:
+        config, is_default = merged(collection)
+        RetrievalConfigResponse.model_validate({**config, "is_default": is_default})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid retrieval config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
+    return config, is_default
 
 
 def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
@@ -6061,9 +6087,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -6117,6 +6143,21 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"Baked-in defaults for this package: collection `{collection}`, mode "
             f"`{cfg['retrieval_mode']}`, top-k {cfg['top_k']}, alpha {cfg['alpha']}, "
             f"answer style `{cfg['response_format']}`.")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+    """Archive the staged package as `<stem>/`, with manifest.json first (#383).
+
+    The directory entry, then the manifest, then everything else in the sorted
+    order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
+    at the manifest instead of decompressing chunks.jsonl to reach it.
+    """
+    with tarfile.open(dest, "w:gz") as tar:
+        tar.add(stage, arcname=stem, recursive=False)
+        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+        for entry in sorted(os.listdir(stage)):
+            if entry != "manifest.json":
+                tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
 def build(
@@ -6322,8 +6363,7 @@ def build(
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(stage, arcname=stem)
+        _write_archive(stage, stem, tmp_archive)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -6357,15 +6397,41 @@ class PackageError(Exception):
         self.detail = detail
 
 
+# The listing reads only the manifest (#383). It holds one `files` entry per file
+# in the package, so 16 MiB is far more than any real package needs; a larger
+# manifest is refused unread and the package is listed as unreadable.
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _is_top_manifest(name: str) -> bool:
+    """True for `<top-level directory>/manifest.json`, not one deeper down."""
+    parts = PurePosixPath(name).parts
+    return len(parts) == 2 and parts[1] == "manifest.json"
+
+
 def read_manifest(archive: Path) -> dict:
-    """Read manifest.json out of a package without extracting the whole archive."""
+    """Read the top-level manifest.json out of a package, for the listing.
+
+    Members are read one at a time and nothing after the manifest is touched,
+    so a package is not decompressed in full (#383). New packages put the
+    manifest first; in older ones chunks.jsonl comes before it and is read past.
+    Raises when the package has no readable manifest, or one larger than
+    MANIFEST_MAX_BYTES or not a JSON object.
+    """
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if Path(member.name).name == "manifest.json" and member.isfile():
-                fh = tar.extractfile(member)
-                if fh is None:
-                    break
-                return json.loads(fh.read().decode("utf-8"))
+        while (member := tar.next()) is not None:
+            if not (_is_top_manifest(member.name) and member.isfile()):
+                continue
+            if member.size > MANIFEST_MAX_BYTES:
+                raise ValueError(f"manifest.json is {member.size} bytes, over the "
+                                 f"{MANIFEST_MAX_BYTES}-byte limit")
+            fh = tar.extractfile(member)
+            if fh is None:
+                break
+            manifest = json.loads(fh.read(member.size).decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            return manifest
     raise ValueError("no manifest.json in package")
 
 
@@ -9022,6 +9088,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from models.schemas import (
     CollectionInfo,
+    CollectionName,
     CollectionsResponse,
     CreateCollectionRequest,
 )
@@ -9181,7 +9248,7 @@ def _busy_error(name: str, jobs: list[tuple[str, str]]):
 
 
 @router.delete("/{name}", status_code=200)
-async def delete_collection(name: str, confirm: str | None = None):
+async def delete_collection(name: CollectionName, confirm: str | None = None):
     # Checked first, before the collection is even looked up, and as text, so a
     # value other than `true` is a 400 like a missing one, never a 422 (#302).
     if (confirm or "").lower() != "true":
@@ -9236,18 +9303,19 @@ from fastapi import APIRouter, Form, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
+                            IngestUploadResponse, JobStatusResponse)
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
-from services.collection_writes import CollectionDeletingError
+from services.collection_writes import CollectionDeletingError, canonical
 from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
 
 class SaveIngestConfigBody(IngestConfig):
-    collection: str
+    collection: CollectionName
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -9262,6 +9330,9 @@ async def ingest_upload(
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
+    # A form field's default is not validated through CollectionName, so the
+    # stored-name rule is applied here (#372).
+    collection = canonical(collection)
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files)
@@ -9328,7 +9399,7 @@ async def job_status(job_id: str):
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: str):
+async def get_ingest_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 
@@ -9425,14 +9496,14 @@ import asyncio
 
 from fastapi import APIRouter
 
-from models.schemas import RetrievalConfigResponse, SaveRetrievalConfigBody
+from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
 from services import retrieval_config
 
 router = APIRouter(prefix="/retrieval")
 
 
 @router.get("/config/{collection}", response_model=RetrievalConfigResponse)
-async def get_retrieval_config(collection: str):
+async def get_retrieval_config(collection: CollectionName):
     cfg, is_default = await asyncio.to_thread(retrieval_config.resolve, collection)
     return RetrievalConfigResponse(is_default=is_default, **cfg)
 
@@ -9587,6 +9658,7 @@ import logging
 from fastapi import APIRouter
 
 from models.schemas import (
+    CollectionName,
     ReembedRequest,
     ReindexRequest,
     RechunkRequest,
@@ -9680,7 +9752,7 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: str):
+async def tune_options(collection: CollectionName):
     """What this collection can be tuned with, given its fidelity."""
     try:
         exists = await wc.collection_exists(collection)
@@ -9871,7 +9943,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from models.schemas import MetricsResponse
+from models.schemas import CollectionName, MetricsResponse
 from services import metrics
 
 router = APIRouter(prefix="/metrics")
@@ -9879,7 +9951,7 @@ router = APIRouter(prefix="/metrics")
 
 @router.get("/latency", response_model=MetricsResponse)
 async def latency_summary(
-    collection: str | None = Query(default=None),
+    collection: CollectionName | None = Query(default=None),
     retrieval_mode: str | None = Query(default=None),
     history_limit: int = Query(default=100, ge=0, le=500),
 ):
@@ -11265,7 +11337,8 @@ async function getHealthResult(): Promise<HealthResult> {
 
 export const api = {
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
-  createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
+  // Answers with the name as stored, first letter capitalised (#372).
+  createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
@@ -11902,19 +11975,21 @@ export default function ImportPage() {
 
   async function createCollection() {
     if (!newColName.trim()) return
+    // The name as the API stored it, which is the one the list shows: a typed
+    // lowercase first letter matched no option (#372).
+    let created: string
     try {
-      await api.createCollection({
+      created = (await api.createCollection({
         name: newColName,
         index_type: newColIndexType,
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
-      })
+      })).name
     } catch (e: unknown) {
       setNewColError(e instanceof Error ? e.message : String(e))
       return
     }
     // The create succeeded, so a failed reload is a list error, not a refusal.
-    const created = newColName
     setShowNewColModal(false)
     setNewColName('')
     setNewColError('')
@@ -12417,6 +12492,17 @@ export default function RetrievalPage() {
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, Session, GoldPair } from '../api/client'
 
+// The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
+// UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
+// 0-9 and '_' dropped, and the collection part shortened to keep 128 characters.
+function defaultExportName(collection: string, now = new Date()): string {
+  const iso = now.toISOString()
+  const ts = `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}_${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}`
+  const safe = collection.replace(/ /g, '_').replace(/[^A-Za-z0-9_]/g, '')
+  const suffix = `_${ts}.json`
+  return safe.slice(0, 128 - suffix.length) + suffix
+}
+
 export default function GoldStandardPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -12478,13 +12564,14 @@ export default function GoldStandardPage() {
       const loaded = await api.getSession(id)
       activeSessionRef.current = loaded.session_id
       setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
-      setFilename('')
+      setFilename(defaultExportName(loaded.collection ?? 'export'))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { setLoading(false) }
   }
 
   async function generate() {
+    if (!sampleSizeValid) return
     if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
     setLoading(true)
@@ -12495,8 +12582,7 @@ export default function GoldStandardPage() {
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
       setSession(null)
-      const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
-      setFilename(`${collection}_${ts}.json`)
+      setFilename(defaultExportName(collection))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -12531,7 +12617,8 @@ export default function GoldStandardPage() {
     try {
       const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
       setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
-      window.open(api.downloadUrl(res.filename), '_blank')
+      // downloadUrl puts the name into the path as given, so encode it here (#393).
+      window.open(api.downloadUrl(encodeURIComponent(res.filename)), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     } finally { exportPendingRef.current = false; setExportPending(false) }
@@ -12558,6 +12645,8 @@ export default function GoldStandardPage() {
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
+  // An empty field reads as 0, so it is refused too (#393).
+  const sampleSizeValid = Number.isInteger(sampleSize) && sampleSize >= 1 && sampleSize <= 100
   const historical = Boolean(session?.stale || session?.orphaned)
   const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
@@ -12575,13 +12664,14 @@ export default function GoldStandardPage() {
             </select>
           </div>
           <div>
-            <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
-            <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
+            <label htmlFor="sample-size" className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
+            <input id="sample-size" type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || exportPending || !sampleSizeValid} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
+        {!sampleSizeValid && <p role="alert" className="text-red-600 text-sm mt-3">Sample size must be a whole number from 1 to 100.</p>}
         {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
 
         {session && session.status === 'generating' && (
@@ -13575,6 +13665,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -13604,7 +13699,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -13991,7 +14086,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E33; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -13999,9 +14094,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`; run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
@@ -14175,6 +14272,28 @@ on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 node scripts/verify/browser/transfer_page.js
 ```
 
+## Gold Standard page details
+
+`browser/goldstandard_page.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+answers every `/api/` call from the Gold Standard page by request interception
+(#393). It checks that the export filename is pre-filled as
+`{collection}_{YYYYMMDD_HHMMSS}.json` after a generation and after a lookup, made
+safe and shortened to 128 characters as the API's default is; that Export opens the
+download URL with the filename encoded; that a review row expands to the first 300
+characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
+an empty field disables Generate with a message and sends no request. A second
+Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
+real: a save answered in 1 s opens the download tab, and a control answered after
+6 s (past Chromium's user-activation window) opens none. That tab sends one
+read-only download request for the fixture name to the stack under test, which
+refuses it as an invalid export name. It runs on its own too, like
+`query_config.js`:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/goldstandard_page.js
+```
+
 ## UI control browser checks
 
 `browser/ui_controls.js` and `browser/ui_pages.js`, registered in `06_ui.sh` through
@@ -14228,6 +14347,16 @@ template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND` and `PUT /query` answers `METHOD_NOT_ALLOWED`.
 
+Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
+and the job workers mocked, it sends each route that takes a collection name a lowercase-first
+spelling (`myDocs`) and checks that the registry, the 201 and 202 answers, the ingest and
+retrieval settings files, the query metric and the metrics filter, retained originals found by
+`GET /tune`, and the export, tune, ingest and generation workers all get the stored name
+(`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
+ingests under a lowercase-first name, reads the tuning options and exports under the stored
+name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
+metrics under both spellings.
+
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
@@ -14264,9 +14393,10 @@ with only `question` and `collection` reaches the pipeline with the defaults (`h
 search with the end-user prompt; the reformulation, end-user and engineer prompts and their
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
-from the defaults, and one that isn't JSON or can't be read gives the defaults with
-`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
-instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type gives the
+defaults with `is_default: true` and a warning, while coercible and out-of-range values are
+still served as saved (#439). `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -14283,9 +14413,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
@@ -15174,6 +15308,30 @@ restart_refusal_reason() {
   fi
 }
 
+# Prints why removing the project's volumes (`docker compose down -v`) must not
+# run here, or nothing (#465). Only the verify project as stack.sh sets it up:
+# COMPOSE_PROJECT_NAME rag-verify and a COMPOSE_FILE that includes the overlay
+# docker-compose.verify.yml, whose model volume is external and so kept. Any
+# other project would lose all its volumes, models included.
+volume_removal_refusal_reason() {
+  local reason sep="${COMPOSE_PATH_SEPARATOR:-:}" rest entry
+  reason=$(restart_refusal_reason)
+  if [ -n "$reason" ]; then printf '%s' "$reason"; return 0; fi
+  if [ "$COMPOSE_PROJECT_NAME" != rag-verify ]; then
+    printf "volumes are removed only on the verify project rag-verify, not '%s'; run it through scripts/verify/stack.sh" "$COMPOSE_PROJECT_NAME"
+    return 0
+  fi
+  # Split as compose splits COMPOSE_FILE; only that exact file name counts.
+  rest="${COMPOSE_FILE:-}"
+  while [ -n "$rest" ]; do
+    entry="${rest%%"$sep"*}"
+    [ "${entry##*/}" = docker-compose.verify.yml ] && return 0
+    [ "$entry" = "$rest" ] && break
+    rest="${rest#*"$sep"}"
+  done
+  printf 'COMPOSE_FILE does not include docker-compose.verify.yml, whose model volume is kept; run it through scripts/verify/stack.sh'
+}
+
 # Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
 # docker-compose.yml plus 60s for `down` and the api's own start.
 RESTART_LIMIT_DEFAULT_S=240
@@ -15764,6 +15922,9 @@ with tempfile.TemporaryDirectory() as td:
     check("archive expands to a single directory", len(tops) == 1, str(tops))
     check("that directory is the filename minus .tar.gz",
           tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    # §4.2 — the manifest comes right after the directory entry (#383)
+    check("§4.2 manifest.json is the archive's first file",
+          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
     pkg = root / archive.name[:-len(".tar.gz")]
 
     manifest = json.loads((pkg / "manifest.json").read_text())
@@ -16439,19 +16600,26 @@ ENDPY
     fi
 
     # First start: no volumes but the model copy, which is external and kept by
-    # `down -v`. The model pull isn't timed: the verify project copies the models.
-    (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
-    started=$(python3 -c "import time;print(time.time())")
-    (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
-    up_ok=$?
-    took=$(python3 -c "import time;print(int(time.time()-$started))")
-    [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
-    check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
-      "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
-    wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
-    # It started from nothing: the collection made above is gone with its volume.
-    check_eq "that first start began with no collections" \
-      "$(api_get "/collections" | jfield "['collections']")" "[]"
+    # `down -v`, so the models are already present, as SPECIFICATIONS.md's
+    # criterion says; the pull from empty is a recorded manual measurement (#465).
+    # Only on the verify project: elsewhere `down -v` would remove every volume.
+    removal_refusal=$(volume_removal_refusal_reason)
+    if [ -n "$removal_refusal" ]; then
+      check "a first start from empty volumes brings every service healthy within 300s" 1 "$removal_refusal"
+    else
+      (cd "$REPO_ROOT" && docker compose -p "$project" down -v >/dev/null 2>&1)
+      started=$(python3 -c "import time;print(time.time())")
+      (cd "$REPO_ROOT" && docker compose -p "$project" up -d --wait --wait-timeout 600 >/dev/null 2>&1)
+      up_ok=$?
+      took=$(python3 -c "import time;print(int(time.time()-$started))")
+      [ "$up_ok" = 0 ] && [ "$took" -le 300 ]
+      check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
+        "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
+      wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # It started from nothing: the collection made above is gone with its volume.
+      check_eq "that first start began with no collections" \
+        "$(api_get "/collections" | jfield "['collections']")" "[]"
+    fi
   fi
 fi
 
@@ -17072,6 +17240,10 @@ check "delete-while-busy: job kinds, request orderings and the job's report" $?
 check "ingest jobs count submitted, accepted and stored chunks apart" $?
 python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
 check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+# One spelling for per-collection state (#372): every route takes a collection
+# name as Weaviate stores it, so a lowercase first letter keys nothing apart.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_spelling.py)
+check "routes key per-collection state by the stored collection name (#372)" $?
 
 # DELETE needs ?confirm=true, checked before the collection is looked up (#302).
 CC="${PREFIX}Confirm"
@@ -18219,6 +18391,9 @@ check "E12 embedding mismatch and post-install Ollama check regressions" $?
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# The package listing reads each manifest without decompressing the package (#383).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
+check "the package listing reads only up to each manifest (#383)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -19340,6 +19515,57 @@ ENDPY
   drop_collection "$XR"
 fi
 
+# ── one spelling for per-collection state (#372) ─────────────────────────────
+# Weaviate stores a collection with its first letter capitalised. Everything
+# below is sent under the lowercase-first spelling; the registry, the retained
+# originals, the package and the metrics must all land under the stored name.
+SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
+SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+drop_collection "$SC"
+api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
+check_eq "#372: creating '$SL' answers the stored name" \
+  "$(jfield "['name']" < /tmp/vfy_sp_create.json)" "$SC"
+check "#372: the list gives '$SC' its created_at" "$(api_get "/collections" | python3 -c "
+import json,sys
+c=[c for c in json.load(sys.stdin)['collections'] if c['name']=='$SC']
+print(0 if c and c[0]['created_at'] else 1)")"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SL" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_sp_up.json
+check_eq "#372: an upload to '$SL' answers the stored name" \
+  "$(jfield "['collection']" < /tmp/vfy_sp_up.json)" "$SC"
+check_eq "#372: the upload completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_sp_up.json)" 900)" "completed"
+# Read back under the stored name: an upload under the typed spelling used to
+# file its originals where the stored name never looked.
+api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
+check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
+api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
+check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
+api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
+check_eq "#372: the export of '$SC' carries the originals uploaded as '$SL'" \
+  "$(jfield "['fidelity']" < /tmp/vfy_sp_expjob.json)" "with-sources"
+sppkg=$(jfield "['filename']" < /tmp/vfy_sp_expjob.json)
+api_post "/tune/rechunk" "{\"collection\":\"$SL\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_sp_tj.json
+check_eq "#372: a re-chunk of '$SL' completes" \
+  "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_sp_tj.json)" 1800)" "completed"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#372: a query's metrics under both spellings" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  # The body goes through a variable: inside "$(...)" its braces would be
+  # brace-expanded into three requests.
+  spq="{\"question\":\"who approves overtime?\",\"collection\":\"$SL\",\"top_k\":3}"
+  spcode=$(api_post_code "/query" "$spq")
+  check_eq "#372: a query on '$SL' answers" "$spcode" "200"
+  spl=$(api_get "/metrics/latency?collection=$SL&history_limit=0" | jfield "['total_records']")
+  spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
+  check "#372: the metrics filter finds the query under both spellings" \
+    "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+fi
+[ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
+drop_collection "$SC"
+
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
@@ -20341,6 +20567,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./health_page').runHealthPageTests(browser, BASE, r);
   await require('./transfer_page').runTransferPageTests(browser, BASE, r);
 
+  await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
+
   await require('./ui_controls').runUiControlTests(browser, BASE, r);
 
   await require('./ui_pages').runUiPageTests(browser, BASE, r);
@@ -20789,6 +21017,44 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
         r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
       } finally { await s.ctx.close(); }
     }
+  }
+
+  // ── the created name as stored (#372) ──────────────────────────────────────
+  // Weaviate capitalises a collection's first letter, and the list shows that
+  // name. The Import page selected the typed name, which matched no option, so
+  // React showed the first option instead while uploads went to the typed name.
+  // /api/collections is answered here, the list with a decoy first, so that
+  // fallback can't pass the check; nothing is created on the stack.
+  r.section('the created name as stored (#372)');
+  {
+    const TYPED = 'vfySpelling372', STORED = 'VfySpelling372', DECOY = 'VfyDecoy372';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const s = await session(browser, BASE, 'engineer');
+    try {
+      await s.page.setRequestInterception(true);
+      let created = false;
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'POST') {
+          created = true;
+          return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ name: STORED, status: 'created' }) });
+        }
+        const list = created ? [info(DECOY), info(STORED)] : [info(DECOY)];
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+      });
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      await clickByText(s.page, '+ New'); await sleep(300);
+      await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", TYPED);
+      await clickByText(s.page, 'Create'); await sleep(1500);
+      const selected = await s.page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        const select = label && label.parentElement.querySelector('select');
+        return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+      });
+      r.check('Import: after "+ New", the selector holds the created collection as stored',
+              !!selected && selected.value === STORED, JSON.stringify(selected));
+      r.check('Import stored-name fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
   }
 
   // ── upload size limit ──────────────────────────────────────────────────────
@@ -23710,7 +23976,9 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     col=client.collections.get(collection)
     await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
     before=await asyncio.to_thread(tuning._existing_records,collection)
-    session={'session_id':sid,'collection':collection[:1].lower()+collection[1:],'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    # Sessions are stored under the collection's stored name (#372); the request below
+    # still uses the lowercase-first spelling, which the API resolves to it.
+    session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
     await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
     def create(target,*args,**kwargs):
         if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
@@ -23868,7 +24136,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
                     alias=name[:1].lower()+name[1:]
                     creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
-                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
+                    check(creation.status_code==201 and creation.json()['name']==name,'collection HTTP creation from a supported lowercase alias answers the stored name (#372)')
                     col=client.collections.get(name)
                     source=[]
                     for i in range(2):
@@ -26266,6 +26534,186 @@ if (require.main === module) (async () => {
   finally { await browser.close(); }
   process.exitCode = reporter.summary() ? 0 : 1;
 })().catch(e => { console.error(e); process.exitCode = 2; });
+```
+
+### scripts/verify/browser/goldstandard_page.js
+
+```javascript
+// Gold Standard page details (#393): the default export name, the encoded
+// download URL with the popup blocker on, the review row preview and the sample
+// size bounds. Every /api/ call from the page is answered here; no backend writes.
+const { sleep, setValue, clickByText, bodyText, makeReporter } = require('./lib');
+
+const SESSION = 'gs_0393abcd';
+const NAME_RE = /^FixtureGold_\d{8}_\d{6}\.json$/;
+// A name the API can't save today, so the check covers every character the
+// issue names; the page must encode whatever name the API returns.
+const SAVED = 'Gold 393 #1?%.json';
+const DOWNLOAD = '/api/goldstandard/download/' + encodeURIComponent(SAVED);
+const CONTEXT = 'abcdefghij'.repeat(40); // 400 characters
+const LONG = 'L'.repeat(140);
+
+const pair = { pair_id: 'p1', question: 'Fixture question 393', answer: 'Fixture answer', contexts: [CONTEXT], ground_truth: 'Fixture answer', source_file: 'fixture.txt', chunk_index: 0, status: 'approved' };
+const sessionBody = collection => ({ session_id: SESSION, collection, status: 'completed', pairs_total: 1, pairs_completed: 1, pairs: [pair] });
+const json = (request, status, body) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(body) });
+
+// A page whose /api/ calls are all answered by `opts`; window.open is recorded
+// (and opens nothing) unless realOpen is set.
+async function fixture(browser, base, opts = {}) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [], generates = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.evaluateOnNewDocument(realOpen => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    window.__opened = [];
+    if (!realOpen) window.open = url => { window.__opened.push(String(url)); return null; };
+  }, !!opts.realOpen);
+  await page.setRequestInterception(true);
+  page.on('request', async request => {
+    const path = new URL(request.url()).pathname;
+    if (!path.startsWith('/api/')) return request.continue();
+    if (path === '/api/collections') {
+      return json(request, 200, { collections: ['FixtureGold', 'Other'].map(name => ({ name, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) });
+    }
+    if (path === '/api/goldstandard/generate') {
+      generates.push(JSON.parse(request.postData() || '{}'));
+      return json(request, 200, { session_id: SESSION, status: 'generating', pairs_total: 1 });
+    }
+    if (path === '/api/goldstandard/session/' + SESSION) return json(request, 200, sessionBody(opts.collection || 'FixtureGold'));
+    if (path === '/api/goldstandard/save') {
+      if (opts.saveDelay) await sleep(opts.saveDelay);
+      return json(request, 200, { filename: SAVED, pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/' + SAVED, historical: false, session_validity: { stale: false } });
+    }
+    return json(request, 404, { error: { code: 'NOT_FOUND', message: 'Not stubbed by the fixture.' } });
+  });
+  await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
+  await sleep(300);
+  return { ctx, page, errors, generates };
+}
+
+const filenameValue = page => page.evaluate(() => document.querySelector('input[placeholder="filename.json"]')?.value ?? null);
+
+async function lookup(page) {
+  await setValue(page, '() => document.getElementById("retained-session")', SESSION);
+  await sleep(100); await clickByText(page, 'Load / refresh session'); await sleep(400);
+}
+
+async function runGoldStandardPageTests(browser, base, r) {
+  r.section('Gold Standard page details (#393)');
+
+  async function run(name, opts, body, inBrowser = browser) {
+    let s;
+    try {
+      s = await fixture(inBrowser, base, opts);
+      await body(s);
+      r.check(name + ': no React page errors', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    } catch (e) {
+      r.check(name, false, e.stack || e.message);
+    } finally { if (s) await s.ctx.close(); }
+  }
+
+  await run('generate', {}, async s => {
+    await clickByText(s.page, 'Generate Pairs'); await sleep(2600);
+    const value = await filenameValue(s.page);
+    r.check('after Generate the filename is {collection}_{YYYYMMDD_HHMMSS}.json, with no double dot', NAME_RE.test(value || ''), String(value));
+  });
+
+  await run('lookup', { collection: 'Gold fixture-393' }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page);
+    r.check('a loaded session pre-fills the filename from its collection, as the API would name it', /^Gold_fixture393_\d{8}_\d{6}\.json$/.test(value || ''), String(value));
+  });
+
+  await run('long name', { collection: LONG }, async s => {
+    await lookup(s.page);
+    const value = await filenameValue(s.page) || '';
+    r.check('a long collection name is shortened to a 128-character filename', value.length === 128 && /^L+_\d{8}_\d{6}\.json$/.test(value), `${value.length}: ${value}`);
+  });
+
+  await run('download URL', {}, async s => {
+    await lookup(s.page);
+    await clickByText(s.page, 'Export Approved'); await sleep(500);
+    const opened = await s.page.evaluate(() => window.__opened);
+    r.check('export opens the download URL with the filename encoded', opened.length === 1 && new URL(opened[0], base).pathname === DOWNLOAD && !opened[0].includes('#'), JSON.stringify(opened));
+  });
+
+  await run('review row', {}, async s => {
+    await lookup(s.page);
+    const row = await s.page.evaluate(() => {
+      const d = [...document.querySelectorAll('details')].find(x => x.textContent.includes('Fixture question 393'));
+      if (!d) return null;
+      const closed = d.open; d.querySelector('summary').click();
+      const ctx = [...d.querySelectorAll('div')].find(x => x.textContent.startsWith('Context:'));
+      return { closed, open: d.open, preview: ctx ? ctx.querySelector('span').textContent : null };
+    });
+    r.check('a review row expands to the context: its first 300 characters, then …',
+      row && row.closed === false && row.open === true && row.preview === CONTEXT.slice(0, 300) + '…', JSON.stringify(row && { ...row, preview: row.preview && row.preview.length }));
+  });
+
+  await run('sample size', {}, async s => {
+    const state = () => s.page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs');
+      return { disabled: b.disabled, message: document.body.innerText.includes('Sample size must be a whole number from 1 to 100.') };
+    });
+    for (const bad of ['0', '101', '2.5', '']) {
+      await setValue(s.page, '() => document.querySelector("input[type=number]")', bad); await sleep(100);
+      await s.page.evaluate(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Generate Pairs').click());
+      await sleep(200);
+      const st = await state();
+      r.check(`sample size "${bad}" disables Generate with the 1-100 message`, st.disabled && st.message, JSON.stringify(st));
+    }
+    r.check('an out-of-range sample size sends no generate request', s.generates.length === 0, JSON.stringify(s.generates));
+    await setValue(s.page, '() => document.querySelector("input[type=number]")', '100'); await sleep(100);
+    const ok = await state();
+    r.check('sample size 100 enables Generate and removes the message', !ok.disabled && !ok.message, JSON.stringify(ok));
+  });
+
+  // Puppeteer starts Chromium with --disable-popup-blocking; turn the blocker back
+  // on and click for real, as a user would, so the window.open after the save's
+  // await is judged by the browser's user-activation rule.
+  const blocking = await require('puppeteer-core').launch({
+    executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser', headless: 'new',
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    ignoreDefaultArgs: ['--disable-popup-blocking'],
+  });
+  try {
+    for (const [delay, wantTab] of [[1000, true], [6000, false]]) {
+      await run(`popup blocker, save after ${delay} ms`, { realOpen: true, saveDelay: delay }, async s => {
+        await lookup(s.page);
+        const tabs = [];
+        const onTarget = t => { if (t.type() === 'page' && t.opener()) tabs.push(t.url()); };
+        blocking.on('targetcreated', onTarget);
+        const button = await s.page.evaluateHandle(() => [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Export Approved'));
+        await button.click();
+        await sleep(delay + 1500);
+        blocking.off('targetcreated', onTarget);
+        await s.page.bringToFront();
+        const done = /1 pairs exported/.test(await bodyText(s.page));
+        if (wantTab) {
+          r.check('with the popup blocker on, a save answered in 1 s opens the download tab', done && tabs.length === 1 && new URL(tabs[0]).pathname === DOWNLOAD, JSON.stringify({ done, tabs }));
+        } else {
+          r.check('control: the blocker is on (a save answered after 6 s opens no tab)', done && tabs.length === 0, JSON.stringify({ done, tabs }));
+        }
+      }, blocking);
+    }
+  } finally { await blocking.close(); }
+}
+
+module.exports = { runGoldStandardPageTests };
+
+if (require.main === module) {
+  (async () => {
+    const browser = await require('puppeteer-core').launch({
+      executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser',
+      headless: 'new', args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+    const reporter = makeReporter();
+    try { await runGoldStandardPageTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+    finally { await browser.close(); }
+    process.exitCode = reporter.summary() ? 0 : 1;
+  })().catch(error => { console.error(error); process.exitCode = 2; });
+}
 ```
 
 ### scripts/verify/browser/stub.js
