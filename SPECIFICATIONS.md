@@ -929,6 +929,12 @@ special-case a new collection.
 system defaults (`hnsw`, `top_k: 5`, `alpha: 0.75`, `ef: null`,
 `response_format: "end_user"`).
 
+A saved file that can't be read, isn't JSON, holds JSON that isn't an object, or has a
+field of the wrong type (for example `"top_k": "x"`) is logged as a warning, and the
+response is the defaults with `is_default: true`, never an error (#439). Fields of the
+right type are returned as saved, missing fields are filled from the defaults, and an
+export still refuses such a file (RAG_EXPORT_SPECIFICATIONS.md §5).
+
 Saved `ef` is a legacy inactive field, not a query override. `GET /collections` reports actual HNSW settings as `hnsw_config` (ef, efConstruction, maxConnections), or null for a Flat, Dynamic or unrecognized index configuration. An unavailable distance metric is reported as `unknown`. Both hnsw/flat query-mode names use the existing physical index.
 
 ---
@@ -1658,6 +1664,14 @@ A file that cannot be read as a package is still listed, with `readable: false`
 and null metadata, so it does not silently disappear from the UI. Import reports
 precisely why it cannot be used.
 
+The listing reads each archive only up to its top-level `manifest.json`
+(`<directory>/manifest.json`) and nothing after it, so a large package is not
+decompressed to list it (#383). New packages put the manifest first
+(`RAG_EXPORT_SPECIFICATIONS.md` §4.2); in older ones the files before it are read
+past, which is slower but works. The manifest read is bounded at 16 MiB: a larger
+manifest is not read and its package is listed `readable: false`, as is one whose
+manifest is missing, damaged, not UTF-8, not valid JSON or not a JSON object.
+
 The package format itself — filename convention, layout, manifest and
 `chunks.jsonl` — is specified in `RAG_EXPORT_SPECIFICATIONS.md` §4.
 
@@ -2059,7 +2073,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
 - Sample size input (1–100, default 20). While the value is empty, not a whole number, below 1 or above 100, "Generate Pairs" is disabled and the page says "Sample size must be a whole number from 1 to 100."; no request is sent (#393).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
+- "Generate Pairs" is disabled while its start request is in flight, while a generation runs and between the start being accepted and the first poll answer (so a second click cannot start another session or skip the confirmation below); a retained session that is still `generating` disables it too (#380).
 - Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review list as they complete (partial display during generation).
+- If a poll fails, polling stops and the page says so as an alert: "Could not read the generation's progress: " followed by the reason, then "Polling stopped; use Load / refresh session to check again." The progress is no longer shown and Generate is enabled again. "Load / refresh session" clears the message and polls again while the session is `generating` (#380).
+- When the session is no longer `generating`, the page shows its outcome under the controls (#380), for a session generated here and for a retained session loaded by ID. `completed`: "Generation completed: C of T pairs generated." and, when `pairs_failed` is above 0, "F pairs failed and are missing from the review list." (a warning). `completed` with `pairs_total` 0: "No pairs were generated: the collection has no chunks." `failed`: "Generation failed." and "F of T pairs failed." when `pairs_failed` is above 0 (an error). `cancelled`: "Generation was cancelled." Any other status: "Generation ended with status S." Under the headline the `errors` reasons are listed once each, with "(xN)" when a reason repeats, at most five, then "and K more reasons". Warnings and errors are alerts.
 - If a session already exists in the UI (from a previous generation), clicking "Generate Pairs" displays a confirmation dialog: "This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?" Previous sessions remain on the server (accessible via direct session ID) but are no longer referenced by the UI after confirmation.
 
 **Phase 2 — Review:**
@@ -2067,9 +2084,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Expanding a row shows the answer, the ground truth and a preview of the first context chunk: its first 300 characters, followed by `…`.
 - Actions per row:
   - Approve (green check) → calls `PATCH /goldstandard/session/{session_id}/pair/{pair_id}` with `{ "status": "approved" }`
-  - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included)
+  - Edit inline (pencil) → opens edit form with three editable fields: question, answer, ground_truth; on save calls `PATCH` with `{ "status": "edited", "question": "...", "answer": "...", "ground_truth": "..." }` (only changed fields included; with no change, only the status). If the `PATCH` is refused (for example a cleared field, `422 INVALID_PARAMETER`), the form stays open with the typed values and shows the API's message inside it as an alert; no page-level error is set (#380).
   - Reject (red X) → calls `PATCH` with `{ "status": "rejected" }`
-  - Regenerate (refresh icon) → calls `POST /goldstandard/regenerate` with `session_id` and `pair_id`, replaces row with returned pair
+  - Regenerate (refresh icon) → calls `POST /goldstandard/regenerate` with `session_id` and `pair_id`, replaces row with returned pair. While that request runs (up to 1800 s) the pair's button is disabled with the title "Regenerating..." and the other pairs' buttons stay enabled (#380).
 - Summary bar: `X approved · Y edited · Z rejected · W pending`
 
 **Phase 3 — Export:**
@@ -2486,8 +2503,8 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_delete_busy.py` sends no value, `false`, `1`, `yes`, an empty value and `truee` (400, no lookup, nothing deleted), a missing collection without it (400, not 404) and `TRUE`/`True` (200). `02_ingest.sh` repeats the 400 cases and a `confirm=TRUE` delete on the live verify stack, and `test_mcp_delete.py` checks the MCP tool sends `confirm=true` with `name` still its only input.*
 - [x] While a delete of a collection is in progress, a new ingest, export, tune or generation job for it answers `409 COLLECTION_DELETING` and leaves nothing behind, and an import of it ends `failed` with that code; a delete still waiting for the writer guard keeps #40's ordering (#302).
       *`test_delete_busy.py` holds a real `DELETE` inside its backend delete and drives each route and the import worker against it, under both spellings, and checks generation answers without its one-second wait. `ui_criteria.js` checks the Import page shows the message for an upload refused this way. An `abort` import whose target is still present also ends `COLLECTION_DELETING` (#324).*
-- [x] When Weaviate can't be read to check whether the collection exists, `POST /query`, `POST /goldstandard/generate`, `POST /collections`, `DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` (#366) and the tune starts `POST /tune/rechunk`, `/tune/reembed` and `/tune/reindex` (#349) answer HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and nothing run, created, saved or queued. `GET /tune/{collection}` answers the same 503 when its existence check or its re-chunk coverage check can't read Weaviate (#349).
-      *`test_reingest.py` (run by `02_ingest.sh`) calls each handler with Weaviate failing, and sends each request through the app over HTTP, checking the JSON 503 reaches the client (#369).*
+- [x] When Weaviate can't be read to check whether the collection exists, `POST /query`, `POST /goldstandard/generate`, `POST /collections`, `DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` (#366) and the tune starts `POST /tune/rechunk`, `/tune/reembed` and `/tune/reindex` (#349) answer HTTP 503 `SERVICE_UNAVAILABLE` as a JSON error, `detail` `{"collection": "<name>"}`, with the cause logged and not returned and nothing run, created, saved or queued. `GET /tune/{collection}` answers the same 503 when its existence check or its re-chunk coverage check can't read Weaviate (#349). `POST /tune/rechunk` and `POST /tune/reembed` with chunking fields answer it too when their re-chunk coverage check can't read Weaviate (#340), with no job and the guards released.
+      *`test_reingest.py` (run by `02_ingest.sh`) calls each handler with Weaviate failing, and sends each request through the app over HTTP, checking the JSON 503 reaches the client (#369), the tune starts' re-chunk check included (#409).*
 - [x] A gold-standard start cancelled while its session is being prepared ends its registration and leaves the session `cancelled`, so the collection can be deleted (#302).
       *`test_delete_busy.py` cancels a start while sampling is held, then checks the registration, the session's status, a `200` delete, and that a settle that fails is reported as a failed generation. A cancelled start whose preparation fails settles nothing (#324).*
 - [x] Ingest jobs report `chunks_submitted` and `chunks_accepted` beside `chunks_stored`, counted once per file from its final attempt; older records read them back as `null`; the Import page shows the three only when they differ (#302).
@@ -2756,6 +2773,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       request sent for 0, 101, 2.5 and an empty field). It also clicks Export in Chromium with the
       popup blocker on: a save answered in 1 s opens the download tab, and a control answered after
       6 s opens none.*
+- [x] The Gold Standard page shows how a generation ended (final status, failed pairs and the `errors` reasons, and the empty collection), stops polling with a message when a poll fails, keeps Generate disabled while a start or generation runs and Regenerate disabled per pair while it runs, and keeps the edit form open with the typed values when the `PATCH` is refused, sending only the changed fields (#380).
+      *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
+      API call by request interception: a completed, partially failed, failed, cancelled and empty
+      session; a poll answered 503 and 404; a second Generate click in the window before the first
+      poll; repeated Regenerate clicks; and an edit refused with 422, then retried. 30 of its checks
+      fail on the code before #380 (no outcome shown, polling forever, a second session started,
+      a second regenerate request, the modal closed with all three fields sent).*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
@@ -2783,9 +2807,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
   *Evidence: compose start_period and `RestartTimingTests` verify capped waiting, elapsed time from the supplied start, and positive six-digit limit validation.*
 
-- [x] `docker compose up` brings all five services healthy within 5 minutes on first run (including model pull).
-      *Model volume deleted and re-pulled from scratch: **233s (3.9 min)**. Both
-      models returned with their original IDs.*
+- [x] `docker compose up` brings all five services healthy within 5 minutes on a first start from empty data volumes, with the models already in the model volume.
+      *With `RAG_ALLOW_RESTART=1`, `16_api_paths.sh` (run by `01_infrastructure.sh`)
+      removes the verify project's volumes but its model copy (`down -v`) and times
+      `up -d --wait`. The model pull isn't part of the automated check (#465). A
+      first run with the pull, measured by hand: model volume deleted and re-pulled
+      from scratch, **233s (3.9 min)**. Both models returned with their original IDs.*
 - [x] `docker compose up` brings all five services healthy within 120 seconds on subsequent runs (models cached in volume, no re-download).
       *22s.*
 - [x] Weaviate data persists across `docker compose down && docker compose up`.
@@ -2794,6 +2821,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *`created_at`, index type and distance metric all preserved.*
 - [x] `collection_registry.json` is replaced atomically through an fsynced temporary file, so a failed write leaves the old file whole; a registry that can't be read is kept unchanged and logged, never overwritten, while creates, deletes and the list still answer (`created_at` `null`) (#388).
       *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
+- [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
+      *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
       *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and

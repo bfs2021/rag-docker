@@ -113,6 +113,11 @@ never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
 `02_ingest.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
@@ -142,7 +147,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -406,7 +411,7 @@ sent, and nothing run, created or saved; a collection Weaviate reports missing i
 `COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
 create (#366).
 Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
-the JSON 503 reaches the client (#369).
+the JSON 503 reaches the client (#369), also the tune starts' re-chunk check one (#409).
 Weaviate and sessions are mocked.
 `02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
 (one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
@@ -544,6 +549,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`; run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
@@ -726,7 +732,15 @@ answers every `/api/` call from the Gold Standard page by request interception
 safe and shortened to 128 characters as the API's default is; that Export opens the
 download URL with the filename encoded; that a review row expands to the first 300
 characters of the context followed by `…`; and that a sample size of 0, 101, 2.5 or
-an empty field disables Generate with a message and sends no request. A second
+an empty field disables Generate with a message and sends no request. Its #380 half
+checks how a generation ends and the guards on actions in flight: the outcome shown for a
+completed, partially failed, failed, cancelled and empty-collection session (headline, failed
+pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
+the message, enables Generate and is cleared by Load / refresh; a second Generate click in the
+window before the first poll sends no request and asks no confirm; Regenerate is disabled for
+the running pair only and repeated clicks send one request; and a refused edit (422) keeps the
+modal open with the typed values and the message, and each edit sends only the changed fields.
+A second
 Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
 real: a save answered in 1 s opens the download tab, and a control answered after
 6 s (past Chromium's user-activation window) opens none. That tab sends one
@@ -838,9 +852,10 @@ with only `question` and `collection` reaches the pipeline with the defaults (`h
 search with the end-user prompt; the reformulation, end-user and engineer prompts and their
 `[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
 successful query records one metric; a saved retrieval config missing newer keys is filled
-from the defaults, and one that isn't JSON or can't be read gives the defaults with
-`is_default: true` and a warning. A saved file holding JSON that isn't an object answers 500
-instead: that test is an expected failure until it is fixed. `GET /metrics/latency` is
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type gives the
+defaults with `is_default: true` and a warning, while coercible and out-of-range values are
+still served as saved (#439). `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -857,9 +872,13 @@ defaults on a text of more than five chunks retrieves 5 chunks without citations
 one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
 and that metric read back unchanged after the API restarts, and then a first start: `down -v`
 (the model copy is external and kept) and `up -d --wait` must bring every service healthy
-within 300 s, reporting the time, and start with no collections. That first start doesn't include the model pull of
-SPECIFICATIONS.md's criterion: the verify project copies the models, and a pull needs the
-internet. It removes the verify project's data, so it runs last in suite 01.
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
 
 Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
 `--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.

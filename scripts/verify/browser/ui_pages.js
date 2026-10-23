@@ -75,9 +75,9 @@ function goldCases() {
     } },
     (() => {
       const h = hold();
-      return { name: 'Generate sends the chosen collection and sample size once and is disabled until the start is answered', open: gold({
+      return { name: 'Generate sends the chosen collection and sample size once and is disabled until the start is answered and the session settles', open: gold({
         'POST /api/goldstandard/generate': () => h,
-        ['GET ' + SESSION]: json(200, session([], { status: 'generating', pairs_total: 4, pairs_attempted: 0, pairs_completed: 0 })) }), async run(s) {
+        ['GET ' + SESSION]: json(200, session(reviewPairs())) }, { fastPolls: true }), async run(s) {
         await waitSelected(s.page, 0);
         await fillNth(s.page, 'select', 0, B);
         await fill(s.page, 'input[type=number]', 5);
