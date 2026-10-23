@@ -14258,7 +14258,11 @@ names, paths leaving the archive are dropped, and labels keep the archive's own 
 macOS metadata in a ZIP (#378): a Finder-style ZIP queues its file and lists the
 `__MACOSX/` AppleDouble member in `skipped`, a `._*` file beside its file and any other
 `__MACOSX/` member are skipped the same way, names that only look like them are queued, and a
-ZIP of nothing else is refused with `NO_SUPPORTED_FILES`. The
+ZIP of nothing else is refused with `NO_SUPPORTED_FILES`. These members are still validated
+(#455): a damaged `__MACOSX/` member refuses the ZIP with `ARCHIVE_UNREADABLE` and their bytes
+count toward the expansion cap; `./__MACOSX/._r.txt`, `x/../__MACOSX/notes.txt` and
+`d/./._e.txt` are matched by their normalised names and listed under the archive's spelling;
+and a direct upload named `._notes.txt` is still queued. The
 job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
 the replaced files, before any insert, and deletes earlier chunks only after the insert; a
 marking failure fails only that file and changes nothing; a failed lookup of the later files

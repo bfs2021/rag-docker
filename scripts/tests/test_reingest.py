@@ -188,6 +188,55 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(error["code"], "NO_SUPPORTED_FILES")
         self.assertIn(f"only.zip:__MACOSX/._r.txt {self.MACOS_SKIP}", error["message"])
 
+    def refused(self, *files):
+        response = asyncio.run(ingest.ingest_upload(
+            collection="Coll", strategy="fixed", chunk_size="200", chunk_overlap="0",
+            similarity_threshold="0.85", min_chunk_size="0", files=list(files)))
+        self.assertEqual(getattr(response, "status_code", None), 400,
+                         "expected a refusal, got a job")
+        return json.loads(response.body)["error"]
+
+    def test_a_damaged_macos_metadata_member_still_refuses_the_zip(self):
+        # Validation is unchanged (#378): metadata is read like any skipped member.
+        payload = b"z" * 100
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            z.writestr("report.txt", "the real report")
+            z.writestr("__MACOSX/._report.txt", payload)
+        data = bytearray(buf.getvalue())
+        data[data.index(payload)] ^= 0x01   # bad CRC in the AppleDouble member
+        error = self.refused(upload("damaged.zip", bytes(data)))
+        self.assertEqual(error["code"], "ARCHIVE_UNREADABLE")
+        self.assertEqual([m["member"] for m in error["detail"]["members"]],
+                         ["__MACOSX/._report.txt"])
+
+    def test_macos_metadata_counts_toward_the_expansion_cap(self):
+        # The AppleDouble member's bytes still count (#298, #378).
+        data = zip_bytes([("report.txt", "r" * 100), ("__MACOSX/._report.txt", b"m" * 200)])
+        with patch.object(settings, "max_zip_expanded_bytes", 250):
+            error = self.refused(upload("big.zip", data))
+        self.assertEqual(error["code"], "ARCHIVE_TOO_LARGE")
+        with patch.object(settings, "max_zip_expanded_bytes", 300):
+            job, queued, _ = self.admit(upload("big.zip", data))
+        self.assertEqual([name for name, _, _ in queued], ["report.txt"])
+
+    def test_normalised_metadata_paths_are_skipped_under_their_archive_spelling(self):
+        # The match is on the logical (normalised) name; skipped keeps the raw name.
+        job, queued, _ = self.admit(upload("n.zip", zip_bytes(
+            [("r.txt", "real"), ("./__MACOSX/._r.txt", self.APPLEDOUBLE),
+             ("x/../__MACOSX/notes.txt", "x"), ("d/./._e.txt", self.APPLEDOUBLE)])))
+        self.assertEqual(queued, [("r.txt", "n.zip:r.txt", "real")])
+        self.assertEqual(job["skipped"], [
+            f"n.zip:./__MACOSX/._r.txt {self.MACOS_SKIP}",
+            f"n.zip:x/../__MACOSX/notes.txt {self.MACOS_SKIP}",
+            f"n.zip:d/./._e.txt {self.MACOS_SKIP}"])
+
+    def test_a_direct_upload_named_like_appledouble_is_still_ingested(self):
+        # Only ZIP members are filtered; direct uploads are unchanged (#378).
+        job, queued, _ = self.admit(upload("._notes.txt", "a direct upload"))
+        self.assertEqual(queued, [("._notes.txt", "._notes.txt", "a direct upload")])
+        self.assertEqual(job["skipped"], [])
+
 
 class FakeCollection:
     """Chunks by name, with the replacement helpers' contract."""
