@@ -148,7 +148,8 @@ class RouteTests(BusyTestCase):
         self.assert_busy(response, "tune", "t1", "A tuning job is running for this collection")
         self.assertEqual(response.json()["error"]["detail"]["jobs"],
                          [{"job_kind": "tune", "job_id": "t1"}, {"job_kind": "ingest", "job_id": "i1"}])
-        self.assertEqual(response.json()["error"]["detail"]["collection"], "ownedBusy")
+        # Named as stored, whichever spelling the request used (#372).
+        self.assertEqual(response.json()["error"]["detail"]["collection"], "OwnedBusy")
 
 
 class OrderingTests(BusyTestCase):
@@ -602,7 +603,7 @@ class DeletingTests(BusyTestCase):
         with self.deleting():
             response = self.call("POST", "/ingest/upload", data={"collection": "ownedBusy"},
                                  files={"files": ("one.txt", b"Owned text", "text/plain")})
-        self.assert_deleting(response, "ownedBusy")
+        self.assert_deleting(response, "OwnedBusy")              # as stored (#372)
         self.assertEqual(set(ingest_pipeline._jobs), jobs_before)
         self.assertEqual(sorted(self.root.iterdir()), files_before)
         self.assertEqual(writes.active_jobs("OwnedBusy"), [])

@@ -340,6 +340,11 @@ finally:
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
 
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
+
 drop_collection "$C"
 cleanup_prefixed
 summary
