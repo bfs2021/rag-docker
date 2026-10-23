@@ -6125,6 +6125,21 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
+def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+    """Archive the staged package as `<stem>/`, with manifest.json first (#383).
+
+    The directory entry, then the manifest, then everything else in the sorted
+    order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
+    at the manifest instead of decompressing chunks.jsonl to reach it.
+    """
+    with tarfile.open(dest, "w:gz") as tar:
+        tar.add(stage, arcname=stem, recursive=False)
+        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+        for entry in sorted(os.listdir(stage)):
+            if entry != "manifest.json":
+                tar.add(stage / entry, arcname=f"{stem}/{entry}")
+
+
 def build(
     collection: str,
     include_models: bool = False,
@@ -6328,8 +6343,7 @@ def build(
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(stage, arcname=stem)
+        _write_archive(stage, stem, tmp_archive)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -6363,15 +6377,41 @@ class PackageError(Exception):
         self.detail = detail
 
 
+# The listing reads only the manifest (#383). It holds one `files` entry per file
+# in the package, so 16 MiB is far more than any real package needs; a larger
+# manifest is refused unread and the package is listed as unreadable.
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _is_top_manifest(name: str) -> bool:
+    """True for `<top-level directory>/manifest.json`, not one deeper down."""
+    parts = PurePosixPath(name).parts
+    return len(parts) == 2 and parts[1] == "manifest.json"
+
+
 def read_manifest(archive: Path) -> dict:
-    """Read manifest.json out of a package without extracting the whole archive."""
+    """Read the top-level manifest.json out of a package, for the listing.
+
+    Members are read one at a time and nothing after the manifest is touched,
+    so a package is not decompressed in full (#383). New packages put the
+    manifest first; in older ones chunks.jsonl comes before it and is read past.
+    Raises when the package has no readable manifest, or one larger than
+    MANIFEST_MAX_BYTES or not a JSON object.
+    """
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if Path(member.name).name == "manifest.json" and member.isfile():
-                fh = tar.extractfile(member)
-                if fh is None:
-                    break
-                return json.loads(fh.read().decode("utf-8"))
+        while (member := tar.next()) is not None:
+            if not (_is_top_manifest(member.name) and member.isfile()):
+                continue
+            if member.size > MANIFEST_MAX_BYTES:
+                raise ValueError(f"manifest.json is {member.size} bytes, over the "
+                                 f"{MANIFEST_MAX_BYTES}-byte limit")
+            fh = tar.extractfile(member)
+            if fh is None:
+                break
+            manifest = json.loads(fh.read(member.size).decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            return manifest
     raise ValueError("no manifest.json in package")
 
 
@@ -13634,7 +13674,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the five controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the six controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -14033,6 +14073,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`; run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
@@ -15827,6 +15868,9 @@ with tempfile.TemporaryDirectory() as td:
     check("archive expands to a single directory", len(tops) == 1, str(tops))
     check("that directory is the filename minus .tar.gz",
           tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    # §4.2 — the manifest comes right after the directory entry (#383)
+    check("§4.2 manifest.json is the archive's first file",
+          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
     pkg = root / archive.name[:-len(".tar.gz")]
 
     manifest = json.loads((pkg / "manifest.json").read_text())
@@ -18286,6 +18330,9 @@ check "E12 embedding mismatch and post-install Ollama check regressions" $?
 check "import and tuning recovery regressions" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
 check "test_batch_recovery_fixture.py registered regression checks" $?
+# The package listing reads each manifest without decompressing the package (#383).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
+check "the package listing reads only up to each manifest (#383)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
