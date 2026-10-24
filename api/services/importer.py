@@ -21,7 +21,6 @@ depending on whether there is anything to protect:
   is recoverable rather than lost.
 """
 from __future__ import annotations
-from services import telemetry
 
 import asyncio
 import json
@@ -37,29 +36,22 @@ from contextlib import nullcontext
 
 from config import settings
 from services import settings_store
-from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, IngestConfig
 from services import goldstandard
 from services import model_bundle
 from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
-from services import batch_write, collection_recovery, collection_writes, jobstore
+from services import batch_write, collection_recovery, collection_writes
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
 
 ON_CONFLICT = ("abort", "rename", "replace")
 
-# Job records survive an API restart (#23); see jobstore.py.
-_jobs = jobstore.JobStore("import")
-# Package names being imported: the file the worker opens, whatever the path
-# spelling sent (#391).
+_jobs: dict[str, dict] = {}
 _active: set[str] = set()
-# Target collections claimed by an import job, canonical name -> job id. A second
-# import into the same target is refused whatever its conflict mode, so two
-# imports never build, mark or clean up one collection at once (#391).
-_targets: dict[str, str] = {}
 _lock = threading.Lock()
 
 # Weaviate capitalises the first character of a collection name and rejects
@@ -157,26 +149,29 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk, and an ingest's
-# upload staging (#377). Each removes its own directory in a `finally`, which a
-# hard kill skips -- twelve of these were found holding 152 MB after the kill
-# tests, a with-models package would leave 2.3 GB behind each time, and an
-# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-")
+# Extraction workspaces created by an import or a re-chunk. Both remove their
+# own directory in a `finally`, which a hard kill skips -- twelve of these were
+# found holding 152 MB after the kill tests, and a with-models package would
+# leave 2.3 GB behind each time.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
 
 
 def sweep_stale_workdirs() -> list[str]:
-    """Remove work directories abandoned by a killed job; never follows a link."""
+    """Remove extraction directories abandoned by a killed job."""
     root = Path(settings.upload_dir)
     removed: list[str] = []
     if not root.is_dir():
         return removed
     for entry in sorted(root.iterdir()):
-        if not entry.name.startswith(_WORKDIR_PREFIXES):
+        if not entry.is_dir() or not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        size = packager.remove_leftover(entry, directory=True)
-        if size is not None:
-            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+        try:
+            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            _log.exception("Could not remove stale work directory %s", entry)
+            continue
+        removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
 
 
@@ -208,7 +203,7 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        if telemetry.call("weaviate.config", col.config.get).description != _instance_description(data["instance"]):
+                        if col.config.get().description != _instance_description(data["instance"]):
                             # Created after the import stopped, for example while
                             # an earlier start could not resolve this marker.
                             _log.warning("Collection %r is not the one the interrupted import "
@@ -217,7 +212,7 @@ def sweep_interrupted_imports() -> list[str]:
                             try:
                                 expected.verify(col, exact=True)
                             except batch_write.BatchVerificationError:
-                                telemetry.call("weaviate.delete", wc.get_client().collections.delete, collection)
+                                wc.get_client().collections.delete(collection)
                                 removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
@@ -266,38 +261,6 @@ def canonical(name: str) -> str:
     return name[:1].upper() + name[1:] if name else name
 
 
-def _package_key(filename: str) -> str:
-    """The package the worker opens, so every spelling of one file is one key."""
-    return Path(filename).name
-
-
-def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
-    """Claim `target` for this import, or refuse while another import holds it.
-
-    `instead_of`, a name this job claimed earlier, is released in the same step:
-    a `rename` no longer writes the name it moved away from.
-    """
-    name = canonical(target)
-    with _lock:
-        owner = _targets.get(name)
-        if owner is not None and owner != job_id:
-            raise PackageError(
-                "IMPORT_IN_PROGRESS",
-                f"Another import into '{name}' is running. Start this import again "
-                "once it finishes.",
-                {"collection": name})
-        if instead_of is not None and _targets.get(canonical(instead_of)) == job_id:
-            del _targets[canonical(instead_of)]
-        _targets[name] = job_id
-    return name
-
-
-def _release_targets(job_id: str) -> None:
-    with _lock:
-        for name in [name for name, owner in _targets.items() if owner == job_id]:
-            del _targets[name]
-
-
 def _safe_file(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
@@ -331,23 +294,20 @@ def _check_embedding(manifest: dict) -> None:
 
     if pkg_model != our_model:
         fidelity = manifest.get("fidelity")
-        # Nothing re-embeds a refused package, whatever its fidelity (#390).
-        remedy = (f"Use an instance running '{pkg_model}', or re-export from one."
+        remedy = ("This package is `with-sources`, so it can be re-embedded after "
+                  "import once that is supported."
                   if fidelity == "with-sources" else
                   "This package is `chunks-only`, so it cannot be re-embedded from "
                   "the original documents. Use an instance running "
                   f"'{pkg_model}', or re-export from one.")
-        actual = _probe_dimensions()
-        ours = (f"{actual} dimensions" if actual is not None else
-                "whose dimension count couldn't be read from Ollama")
         raise PackageError(
             "EMBEDDING_MISMATCH",
             f"The package was embedded with '{pkg_model}' ({pkg_dims} dimensions) "
-            f"but this instance uses '{our_model}' ({ours}). Vectors from a different "
-            f"model are meaningless here, not merely different, so the import is "
-            f"refused. " + remedy,
+            f"but this instance uses '{our_model}'. Vectors from a different model "
+            f"are meaningless here, not merely different, so the import is refused. "
+            + remedy,
             {"package_model": pkg_model, "package_dimensions": pkg_dims,
-             "instance_model": our_model, "instance_dimensions": actual})
+             "instance_model": our_model})
 
     # Same model name but a different width means one side is not what it claims.
     if pkg_dims is not None:
@@ -411,8 +371,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
     embed_model = settings.embed_model
     llm_model = settings.llm_model
-    # `name:tag`; a folder counts only for the tag it holds (#487).
-    bundled = model_bundle.bundled_models(pkg, manifest)
+    bundled = model_bundle.bundled_models(pkg)
 
     for model, required in ((embed_model, True), (llm_model, False)):
         if not model_bundle.supports_name(model):
@@ -465,7 +424,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {name}`, then import again.",
                 {"model": name})
-        if model_bundle.model_ref(model) not in bundled:
+        if name not in bundled:
             if not required:
                 notes.append(f"model '{name}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -480,22 +439,13 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
-            model_bundle.install_model(pkg, model, manifest)
+            model_bundle.install_model(pkg, model)
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Could not install bundled model '{name}': {exc}",
                 {"model": name}) from exc
-        # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
-        reported = _ollama_reports(model)
-        if reported is None:
-            raise PackageError(
-                "IMPORT_FAILED",
-                f"Installed '{name}' from the package but couldn't reach Ollama to "
-                f"confirm it is there. Check that the ollama service is running, "
-                f"then import again.",
-                {"model": name})
-        if not reported:
+        if not model_bundle.is_installed(model):
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
@@ -555,9 +505,8 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
-@telemetry.traced("rag.validate")
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
-    """Check source identities after verify_digests, before any live mutation."""
+    """Check untrusted retained-source identities before any live mutation."""
     source_dir = pkg / "sources"
     if not source_dir.exists():
         if manifest.get("fidelity") == "with-sources":
@@ -578,13 +527,7 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
             blob = source_dir / digest
             if blob.is_symlink() or not blob.is_file():
                 raise ValueError("Retained source blob is missing or is not a regular file")
-            # Check 3 already hashed listed files in this private extraction.
-            # Match that verified digest to the content-addressed filename;
-            # manifest omissions still need their own identity hash.
-            files = manifest.get("files", {})
-            rel = f"sources/{digest}"
-            actual = files[rel] if rel in files else "sha256:" + packager.sha256_file(blob)
-            if actual != f"sha256:{digest}":
+            if packager.sha256_file(blob) != digest:
                 raise ValueError("Retained source blob does not match its identity")
     except (OSError, ValueError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
@@ -653,19 +596,39 @@ def _read_retrieval_config(pkg: Path, original: str,
     return validated
 
 
+def _read_ingest_config(pkg: Path) -> dict | None:
+    """Validate the package's chunking settings before any live mutation."""
+    path = pkg / "ingest_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Ingest settings must be a regular file")
+        return IngestConfig.model_validate(json.loads(path.read_text())).model_dump()
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid ingest settings.",
+                           {"file": "ingest_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
                       restored_sessions: list[dict] | None = None,
-                      validated_retrieval: dict | None = None) -> list[str]:
+                      validated_retrieval: dict | None = None,
+                      validated_ingest: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
-    sources.restore_package(pkg, target)
+    src = pkg / "sources"
+    if src.is_dir():
+        dest = sources.collection_dir(target)
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            if item.is_file():
+                shutil.copyfile(item, dest / item.name)
 
-    ingest_cfg = pkg / "ingest_config.json"
-    if ingest_cfg.is_file():
-        data = json.loads(ingest_cfg.read_text())
-        data["collection"] = target
+    ingest = validated_ingest if validated_ingest is not None else _read_ingest_config(pkg)
+    if ingest is not None:
+        data = {**ingest, "collection": target}
         out = Path(settings.upload_dir) / "ingest_configs"
         out.mkdir(parents=True, exist_ok=True)
         settings_store.publish(out / f"{_safe_file(target)}.json", data)
@@ -711,7 +674,6 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     return notes
 
 
-@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
@@ -721,7 +683,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
     except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
-            telemetry.call("weaviate.delete", wc.get_client().collections.delete, target)
+            wc.get_client().collections.delete(target)
         except Exception as cleanup:
             raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
                                f"partial target cleanup failed ({cleanup})",
@@ -729,7 +691,6 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
-@telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -744,12 +705,6 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
-
-    def finish(**fields) -> None:
-        # The registration ends before the status turns terminal, so a client
-        # that sees the import finish can delete the collection at once (#40).
-        collection_writes.end_job("import", job_id)
-        job.update(fields)
 
     try:
         archive = packager.exports_dir() / Path(filename).name
@@ -773,19 +728,12 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         validated_sessions = _read_goldstandard_sessions(pkg, original)
         retrieval_notes: list[str] = []
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
+        validated_ingest = _read_ingest_config(pkg)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        # One import per target, whatever its conflict mode, claimed before the
-        # existence check and held until the job ends (#391).
-        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
-            # Before the existence check: a target the delete hasn't removed yet
-            # would otherwise answer COLLECTION_EXISTS (#324).
-            if on_conflict == "abort" and collection_writes.delete_in_progress(target):
-                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
-                                   {"collection": target})
             exists = wc._collection_exists_sync(target)                 # check 5
             if exists and on_conflict == "abort":
                 raise PackageError(
@@ -795,17 +743,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     {"collection": target})
 
             if exists and on_conflict == "rename":
-                target = _claim_target(job_id, _rename_target(original, id8), instead_of=target)
-
-            # The target is final: DELETE /collections refuses it from here until
-            # this job ends (#40). Replace's own delete of the old target below
-            # goes through _delete_collection_sync, which the registry never refuses.
-            # A target being deleted refuses the import (#302).
-            try:
-                collection_writes.register_job(target, "import", job_id)
-            except collection_writes.CollectionDeletingError:
-                raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
-                                   {"collection": target}) from None
+                target = _rename_target(original, id8)
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -817,7 +755,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                 staged = True
                 # Counted before the delete, because the delete is what orphans them.
                 orphaned = len({session["session_id"]
-                                for spelling in collection_writes.aliases(target)
+                                for spelling in {target, target[:1].lower() + target[1:]}
                                 for session in goldstandard.sessions_for(spelling)})
                 wc._delete_collection_sync(target)   # also drops its sources + config
                 if orphaned:
@@ -838,7 +776,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval) + retrieval_notes
+                validated_retrieval, validated_ingest) + retrieval_notes
 
             if staged and temp_collection:
                 try:
@@ -847,14 +785,13 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                     _log.exception("Could not remove staging collection %r", temp_collection)
                 staged = False
 
-            finish(status="completed", collection=target, original_collection=original,
-                   chunks_written=written, renamed=(target != canonical(original)),
-                   notes=notes)
+            job.update(status="completed", collection=target, original_collection=original,
+                       chunks_written=written, renamed=(target != canonical(original)),
+                       notes=notes)
 
     except PackageError as exc:
-        telemetry.outcome("error", exc)
-        finish(status="failed", error_code=exc.code, error=exc.message,
-               error_detail=exc.detail)
+        job.update(status="failed", error_code=exc.code, error=exc.message,
+                   error_detail=exc.detail)
         if staged and temp_collection:
             # The real build failed after the target was deleted. Keeping the
             # staging collection means the data is recoverable, not lost.
@@ -863,10 +800,9 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
-        telemetry.outcome("error", exc)
         _log.exception("Import of %r failed", filename)
-        finish(status="failed", error_code="IMPORT_FAILED",
-               error=f"{type(exc).__name__}: {exc}")
+        job.update(status="failed", error_code="IMPORT_FAILED",
+                   error=f"{type(exc).__name__}: {exc}")
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
@@ -887,42 +823,32 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             except Exception:
                 _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
-        collection_writes.end_job("import", job_id)
         with _lock:
-            _active.discard(_package_key(filename))
-        _release_targets(job_id)
+            _active.discard(filename)
 
 
 async def start_import_job(filename: str, on_conflict: str) -> str:
     job_id = str(uuid.uuid4())[:8]
-    key = _package_key(filename)
     with _lock:
-        if key in _active:
+        if filename in _active:
             raise RuntimeError(filename)
-        _active.add(key)
+        _active.add(filename)
 
-    # The first write is durable, so it runs off the event loop (#309). A start
-    # cancelled meanwhile releases its guard; the store removes the record.
-    try:
-        await _jobs.create(job_id, {
-            "job_id": job_id,
-            "status": "queued",
-            "filename": filename,
-            "on_conflict": on_conflict,
-            "collection": None,
-            "original_collection": None,
-            "chunks_written": 0,
-            "fidelity": None,
-            "renamed": False,
-            "notes": [],
-            "restored_sessions": [],
-            "error": None,
-            "error_code": None,
-            "error_detail": None,
-        })
-    except BaseException:
-        with _lock:
-            _active.discard(key)
-        raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
+    _jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "filename": filename,
+        "on_conflict": on_conflict,
+        "collection": None,
+        "original_collection": None,
+        "chunks_written": 0,
+        "fidelity": None,
+        "renamed": False,
+        "notes": [],
+        "restored_sessions": [],
+        "error": None,
+        "error_code": None,
+        "error_detail": None,
+    }
+    asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
     return job_id
